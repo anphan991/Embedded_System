@@ -1,0 +1,46 @@
+# ==========================================
+# Cấu hình Git Ignore cho Hệ thống Điều khiển
+# ==========================================
+
+# -----------------------
+# Khối Máy chủ (Python/Backend)
+# -----------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Môi trường ảo (Virtual Environments)
+venv/
+env/
+.env
+
+# Tệp trọng số mô hình AI (YOLO tự động tải, không cần đẩy lên GitHub)
+*.pt
+*.onnx
+
+# -----------------------
+# Khối Giao diện (Node.js/Next.js)
+# -----------------------
+node_modules/
+.next/
+out/
+build/
+
+# Tệp nhật ký (Logs)
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Biến môi trường cục bộ (Environment variables)
+.env*.local
+
+# Dữ liệu cache của Vercel
+.vercel/
+
+# -----------------------
+# Cấu hình Hệ điều hành & IDE (Tránh xung đột cấu hình giữa các máy)
+# -----------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
