@@ -18,6 +18,10 @@ env/
 *.pt
 *.onnx
 
+# Dữ liệu cục bộ & Hình ảnh người bệnh (Tuyệt đối không đẩy lên Git)
+*.db
+snapshots/
+
 # -----------------------
 # Khối Giao diện (Node.js/Next.js)
 # -----------------------
