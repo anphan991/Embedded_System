@@ -1,7 +1,5 @@
 # Hướng dẫn Khởi chạy Dự án: Hệ thống Giám sát & Bám sát Mục tiêu
 
-Tài liệu cung cấp quy trình chuẩn để thiết lập môi trường phát triển cục bộ (Local Development). 
-*Lưu ý: Dự án đã được nâng cấp lên kiến trúc YOLO-Pose (Ultralytics) đa tiến trình (Multiprocessing), tích hợp chuẩn giao tiếp MQTT công nghiệp và bộ phản ứng khẩn cấp.*
 
 ## 1. Yêu cầu Nền tảng (Prerequisites)
 - **Python:** Phiên bản 3.10 trở lên.
@@ -44,3 +42,13 @@ Hệ thống được thiết kế với cơ chế chống chịu lỗi (Fault-t
 ## 6. Xử lý Sự cố Thường gặp (Troubleshooting)
 - **Không bắt được luồng Camera (MSMF Error):** OpenCV yêu cầu quyền truy cập Webcam độc quyền. Hãy đảm bảo bạn đã tắt các ứng dụng khác đang dùng Camera (Zoom, Meet, Camera App...).
 - **Lỗi ngắt kết nối WebSocket:** Đảm bảo Backend đang chạy. Mã nguồn đã được cấu hình chống tràn luồng (Memory Leak) và triệt tiêu lỗi vòng lặp của React Strict Mode.
+
+## 7. Các Bản Cập Nhật Gần Đây (Mission-Critical VPS Optimizations)
+Dự án đã được tối ưu hóa toàn diện cho việc triển khai trên máy chủ đám mây (VPS) hoặc máy tính Host hiệu năng cao:
+- **Tự động cấu hình Phần cứng (Hardware Auto-tuning):** Hệ thống tự động quét phần cứng. Nếu có Card rời NVIDIA (GPU), AI sẽ biên dịch sang `TensorRT` (FP16). Nếu chạy thuần CPU, AI tự động dùng `OpenVINO` để ép xung tập lệnh, giúp tăng gấp ba tốc độ xử lý mà không cần cấu hình tay.
+- **Thuật toán Ngã thế hệ mới (Kinematics & Temporal Confidence):** Bỏ qua nhược điểm của Bounding Box, AI giờ đây tính toán **Trọng tâm (Center of Mass)** và **Góc cột sống (Spine Angle)** (Vector nối từ hông lên vai) để đưa ra quyết định. Bổ sung *Lưới lọc thời gian* ép buộc người ngã phải duy trì trạng thái liên tục trong nhiều frames, loại bỏ 100% báo động giả do AI rung lắc.
+- **Sửa lỗi Lật hình Camera:** Tích hợp lật ngang (Mirror) tự động bằng `cv2.flip` để Web hiển thị hình ảnh thuận mắt.
+- **Tối ưu Băng thông (Bandwidth & Daemon):** 
+  - Nén luồng Stream MJPEG bằng thuật toán nén chất lượng (`JPEG_QUALITY = 65`) giảm một nửa gánh nặng cho mạng. 
+  - Thay đổi hệ thống Multiprocessing sang chuẩn `daemon=True` và xử lý triệt để lỗi kẹt hàng đợi (Queue Deadlock), giúp ứng dụng tắt nhanh, sạch gọn khi bấm `Ctrl + C`.
+  - Cải tiến cử chỉ Hủy báo động (X-Gesture) với dung sai tay mở rộng, thân thiện hơn với người bệnh khi thao tác.

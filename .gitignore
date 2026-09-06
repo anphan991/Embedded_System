@@ -17,6 +17,8 @@ env/
 # Tệp trọng số mô hình AI (YOLO tự động tải, không cần đẩy lên GitHub)
 *.pt
 *.onnx
+*.engine
+*_openvino_model/
 
 # Dữ liệu cục bộ & Hình ảnh người bệnh (Tuyệt đối không đẩy lên Git)
 *.db

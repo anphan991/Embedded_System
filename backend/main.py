@@ -11,6 +11,7 @@ import queue
 import time
 import threading
 import requests
+import math
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -47,10 +48,18 @@ def camera_process(raw_q: mp.Queue, shutdown_flag):
     while not shutdown_flag.value:
         ret, frame = cap.read()
         if ret:
+            # Lật ảnh để sửa lỗi bị ngược. 
+            # Dùng 1 để lật ngang (như gương), 0 để lật dọc (nếu camera gắn ngược trên trần), -1 để lật cả ngang và dọc.
+            frame = cv2.flip(frame, 1)
+            
             if raw_q.full():
                 try: raw_q.get_nowait()
                 except: pass
-            raw_q.put(frame)
+            
+            try:
+                raw_q.put(frame, timeout=0.1)
+            except:
+                pass
         else:
             time.sleep(0.01)
     cap.release()
@@ -61,7 +70,7 @@ def camera_process(raw_q: mp.Queue, shutdown_flag):
 # TIẾN TRÌNH 2: AI & MQTT CONSUMER (Tính toán song song)
 # ---------------------------------------------------------
 def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_flag):
-    logger.info("Process 2 (AI Core & MQTT): Started.")
+    logger.info("Process 2 (AI Core & MQTT): Started. Optimizing for Host/VPS...")
     
     # 1. Khởi tạo MQTT (Giao tiếp với ESP32)
     import paho.mqtt.client as mqtt
@@ -72,31 +81,62 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     except Exception as e:
         logger.warning(f"Process 2: MQTT Connection failed: {e}")
 
-    # 2. Khởi tạo YOLO
+    # 2. Khởi tạo YOLO (Tự động nhận diện GPU/CPU)
+    import torch
     from ultralytics import YOLO
-    model_path = "yolov8n-pose.pt"
-    onnx_path = "yolov8n-pose.onnx"
-    int8_path = "yolov8n-pose_int8.onnx"
     
-    if not os.path.exists(onnx_path):
-        temp_model = YOLO(model_path)
-        temp_model.export(format="onnx", dynamic=False)
+    model_path = "yolov8m-pose.pt"
+    
+    if torch.cuda.is_available():
+        logger.info("NVIDIA GPU Detected! Optimizing with TensorRT/CUDA...")
+        trt_path = "yolov8m-pose.engine"
+        if not os.path.exists(trt_path):
+            logger.info("Exporting YOLO model to TensorRT engine for max performance...")
+            try:
+                temp_model = YOLO(model_path)
+                temp_model.export(format="engine", dynamic=False, half=True)
+            except Exception as e:
+                logger.warning(f"TensorRT export failed: {e}. Falling back to PyTorch CUDA.")
         
-    try:
-        from onnxruntime.quantization import quantize_dynamic, QuantType
-        if not os.path.exists(int8_path):
-            quantize_dynamic(onnx_path, int8_path, weight_type=QuantType.QUInt8)
-        pose_estimator = YOLO(int8_path, task='pose')
-    except Exception:
-        pose_estimator = YOLO(onnx_path, task='pose')
+        try:
+            logger.info("Loading TensorRT model...")
+            pose_estimator = YOLO(trt_path, task='pose')
+        except Exception:
+            logger.info("Loading PyTorch CUDA model...")
+            pose_estimator = YOLO(model_path, task='pose')
+    else:
+        logger.info("No GPU detected. Optimizing for CPU with OpenVINO...")
+        ov_path = "yolov8m-pose_openvino_model"
+        if not os.path.exists(ov_path):
+            logger.info("Exporting YOLO model to OpenVINO...")
+            try:
+                temp_model = YOLO(model_path)
+                temp_model.export(format="openvino", dynamic=False)
+            except Exception as e:
+                logger.warning(f"OpenVINO export failed: {e}. Falling back to PyTorch CPU.")
+                
+        try:
+            logger.info("Loading OpenVINO model...")
+            pose_estimator = YOLO(ov_path, task='pose')
+        except Exception:
+            logger.info("Loading PyTorch CPU model...")
+            pose_estimator = YOLO(model_path, task='pose')
 
     track_history = {}
     last_heartbeat = 0
     
+    # Giới hạn FPS AI để giảm tải VPS (15 FPS)
+    target_fps = 15
+    frame_time = 1.0 / target_fps
+    
     while not shutdown_flag.value:
+        loop_start = time.time()
+        
         # Heartbeat Ping cho ESP32 mỗi giây
         if time.time() - last_heartbeat > 1.0:
-            mqtt_client.publish("embedded/system/heartbeat", "PING")
+            try:
+                mqtt_client.publish("embedded/system/heartbeat", "PING")
+            except Exception: pass
             last_heartbeat = time.time()
             
         try:
@@ -104,7 +144,14 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
         except queue.Empty:
             continue
 
-        results = pose_estimator.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")
+        # Dùng tracker mạnh hơn (botsort), conf=0.5 lọc nhiễu
+        try:
+            results = pose_estimator.track(frame, persist=True, verbose=False, tracker="botsort.yaml", conf=0.5)
+        except Exception as e:
+            logger.error(f"Inference error: {e}")
+            time.sleep(1)
+            continue
+        
         annotated_frame = results[0].plot()
         anyone_falling = False
 
@@ -116,23 +163,46 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                 obj_id = int(boxes.id[i].item())
                 x1, y1, x2, y2 = boxes.xyxy[i].tolist()
                 
-                # Bắn tọa độ mục tiêu (Bù vùng mù: Nếu kẹt ngã, Servo vẫn khóa tọa độ cuối cùng)
+                # Bắn tọa độ mục tiêu
                 if i == 0:
                     target_x = int((x1 + x2) / 2)
                     target_y = int((y1 + y2) / 2)
-                    mqtt_client.publish("embedded/servo/tracking", f"{target_x},{target_y}")
+                    try: mqtt_client.publish("embedded/servo/tracking", f"{target_x},{target_y}")
+                    except Exception: pass
                 
                 width = x2 - x1
                 height = y2 - y1
                 aspect_ratio = width / height if height > 0 else 0
                 
-                # Phân tích Keypoints
+                # Phân tích Keypoints (Spine Angle & Center of Mass)
                 kp = keypoints.xy[i]
                 nose_y = kp[0][1].item() if len(kp) > 0 else 0
                 left_knee_y = kp[13][1].item() if len(kp) > 13 else 0
                 right_knee_y = kp[14][1].item() if len(kp) > 14 else 0
                 
-                # Thuật toán: Nhận diện Cử chỉ Hình Chữ X (Hủy Báo động)
+                spine_angle = 90.0 # Mặc định đứng thẳng
+                com_y = nose_y # Default Center of Mass (CoM)
+                
+                if len(kp) > 12:
+                    shoulder_l = kp[5]
+                    shoulder_r = kp[6]
+                    hip_l = kp[11]
+                    hip_r = kp[12]
+                    
+                    if shoulder_l[1] > 0 and shoulder_r[1] > 0 and hip_l[1] > 0 and hip_r[1] > 0:
+                        shoulder_center_x = (shoulder_l[0].item() + shoulder_r[0].item()) / 2.0
+                        shoulder_center_y = (shoulder_l[1].item() + shoulder_r[1].item()) / 2.0
+                        hip_center_x = (hip_l[0].item() + hip_r[0].item()) / 2.0
+                        hip_center_y = (hip_l[1].item() + hip_r[1].item()) / 2.0
+                        
+                        dx = hip_center_x - shoulder_center_x
+                        dy = hip_center_y - shoulder_center_y
+                        
+                        if dy != 0 or dx != 0:
+                            spine_angle = math.degrees(math.atan2(abs(dy), abs(dx)))
+                        com_y = hip_center_y # Lấy hông làm trọng tâm cơ thể
+                
+                # Cử chỉ Hủy (X-Gesture) được tối ưu: Mở rộng vùng dung sai tay
                 is_x_gesture = False
                 if len(kp) > 10:
                     wrist_l = kp[9]
@@ -140,21 +210,19 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     shoulder_l = kp[5]
                     shoulder_r = kp[6]
                     
-                    # 2 tay đưa lên cao hơn vai
                     if wrist_l[1] > 0 and wrist_r[1] > 0 and shoulder_l[1] > 0 and shoulder_r[1] > 0:
-                        arms_raised = (wrist_l[1] < shoulder_l[1]) and (wrist_r[1] < shoulder_r[1])
-                        # 2 cổ tay bắt chéo nhau (Khoảng cách X cực nhỏ hoặc đảo ngược)
-                        wrists_crossed = abs(wrist_l[0] - wrist_r[0]) < 40
+                        arms_raised = (wrist_l[1].item() < shoulder_l[1].item()) and (wrist_r[1].item() < shoulder_r[1].item())
+                        wrists_crossed = abs(wrist_l[0].item() - wrist_r[0].item()) < 60 # Tăng dung sai bắt chéo tay
                         if arms_raised and wrists_crossed:
                             is_x_gesture = True
 
-                # Quản lý Trạng thái & Vận tốc
+                # Trạng thái & Vận tốc rơi (Dựa trên CoM)
                 current_t = time.time()
                 if obj_id not in track_history:
-                    track_history[obj_id] = {"y_history": [], "status": "normal", "gesture_cooldown": 0}
+                    track_history[obj_id] = {"y_history": [], "status": "normal", "gesture_cooldown": 0, "fall_frames": 0}
                 
                 history = track_history[obj_id]["y_history"]
-                if nose_y > 0: history.append((current_t, nose_y))
+                if com_y > 0: history.append((current_t, com_y))
                 if len(history) > 10: history.pop(0)
                     
                 y_velocity = 0.0
@@ -164,28 +232,36 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     y_velocity = dy / dt if dt > 0 else 0.0
                     
                 is_horizontal = aspect_ratio > 1.2
-                is_head_low = False
-                if left_knee_y > 0 and right_knee_y > 0 and nose_y > 0:
-                    is_head_low = nose_y > ((left_knee_y + right_knee_y) / 2.0)
-                    
+                is_spine_horizontal = spine_angle < 45.0
                 is_falling_fast = y_velocity > FALL_VELOCITY_THRESHOLD
                 
                 # LOGIC CỐT LÕI (Ngã + Cử chỉ Hủy)
                 if is_x_gesture:
                     track_history[obj_id]["status"] = "normal"
-                    track_history[obj_id]["gesture_cooldown"] = time.time() + 5.0 # Miễn nhiễm báo ngã 5 giây
+                    track_history[obj_id]["fall_frames"] = 0
+                    track_history[obj_id]["gesture_cooldown"] = time.time() + 5.0 # Miễn nhiễm 5s
                     cv2.putText(annotated_frame, "ALARM CANCELED", (int(x1), int(y1)-30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 3)
-                    mqtt_client.publish("embedded/servo/buzzer", "OFF")
+                    try: mqtt_client.publish("embedded/servo/buzzer", "OFF")
+                    except Exception: pass
                 elif time.time() > track_history[obj_id]["gesture_cooldown"]:
-                    if (is_horizontal and is_head_low) or (is_falling_fast and is_head_low):
+                    # Ngã khi: (Dáng nằm ngang + Cột sống thấp) HOẶC (Rơi nhanh + Cột sống thấp)
+                    if (is_horizontal and is_spine_horizontal) or (is_falling_fast and is_spine_horizontal):
+                        track_history[obj_id]["fall_frames"] += 1
+                    else:
+                        # Phục hồi từ từ thay vì reset (Lưới lọc Temporal Confidence)
+                        track_history[obj_id]["fall_frames"] = max(0, track_history[obj_id]["fall_frames"] - 1)
+                    
+                    # Yêu cầu ngã duy trì ít nhất 3 frame liên tục
+                    if track_history[obj_id]["fall_frames"] >= 3:
                         track_history[obj_id]["status"] = "falling"
                         anyone_falling = True
-                        mqtt_client.publish("embedded/servo/buzzer", "ON")
+                        try: mqtt_client.publish("embedded/servo/buzzer", "ON")
+                        except Exception: pass
                         cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 4)
                         cv2.putText(annotated_frame, f"ID:{obj_id} FALLING", (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
                     else:
                         track_history[obj_id]["status"] = "normal"
-                        cv2.putText(annotated_frame, f"ID:{obj_id} Normal", (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(annotated_frame, f"ID:{obj_id} Normal (Spine: {int(spine_angle)}deg)", (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # Gửi cảnh báo sang FastAPI
         try:
@@ -193,13 +269,18 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
             alert_q.put_nowait(anyone_falling)
         except: pass
 
-        # Gửi Frame hiển thị sang FastAPI
-        success, buffer = cv2.imencode('.jpg', annotated_frame)
+        # Tối ưu hóa nén luồng hình ảnh để giảm băng thông VPS (JPEG Quality 65%)
+        success, buffer = cv2.imencode('.jpg', annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
         if success:
             if mjpeg_q.full():
                 try: mjpeg_q.get_nowait()
                 except: pass
             mjpeg_q.put_nowait(buffer.tobytes())
+            
+        # Kiểm soát FPS
+        elapsed = time.time() - loop_start
+        if elapsed < frame_time:
+            time.sleep(frame_time - elapsed)
 
     mqtt_client.loop_stop()
     logger.info("Process 2 (AI/MQTT): Exited gracefully.")
@@ -227,7 +308,8 @@ def send_telegram_alert(image_bytes, message):
         url = f"https://api.telegram.org/bot{token}/sendPhoto"
         files = {"photo": ("snapshot.jpg", image_bytes, "image/jpeg")}
         data = {"chat_id": chat_id, "caption": message}
-        resp = requests.post(url, data=data, files=files, timeout=5)
+        # Tăng timeout để phục hồi lỗi mạng
+        resp = requests.post(url, data=data, files=files, timeout=10)
         if resp.status_code == 200:
             logger.info("Telegram Alert Sent Successfully!")
         else:
@@ -239,19 +321,24 @@ def watchdog_task():
     global p_cam, p_ai
     logger.info("System Watchdog Started. Monitoring processes...")
     while not shutdown_flag.value:
-        time.sleep(3)
+        # Sleep in small chunks to allow quick shutdown
+        for _ in range(30):
+            if shutdown_flag.value: break
+            time.sleep(0.1)
         if shutdown_flag.value: break
         
         # Tự phục hồi Camera
         if p_cam and not p_cam.is_alive():
             logger.error("WATCHDOG: Camera Process Died! Restarting...")
             p_cam = mp.Process(target=camera_process, args=(raw_q, shutdown_flag))
+            p_cam.daemon = True
             p_cam.start()
             
         # Tự phục hồi AI
         if p_ai and not p_ai.is_alive():
             logger.error("WATCHDOG: AI Process Died! Restarting...")
             p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q, shutdown_flag))
+            p_ai.daemon = True
             p_ai.start()
 
 @asynccontextmanager
@@ -264,7 +351,9 @@ async def lifespan(app: FastAPI):
     shutdown_flag = mp.Value('i', 0)
     
     p_cam = mp.Process(target=camera_process, args=(raw_q, shutdown_flag))
+    p_cam.daemon = True
     p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q, shutdown_flag))
+    p_ai.daemon = True
     p_cam.start()
     p_ai.start()
     
@@ -344,12 +433,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         }
                         await websocket.send_json(alert_payload)
                         
-                        # 2. Lưu Database & Lưu file cục bộ
+                        # 2. Lưu Database & Lưu file cục bộ (Xử lý an toàn)
                         image_path = f"snapshots/fall_{int(time.time())}.jpg"
-                        with open(image_path, "wb") as f:
-                            f.write(latest_mjpeg_bytes)
-                        log_alert("FALL_DETECTED", "Bệnh nhân ngã", image_path)
-                        
+                        try:
+                            with open(image_path, "wb") as f:
+                                f.write(latest_mjpeg_bytes)
+                            log_alert("FALL_DETECTED", "Bệnh nhân ngã", image_path)
+                        except Exception as e:
+                            logger.error(f"File/Database Write Error: {e}")
+                            
                         # 3. Kích hoạt Telegram Bot (Chạy luồng riêng để không nghẽn Web)
                         threading.Thread(target=send_telegram_alert, args=(latest_mjpeg_bytes, "🚨 CẢNH BÁO TÉ NGÃ KHẨN CẤP! Vui lòng kiểm tra ngay lập tức."), daemon=True).start()
                         
