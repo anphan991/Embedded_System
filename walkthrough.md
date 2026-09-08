@@ -12,7 +12,8 @@
 | **Nguồn** | Nguồn  / Adapter 5V-3A | 1 | 75.000đ ||
 | **Nguồn** | Nguồn  / Adapter 5V-3A | 1 | 75.000đ ||
 |  | Module ESP32 DevKit V1 | 1 | có sẵn ||
-|  |  dây điện| 1 | có sẵn ||
+|  |  dây điện | 1 | có sẵn ||
+|  |  Bảng mạch cắm dây | 1 | có sẵn ||
 
 ## 3. Các Giai Đoạn Thực Hiện 
 
