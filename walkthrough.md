@@ -11,9 +11,14 @@
 | **Cảnh báo** | Module Còi 5V (Buzzer) | 1 | có sẵn | |
 | **Nguồn** | Nguồn  / Adapter 5V-3A | 1 | có sẵn ||
 |  | Module ESP32 DevKit V1 | 1 | có sẵn ||
+<<<<<<< HEAD
 |  |  dây điện| 1 | có sẵn ||
 |  |  bảng cắm dây điện| 1 | có sẵn ||
 |Tổng  |    |**~565**|
+=======
+|  |  dây điện | 1 | có sẵn ||
+|  |  Bảng mạch cắm dây | 1 | có sẵn ||
+>>>>>>> 78a77b33b8a893ab14905c984b06269a8e2ba763
 
 ## 3. Các Giai Đoạn Thực Hiện 
 
