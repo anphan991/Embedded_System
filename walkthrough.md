@@ -8,11 +8,12 @@
 | **Cảm biến** | Radar HLK-LD2450 (hoặc LD2410) | 1 | 240.000đ ||
 | **Cơ khí** | Động cơ Servo SG90 hoặc MG996R | 2 | 80.000đ |  |
 | **Cơ khí** | Khung đế nhựa/nhôm Pan-Tilt | 1 | 50.000đ |  |
-| **Cảnh báo** | Module Còi 5V (Buzzer) | 1 | 5.000đ | |
-| **Nguồn** | Nguồn  / Adapter 5V-3A | 1 | 75.000đ ||
-| **Nguồn** | Nguồn  / Adapter 5V-3A | 1 | 75.000đ ||
+| **Cảnh báo** | Module Còi 5V (Buzzer) | 1 | có sẵn | |
+| **Nguồn** | Nguồn  / Adapter 5V-3A | 1 | có sẵn ||
 |  | Module ESP32 DevKit V1 | 1 | có sẵn ||
 |  |  dây điện| 1 | có sẵn ||
+|  |  bảng cắm dây điện| 1 | có sẵn ||
+|Tổng  |    |**~565**|
 
 ## 3. Các Giai Đoạn Thực Hiện 
 
