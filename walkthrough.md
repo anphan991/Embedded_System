@@ -11,14 +11,9 @@
 | **Cảnh báo** | Module Còi 5V (Buzzer) | 1 | có sẵn | |
 | **Nguồn** | Nguồn  / Adapter 5V-3A | 1 | có sẵn ||
 |  | Module ESP32 DevKit V1 | 1 | có sẵn ||
-<<<<<<< HEAD
 |  |  dây điện| 1 | có sẵn ||
 |  |  bảng cắm dây điện| 1 | có sẵn ||
 |Tổng  |    |**~565**|
-=======
-|  |  dây điện | 1 | có sẵn ||
-|  |  Bảng mạch cắm dây | 1 | có sẵn ||
->>>>>>> 78a77b33b8a893ab14905c984b06269a8e2ba763
 
 ## 3. Các Giai Đoạn Thực Hiện 
 
@@ -46,8 +41,10 @@
 * **Cách làm & Yêu cầu:**
   * Thiết lập môi trường Backend với cấu trúc Multiprocessing. Tách biệt luồng đọc Camera và luồng AI để ngăn ngừa thắt cổ chai vòng lặp.
   * Tích hợp tự động hóa phần cứng: Mã nguồn tự động nhận dạng GPU để biên dịch mô hình YOLO sang chuẩn `TensorRT`, hoặc ép xung CPU thông qua chuẩn `OpenVINO` nhằm tối đa hóa tốc độ suy luận (Inference Speed).
-  * Phát triển thuật toán Động lực học (Kinematics): Ứng dụng vector **Trọng tâm (Center of Mass)** và **Góc cột sống (Spine Angle)** để tính toán vận tốc rơi tự do và trạng thái cơ thể.
-  * Tích hợp **Lưới lọc thời gian (Temporal Confidence)** yêu cầu duy trì trạng thái ngã trong chuỗi nhiều frames liên tiếp, khử nhiễu triệt để. Xây dựng bộ nhận diện **Cử chỉ Hủy (X-Gesture)**.
+  * Phát triển detector theo trạng thái cho từng `track_id`: không báo động chỉ vì một người đang nằm ngang; phải quan sát được baseline ổn định, chuyển tiếp bất thường và trạng thái ổn định sau sự kiện.
+  * Bao phủ ngã từ đứng, ngã từ ghế, gục từ từ và đổ sụp không hoàn toàn nằm ngang bằng trọng tâm, góc thân, khoảng cách đầu–hông, độ dịch chuyển chuẩn hóa theo chiều cao cơ thể và temporal confirmation.
+  * Bổ sung chống nhiễu do camera pan-tilt, lọc chất lượng detection/keypoint, cooldown, pruning track cũ và event cảnh báo có `track_id`.
+  * Xây dựng bộ nhận diện **Cử chỉ Hủy (X-Gesture)** và lưu bằng chứng theo event đã xác nhận.
   * Triển khai Watchdog Thread để tự động khởi động lại các tiến trình con nếu có sự cố tràn RAM hoặc mất kết nối.
 
 ### Giai đoạn 4: UI Dashboard & Networking
@@ -64,7 +61,8 @@
 Dự án hiện đang trong giai đoạn phát triển tích cực. Kiến trúc Phần mềm (Software Architecture) hiện đã đạt độ hoàn thiện cao. Chi tiết trạng thái các hạng mục:
 
 - [x] **Xây dựng cấu trúc phân tán Backend (Hoàn thành):** Đã thiết lập xong kiến trúc Multiprocessing với Watchdog. Mã nguồn chạy ổn định và sạch sẽ.
-- [x] **Tối ưu hóa Thuật toán AI (Hoàn thành):** Hoàn thiện mô hình `YOLOv8m-pose` cùng tính năng phân tích Góc Cột Sống / Trọng Tâm thay thế cho các phương pháp cũ. Đã xử lý triệt để bài toán biên dịch (OpenVINO/TensorRT) và chống báo động giả. Xử lý thành công hiện tượng treo hàng đợi (Queue Deadlock) và kết thúc tiến trình sạch gọn (Daemon).
+- [x] **Tối ưu hóa Thuật toán AI (Hoàn thành phiên bản nền):** Hoàn thiện mô hình `YOLOv8m-pose` cùng detector state machine theo từng người. Đã bổ sung phân tích góc thân, trọng tâm, khoảng cách đầu–hông, temporal confirmation, cooldown, lọc chất lượng và chống nhiễu pan-tilt. Xử lý queue latest-frame, watchdog và kết thúc tiến trình sạch gọn.
+- [x] **Kiểm thử detector (Hoàn thành):** `backend/test_fall_detection.py` kiểm tra 5 nhóm: nằm yên, di chuyển chậm, chuyển tiếp ngã, nhiều người độc lập và gục từ ghế. Tất cả test hiện tại đều pass.
 - [x] **Tích hợp các Lớp An Toàn (Hoàn thành):** Hệ thống nhận diện chuẩn xác Cử chỉ hủy báo động, cơ chế gửi ảnh cảnh báo qua API Telegram, cũng như tự động lưu log sự kiện (SQLite + Snapshots local).
 - [x] **Giao diện quản trị Frontend (Cơ bản hoàn thiện):** Xây dựng thành công hệ thống lắng nghe WebSocket, đảm bảo đồng bộ hóa luồng video và tín hiệu cảnh báo ngã lên màn hình điều khiển một cách tức thời.
 - [ ] **Giai đoạn 1 - Hệ thống Nhìn :**
@@ -76,7 +74,30 @@ Dự án hiện đang trong giai đoạn phát triển tích cực. Kiến trúc
   - Cấp mạch nguồn 5V-3A cho ESP32 thường và Servo để chống sụt áp khi động cơ kẹt.
   - Kết nối MQTT Local cho ESP32 thường để giao tiếp hai chiều với Backend AI (Nhận tọa độ xoay Servo, kích hoạt còi, báo cáo tình trạng phần cứng).
 
+### 4.1. Ma trận kịch bản kiểm thử Fall Detection
+
+| Kịch bản | Kỳ vọng | Trạng thái |
+| :--- | :--- | :---: |
+| Đứng yên / đi chậm | Không báo động | Đã có unit test |
+| Nằm yên từ đầu video | Không báo động mới | Đã có unit test |
+| Đứng → ngã ngang | Xác nhận sau temporal confirmation | Đã có unit test |
+| Ngồi ghế → gục từ từ | Xác nhận sau thay đổi thân + đầu–hông + bất động | Đã có unit test |
+| Nhiều người | Mỗi người độc lập theo `track_id` | Đã có unit test |
+| Vấp rồi tự đứng dậy | Cần video replay để đo false positive | Cần bổ sung |
+| Bị che khuất / ID switch | Không suy luận qua khoảng mất track | Đã có logic bảo vệ |
+| Ngã ra ngoài khung hình | Cần Radar/vùng giám sát bổ sung | Chưa đủ với RGB |
+| Đã nằm sẵn rồi bất tỉnh | Cần radar/cảm biến giường hoặc người kiểm tra | Chưa đủ với RGB |
+
+Chạy test tự động:
+
+```powershell
+cd backend
+python -m unittest -v test_fall_detection.py
+```
+
 ## 5. Định Hướng Triển Khai 
+
+> Lưu ý: camera RGB chỉ có thể phát hiện tốt các sự kiện có chuyển tiếp quan sát được. Không nên tuyên bố hệ thống bao phủ 100% mọi tai nạn hoặc kết luận nạn nhân bất tỉnh nếu chưa có sensor fusion và đánh giá bằng dữ liệu thực tế.
 
 1. **ESP32-CAM**
    * **Truyền phát Video:** Cấu hình Web Server phát luồng MJPEG.
@@ -88,6 +109,7 @@ Dự án hiện đang trong giai đoạn phát triển tích cực. Kiến trúc
 3. **Sensor Fusion - Tính năng Wake-on-Motion bằng Radar:**
    * Thay vì để Camera stream 24/7 và làm tắc nghẽn Wifi, **Radar sẽ là cảm biến đánh thức hệ thống**. Khi phòng không có người, ESP32 thường sẽ gửi lệnh MQTT báo Camera và AI đi vào chế độ ngủ (Standby - gửi 1 FPS). 
    * Khi Radar phát hiện mục tiêu bước vào vùng quét, nó lập tức "Wake up" toàn bộ hệ thống: Xoay Servo hướng thẳng vào mục tiêu, yêu cầu Camera đẩy tốc độ lên 20-30 FPS để Backend phân tích dáng điệu.
+4. **Mở rộng an toàn:** dùng radar để xác nhận người bất động, cảm biến áp lực cho giường/ghế, vùng cấm quanh cầu thang/ban công và cơ chế phát hiện người rời khỏi khung hình sau va chạm.
 
 ## 6. Phương Án Dự Phòng & Xử Lý Sự Cố 
 

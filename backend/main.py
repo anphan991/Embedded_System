@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 
 from database import init_db, log_alert
+from fall_detection import FallDetector, FallObservation
 
 # Load environment variables (Telegram config)
 load_dotenv()
@@ -33,7 +34,6 @@ logger = logging.getLogger(__name__)
 # Constants
 VIDEO_SOURCE = 0
 FALL_DURATION_THRESHOLD_SEC = 1.5
-FALL_VELOCITY_THRESHOLD = 300.0
 
 # Tạo thư mục chứa ảnh Snapshot nếu chưa có
 os.makedirs("snapshots", exist_ok=True)
@@ -122,7 +122,8 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
             logger.info("Loading PyTorch CPU model...")
             pose_estimator = YOLO(model_path, task='pose')
 
-    track_history = {}
+    fall_detector = FallDetector()
+    previous_features = {}
     last_heartbeat = 0
     
     # Giới hạn FPS AI để giảm tải VPS (15 FPS)
@@ -153,7 +154,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
             continue
         
         annotated_frame = results[0].plot()
-        anyone_falling = False
+        fall_event = None
 
         if len(results) > 0 and results[0].boxes and results[0].boxes.id is not None:
             boxes = results[0].boxes
@@ -170,18 +171,23 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     try: mqtt_client.publish("embedded/servo/tracking", f"{target_x},{target_y}")
                     except Exception: pass
                 
-                width = x2 - x1
-                height = y2 - y1
+                width = max(1.0, x2 - x1)
+                height = max(1.0, y2 - y1)
                 aspect_ratio = width / height if height > 0 else 0
                 
                 # Phân tích Keypoints (Spine Angle & Center of Mass)
                 kp = keypoints.xy[i]
-                nose_y = kp[0][1].item() if len(kp) > 0 else 0
-                left_knee_y = kp[13][1].item() if len(kp) > 13 else 0
-                right_knee_y = kp[14][1].item() if len(kp) > 14 else 0
+                kp_conf = keypoints.conf[i] if keypoints.conf is not None else None
+                # Torso confidence is more useful than the average of all 17
+                # joints (hands/feet are often occluded in a crowded room).
+                torso_indices = (5, 6, 11, 12)
+                visible = [float(kp_conf[j].item()) for j in torso_indices if kp_conf is not None and j < len(kp_conf)]
+                keypoint_confidence = sum(visible) / len(visible) if visible else 0.0
                 
                 spine_angle = 90.0 # Mặc định đứng thẳng
-                com_y = nose_y # Default Center of Mass (CoM)
+                com_y = (y1 + y2) / 2.0
+                head_y = y1
+                hip_y = com_y
                 
                 if len(kp) > 12:
                     shoulder_l = kp[5]
@@ -189,7 +195,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     hip_l = kp[11]
                     hip_r = kp[12]
                     
-                    if shoulder_l[1] > 0 and shoulder_r[1] > 0 and hip_l[1] > 0 and hip_r[1] > 0:
+                    if all(float(p[1]) > 0 for p in (shoulder_l, shoulder_r, hip_l, hip_r)):
                         shoulder_center_x = (shoulder_l[0].item() + shoulder_r[0].item()) / 2.0
                         shoulder_center_y = (shoulder_l[1].item() + shoulder_r[1].item()) / 2.0
                         hip_center_x = (hip_l[0].item() + hip_r[0].item()) / 2.0
@@ -201,6 +207,9 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                         if dy != 0 or dx != 0:
                             spine_angle = math.degrees(math.atan2(abs(dy), abs(dx)))
                         com_y = hip_center_y # Lấy hông làm trọng tâm cơ thể
+                        hip_y = hip_center_y
+                if len(kp) > 0 and float(kp[0][1]) > 0:
+                    head_y = float(kp[0][1])
                 
                 # Cử chỉ Hủy (X-Gesture) được tối ưu: Mở rộng vùng dung sai tay
                 is_x_gesture = False
@@ -216,57 +225,53 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                         if arms_raised and wrists_crossed:
                             is_x_gesture = True
 
-                # Trạng thái & Vận tốc rơi (Dựa trên CoM)
-                current_t = time.time()
-                if obj_id not in track_history:
-                    track_history[obj_id] = {"y_history": [], "status": "normal", "gesture_cooldown": 0, "fall_frames": 0}
-                
-                history = track_history[obj_id]["y_history"]
-                if com_y > 0: history.append((current_t, com_y))
-                if len(history) > 10: history.pop(0)
-                    
-                y_velocity = 0.0
-                if len(history) >= 3:
-                    dt = history[-1][0] - history[0][0]
-                    dy = history[-1][1] - history[0][1]
-                    y_velocity = dy / dt if dt > 0 else 0.0
-                    
-                is_horizontal = aspect_ratio > 1.2
-                is_spine_horizontal = spine_angle < 45.0
-                is_falling_fast = y_velocity > FALL_VELOCITY_THRESHOLD
-                
-                # LOGIC CỐT LÕI (Ngã + Cử chỉ Hủy)
+                # Per-track temporal state machine. A horizontal pose alone is
+                # intentionally insufficient: the track must have been upright,
+                # transition with normalized downward motion, then remain stable.
                 if is_x_gesture:
-                    track_history[obj_id]["status"] = "normal"
-                    track_history[obj_id]["fall_frames"] = 0
-                    track_history[obj_id]["gesture_cooldown"] = time.time() + 5.0 # Miễn nhiễm 5s
+                    fall_detector.tracks.pop(obj_id, None)
                     cv2.putText(annotated_frame, "ALARM CANCELED", (int(x1), int(y1)-30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 3)
                     try: mqtt_client.publish("embedded/servo/buzzer", "OFF")
                     except Exception: pass
-                elif time.time() > track_history[obj_id]["gesture_cooldown"]:
-                    # Ngã khi: (Dáng nằm ngang + Cột sống thấp) HOẶC (Rơi nhanh + Cột sống thấp)
-                    if (is_horizontal and is_spine_horizontal) or (is_falling_fast and is_spine_horizontal):
-                        track_history[obj_id]["fall_frames"] += 1
-                    else:
-                        # Phục hồi từ từ thay vì reset (Lưới lọc Temporal Confidence)
-                        track_history[obj_id]["fall_frames"] = max(0, track_history[obj_id]["fall_frames"] - 1)
-                    
-                    # Yêu cầu ngã duy trì ít nhất 3 frame liên tục
-                    if track_history[obj_id]["fall_frames"] >= 3:
-                        track_history[obj_id]["status"] = "falling"
-                        anyone_falling = True
-                        try: mqtt_client.publish("embedded/servo/buzzer", "ON")
-                        except Exception: pass
-                        cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 4)
-                        cv2.putText(annotated_frame, f"ID:{obj_id} FALLING", (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-                    else:
-                        track_history[obj_id]["status"] = "normal"
-                        cv2.putText(annotated_frame, f"ID:{obj_id} Normal (Spine: {int(spine_angle)}deg)", (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    previous_features.pop(obj_id, None)
+                    continue
+
+                current_t = time.monotonic()
+                prior = previous_features.get(obj_id)
+                posture_motion = 0.0
+                if prior:
+                    dt = max(1e-3, current_t - prior[0])
+                    posture_motion = abs(spine_angle - prior[1]) / 90.0 / dt
+                previous_features[obj_id] = (current_t, spine_angle, com_y)
+                detection_confidence = float(boxes.conf[i].item()) if boxes.conf is not None else 0.0
+                decision = fall_detector.update(obj_id, FallObservation(
+                    timestamp=current_t,
+                    detection_confidence=detection_confidence,
+                    keypoint_confidence=keypoint_confidence,
+                    aspect_ratio=aspect_ratio,
+                    spine_angle=spine_angle,
+                    com_y=com_y,
+                    body_height=height,
+                    posture_motion=posture_motion,
+                    head_y=head_y,
+                    hip_y=hip_y,
+                ))
+                if decision.newly_confirmed:
+                    fall_event = {"track_id": obj_id, "reason": decision.reason, "timestamp": time.time()}
+                    try: mqtt_client.publish("embedded/servo/buzzer", "ON")
+                    except Exception: pass
+                color = (0, 0, 255) if decision.confirmed else ((0, 165, 255) if decision.state == "candidate" else (0, 255, 0))
+                cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 3 if decision.confirmed else 2)
+                label = f"ID:{obj_id} {decision.state.upper()}"
+                cv2.putText(annotated_frame, label, (int(x1), max(20, int(y1)-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        fall_detector.prune(time.monotonic())
 
         # Gửi cảnh báo sang FastAPI
         try:
-            if alert_q.full(): alert_q.get_nowait()
-            alert_q.put_nowait(anyone_falling)
+            if fall_event is not None:
+                if alert_q.full(): alert_q.get_nowait()
+                alert_q.put_nowait(fall_event)
         except: pass
 
         # Tối ưu hóa nén luồng hình ảnh để giảm băng thông VPS (JPEG Quality 65%)
@@ -297,6 +302,7 @@ p_cam = None
 p_ai = None
 latest_mjpeg_bytes = b""
 alert_active = False
+last_alert_signature = None
 
 def send_telegram_alert(image_bytes, message):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -401,8 +407,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     logger.info("Web Dashboard connected.")
     
-    fall_start_time = 0.0
-    global alert_active
+    global alert_active, last_alert_signature
     
     try:
         while True:
@@ -413,42 +418,38 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             try:
-                is_falling = alert_q.get_nowait()
+                fall_event = alert_q.get_nowait()
             except queue.Empty:
-                is_falling = False if fall_start_time == 0.0 else True
-                
-            if is_falling:
-                if fall_start_time == 0.0:
-                    fall_start_time = time.time()
-                elif (time.time() - fall_start_time) > FALL_DURATION_THRESHOLD_SEC:
-                    if not alert_active:
-                        alert_active = True
-                        
-                        # 1. Báo động WebSocket cho Frontend
-                        alert_payload = {
-                            "type": "CRITICAL_ALERT",
-                            "event_code": "FALL_DETECTED",
-                            "message": "Cảnh báo khẩn cấp: Bệnh nhân đã ngã và bất tỉnh!",
-                            "timestamp": time.time()
-                        }
-                        await websocket.send_json(alert_payload)
-                        
-                        # 2. Lưu Database & Lưu file cục bộ (Xử lý an toàn)
-                        image_path = f"snapshots/fall_{int(time.time())}.jpg"
-                        try:
-                            with open(image_path, "wb") as f:
-                                f.write(latest_mjpeg_bytes)
-                            log_alert("FALL_DETECTED", "Bệnh nhân ngã", image_path)
-                        except Exception as e:
-                            logger.error(f"File/Database Write Error: {e}")
-                            
-                        # 3. Kích hoạt Telegram Bot (Chạy luồng riêng để không nghẽn Web)
-                        threading.Thread(target=send_telegram_alert, args=(latest_mjpeg_bytes, "🚨 CẢNH BÁO TÉ NGÃ KHẨN CẤP! Vui lòng kiểm tra ngay lập tức."), daemon=True).start()
-                        
-                    await asyncio.sleep(2.0)
-            else:
-                fall_start_time = 0.0
-                alert_active = False
+                fall_event = None
+
+            # The AI process emits only a newly-confirmed, per-track event.
+            # This avoids duplicate alerts caused by multiple websocket clients.
+            event_signature = None if not fall_event else (
+                fall_event.get("track_id"), fall_event.get("timestamp")
+            )
+            if fall_event and event_signature != last_alert_signature:
+                alert_active = True
+                last_alert_signature = event_signature
+                alert_payload = {
+                    "type": "CRITICAL_ALERT",
+                    "event_code": "FALL_DETECTED",
+                    "track_id": fall_event.get("track_id"),
+                    "message": "Cảnh báo khẩn cấp: phát hiện ngã hoặc gục bất thường, cần kiểm tra ngay.",
+                    "timestamp": fall_event.get("timestamp", time.time()),
+                }
+                await websocket.send_json(alert_payload)
+                image_path = f"snapshots/fall_{int(time.time())}_{fall_event.get('track_id', 'unknown')}.jpg"
+                try:
+                    with open(image_path, "wb") as f:
+                        f.write(latest_mjpeg_bytes)
+                    log_alert("FALL_DETECTED", f"Phát hiện ngã ở track {fall_event.get('track_id')}", image_path)
+                except Exception as e:
+                    logger.error(f"File/Database Write Error: {e}")
+                threading.Thread(
+                    target=send_telegram_alert,
+                    args=(latest_mjpeg_bytes, "🚨 CẢNH BÁO TÉ NGÃ KHẨN CẤP! Vui lòng kiểm tra ngay lập tức."),
+                    daemon=True,
+                ).start()
             
             await asyncio.sleep(0.2)
     except WebSocketDisconnect:
