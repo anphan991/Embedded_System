@@ -24,14 +24,14 @@ class FallConfig:
     confirmation_time: float = 0.70
     gradual_confirmation_time: float = 1.20
     post_impact_stability: float = 0.30
-    cooldown: float = 8.0
-    history_seconds: float = 2.5
+    cooldown: float = 4.0
+    history_seconds: float = 5.0
     max_observation_gap: float = 0.55
     horizontal_aspect_ratio: float = 1.18
     horizontal_spine_angle: float = 48.0
     min_drop_body_heights: float = 0.30
     min_downward_speed: float = 0.55
-    max_post_impact_speed: float = 0.45
+    max_post_impact_speed: float = 0.90
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,7 @@ class FallObservation:
     posture_motion: float = 0.0
     head_y: float = 0.0
     hip_y: float = 0.0
+    is_camera_moving: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,16 +131,11 @@ class FallDetector:
             track.upright_since is not None
             and obs.timestamp - track.upright_since >= cfg.min_upright_time
         )
-        posture_change = 0.0
-        if track.observations:
-            posture_change = abs(obs.spine_angle - track.observations[0].spine_angle)
         # Camera motion can move every bounding box at once. Requiring a real
         # body-orientation change prevents that global translation from being
         # interpreted as a fall.
-        posture_change = (
-            abs(obs.spine_angle - track.observations[0].spine_angle)
-            if track.observations else 0.0
-        )
+        max_spine = max((o.spine_angle for o in track.observations), default=obs.spine_angle)
+        posture_change = max(0.0, max_spine - obs.spine_angle)
         head_hip_drop = (
             (track.baseline_head_hip_ratio - head_hip_ratio)
             if track.baseline_head_hip_ratio is not None else 0.0
@@ -157,11 +153,13 @@ class FallDetector:
             prior_upright
             and not horizontal
             and posture_change >= 18.0
-            and head_hip_drop >= 0.10
-            and (drop >= 0.18 or speed >= 0.25)
+            and head_hip_drop >= 0.15
         )
         transition = horizontal_transition or gradual_collapse
-        collapsed_posture = horizontal or obs.spine_angle <= 60.0 or head_hip_drop >= 0.10
+        collapsed_posture = horizontal or obs.spine_angle <= 60.0 or head_hip_drop >= 0.15
+
+        if obs.is_camera_moving:
+            transition = False
 
         if obs.timestamp < track.cooldown_until:
             return FallDecision(track.state, 0.0, track.state == "confirmed", reason="cooldown")
@@ -171,11 +169,16 @@ class FallDetector:
             track.candidate_since = track.candidate_since or obs.timestamp
             track.last_positive = obs.timestamp
         elif track.state == "candidate":
-            if collapsed_posture and stable:
+            if obs.is_camera_moving:
+                # Saccadic Masking: Freeze candidate state and avoid timeout while camera moves
+                track.candidate_since = obs.timestamp
                 track.last_positive = obs.timestamp
-            if obs.timestamp - (track.candidate_since or obs.timestamp) > cfg.candidate_timeout:
-                track.state = "recovery"
-                track.candidate_since = None
+            else:
+                if collapsed_posture and stable:
+                    track.last_positive = obs.timestamp
+                if obs.timestamp - (track.candidate_since or obs.timestamp) > cfg.candidate_timeout:
+                    track.state = "recovery"
+                    track.candidate_since = None
 
         if track.state == "candidate":
             candidate_age = obs.timestamp - (track.candidate_since or obs.timestamp)
@@ -224,10 +227,10 @@ class FallDetector:
     def _drop_in_body_heights(history: Deque[FallObservation]) -> float:
         if len(history) < 2:
             return 0.0
-        start = history[0]
+        min_com_y = min(o.com_y for o in history)
         end = history[-1]
-        scale = max(8.0, (start.body_height + end.body_height) / 2.0)
-        return max(0.0, (end.com_y - start.com_y) / scale)
+        scale = max(8.0, end.body_height)
+        return max(0.0, (end.com_y - min_com_y) / scale)
 
     @staticmethod
     def _head_hip_ratio(obs: FallObservation) -> float:

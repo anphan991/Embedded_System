@@ -75,9 +75,29 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     # 1. Khởi tạo MQTT (Giao tiếp với ESP32)
     import paho.mqtt.client as mqtt
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    
+    is_camera_moving = False
+    
+    def on_mqtt_message(client, userdata, msg):
+        nonlocal is_camera_moving
+        try:
+            if msg.topic == "embedded/servo/status":
+                payload = msg.payload.decode('utf-8').strip().upper()
+                if payload == "MOVING":
+                    is_camera_moving = True
+                elif payload == "STOPPED":
+                    is_camera_moving = False
+        except Exception:
+            pass
+
+    mqtt_client.on_message = on_mqtt_message
+    
+    broker = os.getenv("MQTT_BROKER", "localhost")
     try:
-        mqtt_client.connect("broker.emqx.io", 1883, 60)
+        mqtt_client.connect(broker, 1883, 60)
+        mqtt_client.subscribe("embedded/servo/status")
         mqtt_client.loop_start()
+        logger.info(f"Process 2: Connected to MQTT broker at {broker}")
     except Exception as e:
         logger.warning(f"Process 2: MQTT Connection failed: {e}")
 
@@ -164,12 +184,20 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                 obj_id = int(boxes.id[i].item())
                 x1, y1, x2, y2 = boxes.xyxy[i].tolist()
                 
-                # Bắn tọa độ mục tiêu
+                # Bắn tọa độ mục tiêu với Deadband 15%
                 if i == 0:
                     target_x = int((x1 + x2) / 2)
                     target_y = int((y1 + y2) / 2)
-                    try: mqtt_client.publish("embedded/servo/tracking", f"{target_x},{target_y}")
-                    except Exception: pass
+                    
+                    frame_h, frame_w = frame.shape[:2]
+                    center_x, center_y = frame_w / 2.0, frame_h / 2.0
+                    deadband_x = frame_w * 0.15
+                    deadband_y = frame_h * 0.15
+                    
+                    # Chỉ gửi lệnh quay Servo nếu mục tiêu ra khỏi vùng an toàn
+                    if abs(target_x - center_x) > deadband_x or abs(target_y - center_y) > deadband_y:
+                        try: mqtt_client.publish("embedded/servo/tracking", f"{target_x},{target_y}")
+                        except Exception: pass
                 
                 width = max(1.0, x2 - x1)
                 height = max(1.0, y2 - y1)
@@ -229,17 +257,27 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                 # intentionally insufficient: the track must have been upright,
                 # transition with normalized downward motion, then remain stable.
                 if is_x_gesture:
-                    fall_detector.tracks.pop(obj_id, None)
+                    track = fall_detector.tracks.get(obj_id)
+                    if track:
+                        # Reset trạng thái báo động nhưng giữ lại lịch sử để không bị mù với lần ngã sau
+                        track.state = "unknown"
+                        track.candidate_since = None
+                        track.confirmed_at = 0.0
+                        track.cooldown_until = 0.0
                     cv2.putText(annotated_frame, "ALARM CANCELED", (int(x1), int(y1)-30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 3)
                     try: mqtt_client.publish("embedded/servo/buzzer", "OFF")
                     except Exception: pass
-                    previous_features.pop(obj_id, None)
+                    # Không xoá previous_features để giữ liền mạch tracking
                     continue
 
                 current_t = time.monotonic()
                 prior = previous_features.get(obj_id)
                 posture_motion = 0.0
                 if prior:
+                    # Áp dụng bộ lọc Low-pass (EMA) để khử nhiễu (Jitter) khi nằm nghiêng bị che khuất khớp
+                    spine_angle = 0.6 * spine_angle + 0.4 * prior[1]
+                    com_y = 0.7 * com_y + 0.3 * prior[2]
+                    
                     dt = max(1e-3, current_t - prior[0])
                     posture_motion = abs(spine_angle - prior[1]) / 90.0 / dt
                 previous_features[obj_id] = (current_t, spine_angle, com_y)
@@ -255,6 +293,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     posture_motion=posture_motion,
                     head_y=head_y,
                     hip_y=hip_y,
+                    is_camera_moving=is_camera_moving
                 ))
                 if decision.newly_confirmed:
                     fall_event = {"track_id": obj_id, "reason": decision.reason, "timestamp": time.time()}
