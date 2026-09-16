@@ -3,11 +3,13 @@ import unittest
 from fall_detection import FallDetector, FallObservation
 
 
-def obs(t, *, horizontal=False, y=200.0, speed_conf=0.9, head_y=None, hip_y=None, spine_angle=None):
+def obs(t, *, horizontal=False, y=200.0, speed_conf=0.9, head_y=None, shoulder_y=None, hip_y=None, spine_angle=None):
     if hip_y is None:
         hip_y = y
     if head_y is None:
         head_y = y - (30.0 if horizontal else 60.0)
+    if shoulder_y is None:
+        shoulder_y = head_y + 10.0
     return FallObservation(
         timestamp=t,
         detection_confidence=speed_conf,
@@ -17,7 +19,9 @@ def obs(t, *, horizontal=False, y=200.0, speed_conf=0.9, head_y=None, hip_y=None
         com_y=y,
         body_height=100.0,
         head_y=head_y,
+        shoulder_y=shoulder_y,
         hip_y=hip_y,
+        face_visible=True,
     )
 
 

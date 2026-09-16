@@ -215,11 +215,16 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                 spine_angle = 90.0 # Mặc định đứng thẳng
                 com_y = (y1 + y2) / 2.0
                 head_y = y1
+                shoulder_y = y1
                 hip_y = com_y
                 
-                if len(kp) > 12:
+                if len(kp) > 6:
                     shoulder_l = kp[5]
                     shoulder_r = kp[6]
+                    if float(shoulder_l[1]) > 0 and float(shoulder_r[1]) > 0:
+                        shoulder_y = (shoulder_l[1].item() + shoulder_r[1].item()) / 2.0
+
+                if len(kp) > 12:
                     hip_l = kp[11]
                     hip_r = kp[12]
                     
@@ -236,16 +241,23 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                             spine_angle = math.degrees(math.atan2(abs(dy), abs(dx)))
                         com_y = hip_center_y # Lấy hông làm trọng tâm cơ thể
                         hip_y = hip_center_y
-                if len(kp) > 0 and float(kp[0][1]) > 0:
-                    head_y = float(kp[0][1])
+
+                # Trích xuất đầu (head_y) ưu tiên: Mũi -> Mắt -> Tai -> Đỉnh bbox
+                face_visible = False
+                for k_idx in (0, 1, 2, 3, 4):
+                    if len(kp) > k_idx and float(kp[k_idx][1]) > 0:
+                        head_y = float(kp[k_idx][1])
+                        break
+                
+                if kp_conf is not None and len(kp_conf) > 2:
+                    # Mũi hoặc 1 trong 2 mắt có confidence > 0.4
+                    face_visible = float(kp_conf[0]) > 0.4 or float(kp_conf[1]) > 0.4 or float(kp_conf[2]) > 0.4
                 
                 # Cử chỉ Hủy (X-Gesture) được tối ưu: Mở rộng vùng dung sai tay
                 is_x_gesture = False
                 if len(kp) > 10:
                     wrist_l = kp[9]
                     wrist_r = kp[10]
-                    shoulder_l = kp[5]
-                    shoulder_r = kp[6]
                     
                     if wrist_l[1] > 0 and wrist_r[1] > 0 and shoulder_l[1] > 0 and shoulder_r[1] > 0:
                         arms_raised = (wrist_l[1].item() < shoulder_l[1].item()) and (wrist_r[1].item() < shoulder_r[1].item())
@@ -292,7 +304,9 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     body_height=height,
                     posture_motion=posture_motion,
                     head_y=head_y,
+                    shoulder_y=shoulder_y,
                     hip_y=hip_y,
+                    face_visible=face_visible,
                     is_camera_moving=is_camera_moving
                 ))
                 if decision.newly_confirmed:

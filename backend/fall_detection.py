@@ -31,7 +31,7 @@ class FallConfig:
     horizontal_spine_angle: float = 48.0
     min_drop_body_heights: float = 0.30
     min_downward_speed: float = 0.55
-    max_post_impact_speed: float = 0.90
+    max_post_impact_speed: float = 1.50
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,9 @@ class FallObservation:
     body_height: float
     posture_motion: float = 0.0
     head_y: float = 0.0
+    shoulder_y: float = 0.0
     hip_y: float = 0.0
+    face_visible: bool = True
     is_camera_moving: bool = False
 
 
@@ -136,33 +138,84 @@ class FallDetector:
         # interpreted as a fall.
         max_spine = max((o.spine_angle for o in track.observations), default=obs.spine_angle)
         posture_change = max(0.0, max_spine - obs.spine_angle)
-        head_hip_drop = (
-            (track.baseline_head_hip_ratio - head_hip_ratio)
-            if track.baseline_head_hip_ratio is not None else 0.0
-        )
+        
+        max_ratio = max((self._head_hip_ratio(o) for o in track.observations), default=head_hip_ratio)
+        head_hip_drop = max(0.0, max_ratio - head_hip_ratio)
+        
+        # Thêm biến theo dõi khoảng cách đầu-vai (đã chuẩn hóa). Giải quyết lỗi tai ở trên vai khi đầu gục sát ngực.
+        scale = max(8.0, obs.body_height)
+        hs_dist = max(0.0, (obs.shoulder_y - obs.head_y) / scale)
+        max_hs_dist = max(max(0.0, (o.shoulder_y - o.head_y) / max(8.0, o.body_height)) for o in track.observations) if track.observations else hs_dist
+        head_shoulder_drop = max(0.0, max_hs_dist - hs_dist)
+        
+        # Xử lý Ảo ảnh Phối cảnh (Perspective Distortion): Khi gục về phía camera, đầu phình to ra và che khuất,
+        # khoảng cách từ chóp tóc đến vai trên ảnh 2D thực chất LỚN HƠN (dãn ra) so với lúc ngồi thẳng!
+        min_hs_dist = min(max(0.0, (o.shoulder_y - o.head_y) / max(8.0, o.body_height)) for o in track.observations) if track.observations else hs_dist
+        head_shoulder_expansion = max(0.0, hs_dist - min_hs_dist)
+
         horizontal_transition = (
             prior_upright
             and horizontal
             and posture_change >= 15.0
             and (drop >= cfg.min_drop_body_heights or speed >= cfg.min_downward_speed)
         )
-        # A person can slump from a chair without ever producing a wide,
-        # horizontal bounding box. This branch looks for a sustained torso
-        # rotation, head moving toward the hip, and downward displacement.
+        
+        # Phát hiện gục đầu dựa trên hình học: Mũi (head_y) tụt xuống bằng hoặc thấp hơn Vai (shoulder_y)
+        # Bù trừ một chút nhiễu (ví dụ: -5 pixels hoặc 2% body_height để tăng độ nhạy)
+        head_below_shoulder = obs.head_y >= obs.shoulder_y - (obs.body_height * 0.02)
+        
+        # A person can slump from a chair in various ways:
+        # 1. Torso leans far back/side (posture_change >= 20.0)
+        # 2. Head drops straight down to chest/desk (head_hip_drop >= 0.08)
+        # 3. Mũi tụt sát xuống vai (head_below_shoulder) - Cực kỳ chính xác cho gục gập cổ
+        # 4. Đầu có vẻ tụt mạnh so với vai nhưng không cắt ngang (vì xài tai làm fallback) (head_shoulder_drop >= 0.08)
+        # 5. Đầu dãn to ra do gục thẳng về phía ống kính camera (head_shoulder_expansion >= 0.10)
+        # 6. Mất dấu khuôn mặt (Mũi, Mắt) khi đang ngồi (Face Occlusion / Face Lost) do cúi gập mặt giấu đi.
+        face_lost_slump = not obs.face_visible and any(o.face_visible for o in track.observations)
+        
+        chair_slump = (
+            posture_change >= 20.0
+            or head_hip_drop >= 0.08
+            or head_below_shoulder
+            or head_shoulder_drop >= 0.08
+            or head_shoulder_expansion >= 0.10
+            or (not obs.face_visible and (posture_change >= 10.0 or head_shoulder_drop >= 0.04 or head_shoulder_expansion >= 0.05))
+        )
+        
+        # --- DEBUG LOGGING ---
+        if True:
+            with open("fall_debug.log", "a") as f:
+                f.write(f"[{obs.timestamp:.1f}] posture_change: {posture_change:.1f} | head_hip_drop: {head_hip_drop:.3f} | hs_drop: {head_shoulder_drop:.3f} | head_below: {head_below_shoulder} | chair_slump: {chair_slump} | stable: {stable} | prior_up: {prior_upright} | horiz: {horizontal} | angle: {obs.spine_angle:.1f} | h_ratio: {obs.aspect_ratio:.2f}\n")
+        # ---------------------
+        
         gradual_collapse = (
             prior_upright
             and not horizontal
-            and posture_change >= 18.0
-            and head_hip_drop >= 0.15
+            and chair_slump
         )
-        transition = horizontal_transition or gradual_collapse
-        collapsed_posture = horizontal or obs.spine_angle <= 60.0 or head_hip_drop >= 0.15
+        
+        # Ngã ngồi: Rơi tự do xuống nhưng tư thế vẫn thẳng (không horizontal)
+        vertical_collapse = (
+            prior_upright
+            and not horizontal
+            and drop >= 0.35
+            and speed >= cfg.min_downward_speed
+        )
+        
+        # Ngã tiếp sau khi gắn gượng: Rất nhạy, chỉ cần đang ở trạng thái recovery mà nằm xuống lại
+        failed_recovery = (
+            track.state == "recovery"
+            and (horizontal or obs.spine_angle <= 45.0 or drop >= 0.20)
+        )
+        
+        transition = horizontal_transition or gradual_collapse or vertical_collapse or failed_recovery
+        collapsed_posture = horizontal or posture_change >= 20.0 or head_hip_drop >= 0.08 or drop >= 0.35 or head_below_shoulder or head_shoulder_drop >= 0.08 or head_shoulder_expansion >= 0.10 or (not obs.face_visible and (posture_change >= 10.0 or head_shoulder_drop >= 0.04 or head_shoulder_expansion >= 0.05))
 
         if obs.is_camera_moving:
             transition = False
 
-        if obs.timestamp < track.cooldown_until:
-            return FallDecision(track.state, 0.0, track.state == "confirmed", reason="cooldown")
+        # Không return sớm vì cooldown nữa để State Machine luôn được cập nhật liên tục!
+        # Điều này giúp phát hiện nhịp "gắn gượng dậy rồi ngã tiếp".
 
         if transition and track.state != "confirmed":
             track.state = "candidate"
@@ -179,23 +232,31 @@ class FallDetector:
                 if obs.timestamp - (track.candidate_since or obs.timestamp) > cfg.candidate_timeout:
                     track.state = "recovery"
                     track.candidate_since = None
+                    track.cooldown_until = 0.0 # Xoá cooldown khi có dấu hiệu nhúc nhích phục hồi
 
         if track.state == "candidate":
             candidate_age = obs.timestamp - (track.candidate_since or obs.timestamp)
             stable_age = obs.timestamp - track.last_positive if track.last_positive else 0.0
             required_confirmation = cfg.gradual_confirmation_time if gradual_collapse else cfg.confirmation_time
+            
             if candidate_age >= required_confirmation and collapsed_posture and stable and stable_age <= cfg.post_impact_stability:
                 track.state = "confirmed"
                 track.confirmed_at = obs.timestamp
-                track.cooldown_until = obs.timestamp + cfg.cooldown
-                reason = "gradual_collapse_and_stable" if gradual_collapse else "upright_to_horizontal_and_stable"
-                return FallDecision("confirmed", 1.0, True, True, reason)
+                
+                # Chỉ xuất báo động (newly_confirmed=True) nếu đã hết thời gian làm nguội
+                if obs.timestamp >= track.cooldown_until:
+                    track.cooldown_until = obs.timestamp + cfg.cooldown
+                    reason = "gradual_collapse_and_stable" if gradual_collapse else "upright_to_horizontal_and_stable"
+                    return FallDecision("confirmed", 1.0, True, True, reason)
+                else:
+                    return FallDecision("confirmed", 1.0, True, False, "cooldown_blocked")
 
-        if track.state == "confirmed" and not horizontal:
+        if track.state == "confirmed" and (not horizontal or obs.spine_angle >= 20.0 or obs.posture_motion >= 1.0):
             track.state = "recovery"
+            track.cooldown_until = 0.0 # Xoá cooldown ngay khi nạn nhân cố gắng bò dậy
 
-        score = min(1.0, (0.5 if collapsed_posture else 0.0) + (0.3 if transition else 0.0) + (0.2 if stable else 0.0))
-        return FallDecision(track.state, score, track.state == "confirmed", reason="candidate" if transition else "normal")
+        score = 1.0 if track.state == "confirmed" else (candidate_age / required_confirmation if track.state == "candidate" else 0.0)
+        return FallDecision(track.state, min(1.0, score), track.state == "confirmed", False, reason="candidate" if transition else "normal")
 
     def prune(self, now: float, max_age: float = 2.0) -> None:
         for track_id, track in list(self._tracks.items()):
