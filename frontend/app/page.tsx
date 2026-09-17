@@ -1,5 +1,6 @@
 "use client";
 import React, { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 
 interface AlertPayload {
   timestamp: string;
@@ -97,9 +98,17 @@ export default function SurveillanceDashboard() {
             Surveillance AI
           </h1>
         </div>
-        <div className="text-[10px] text-gray-500 uppercase tracking-widest font-mono">
-          {isConnected ? "SYSTEM ONLINE" : "RECONNECTING..."}
-        </div>
+          <div className="flex items-center gap-4">
+            <Link 
+              href="/vitals"
+              className="px-3 py-1 bg-white/10 hover:bg-white/20 text-xs font-semibold rounded transition"
+            >
+              MEDICAL DASHBOARD ↗
+            </Link>
+            <div className="text-[10px] text-gray-500 uppercase tracking-widest font-mono">
+              {isConnected ? "SYSTEM ONLINE" : "RECONNECTING..."}
+            </div>
+          </div>
       </header>
 
       {/* Main Grid Layout */}

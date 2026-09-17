@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 
-from database import init_db, log_alert
+from database import init_db, log_alert, log_vitals
 from fall_detection import FallDetector, FallObservation
 
 # Load environment variables (Telegram config)
@@ -77,9 +77,12 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     
     is_camera_moving = False
+    current_bpm = 0
+    current_breath = 0
+    last_vital_log = 0
     
     def on_mqtt_message(client, userdata, msg):
-        nonlocal is_camera_moving
+        nonlocal is_camera_moving, current_bpm, current_breath, last_vital_log
         try:
             if msg.topic == "embedded/servo/status":
                 payload = msg.payload.decode('utf-8').strip().upper()
@@ -87,6 +90,19 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     is_camera_moving = True
                 elif payload == "STOPPED":
                     is_camera_moving = False
+            elif msg.topic == "embedded/radar/vitals":
+                import json
+                try:
+                    vitals = json.loads(msg.payload.decode('utf-8'))
+                    current_bpm = int(vitals.get("bpm", 0))
+                    current_breath = int(vitals.get("breath", 0))
+                    
+                    # Log vào DB mỗi 2 giây (Chỉ để Test, sau này nên đổi thành 30s hoặc 60s)
+                    if time.time() - last_vital_log > 2:
+                        log_vitals(current_bpm, current_breath)
+                        last_vital_log = time.time()
+                except json.JSONDecodeError:
+                    pass
         except Exception:
             pass
 
@@ -96,6 +112,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     try:
         mqtt_client.connect(broker, 1883, 60)
         mqtt_client.subscribe("embedded/servo/status")
+        mqtt_client.subscribe("embedded/radar/vitals")
         mqtt_client.loop_start()
         logger.info(f"Process 2: Connected to MQTT broker at {broker}")
     except Exception as e:
@@ -145,6 +162,8 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     fall_detector = FallDetector()
     previous_features = {}
     last_heartbeat = 0
+    last_target_seen = time.time()
+    target_lost_sent = False
     
     # Giới hạn FPS AI để giảm tải VPS (15 FPS)
     target_fps = 15
@@ -177,6 +196,8 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
         fall_event = None
 
         if len(results) > 0 and results[0].boxes and results[0].boxes.id is not None:
+            last_target_seen = time.time()
+            target_lost_sent = False
             boxes = results[0].boxes
             keypoints = results[0].keypoints
 
@@ -310,15 +331,45 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     is_camera_moving=is_camera_moving
                 ))
                 if decision.newly_confirmed:
-                    fall_event = {"track_id": obj_id, "reason": decision.reason, "timestamp": time.time()}
+                    fall_event = {
+                        "track_id": obj_id, 
+                        "reason": decision.reason, 
+                        "timestamp": time.time(),
+                        "bpm": current_bpm,
+                        "breath": current_breath
+                    }
                     try: mqtt_client.publish("embedded/servo/buzzer", "ON")
                     except Exception: pass
                 color = (0, 0, 255) if decision.confirmed else ((0, 165, 255) if decision.state == "candidate" else (0, 255, 0))
                 cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 3 if decision.confirmed else 2)
                 label = f"ID:{obj_id} {decision.state.upper()}"
                 cv2.putText(annotated_frame, label, (int(x1), max(20, int(y1)-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        else:
+            # Không thấy người nào trong khung hình
+            if not target_lost_sent and (time.time() - last_target_seen > 3.0):
+                try: 
+                    mqtt_client.publish("embedded/servo/tracking", "LOST")
+                    target_lost_sent = True
+                except Exception: pass
 
         fall_detector.prune(time.monotonic())
+        
+        # --- Vẽ HUD Nhịp tim / Nhịp thở lên góc phải màn hình ---
+        if current_bpm > 0 or current_breath > 0:
+            hud_text = f"BPM: {current_bpm} | Breath: {current_breath}"
+            # Góc trên bên phải
+            frame_h, frame_w = annotated_frame.shape[:2]
+            text_size = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            text_x = frame_w - text_size[0] - 20
+            
+            # Cảnh báo màu đỏ nếu nhịp tim = 0 hoặc nhịp thở = 0 (khi đã nhận được dữ liệu)
+            color = (0, 0, 255) if current_bpm < 40 or current_breath < 10 else (0, 255, 255)
+            cv2.putText(annotated_frame, hud_text, (text_x, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            
+            # Nếu đang có người ngã (fall_event), Radar có thể dùng để đánh giá sống còn
+            if fall_event is not None and current_bpm < 40:
+                fall_event["reason"] += " + NO VITALS DETECTED"
+        # --------------------------------------------------------
 
         # Gửi cảnh báo sang FastAPI
         try:
@@ -356,6 +407,7 @@ p_ai = None
 latest_mjpeg_bytes = b""
 alert_active = False
 last_alert_signature = None
+last_telegram_sent = 0
 
 def send_telegram_alert(image_bytes, message):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -455,6 +507,21 @@ async def video_frame_generator() -> AsyncGenerator[bytes, None]:
 async def video_feed() -> StreamingResponse:
     return StreamingResponse(video_frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
 
+@app.get("/api/v1/vitals/history")
+async def get_vital_history(limit: int = 50):
+    import sqlite3
+    try:
+        conn = sqlite3.connect("local_alerts.db")
+        c = conn.cursor()
+        c.execute('SELECT timestamp, bpm, breath FROM vital_logs ORDER BY timestamp DESC LIMIT ?', (limit,))
+        rows = c.fetchall()
+        conn.close()
+        # Đảo ngược lại để xếp theo thứ tự thời gian cũ -> mới cho biểu đồ
+        data = [{"timestamp": r[0], "bpm": r[1], "breath": r[2]} for r in rows[::-1]]
+        return {"status": "success", "data": data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.websocket("/api/v1/ws/alerts")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -498,11 +565,44 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     log_alert("FALL_DETECTED", f"Phát hiện ngã ở track {fall_event.get('track_id')}", image_path)
                 except Exception as e:
                     logger.error(f"File/Database Write Error: {e}")
-                threading.Thread(
-                    target=send_telegram_alert,
-                    args=(latest_mjpeg_bytes, "🚨 CẢNH BÁO TÉ NGÃ KHẨN CẤP! Vui lòng kiểm tra ngay lập tức."),
-                    daemon=True,
-                ).start()
+                
+                # --- TELEGRAM DEBOUNCE (Rate limit: 1 tin nhắn mỗi 60 giây) ---
+                global last_telegram_sent
+                if time.time() - last_telegram_sent > 60:
+                    last_telegram_sent = time.time()
+                    
+                    bpm = fall_event.get("bpm", 0)
+                    breath = fall_event.get("breath", 0)
+                    dt_str = time.strftime("%H:%M - %d/%m/%Y")
+                    
+                    if bpm == 0:
+                        msg_text = (
+                            f"🚨 [BÁO ĐỘNG] PHÁT HIỆN TÉ NGÃ/GỤC BẤT THƯỜNG!\n"
+                            f"🕒 Thời gian: {dt_str}\n"
+                            f"🚹 Mục tiêu: Patient #{fall_event.get('track_id')}\n\n"
+                            f"📊 ĐÁNH GIÁ SINH TỒN (RADAR):\n"
+                            f"🫀 Nhịp tim: 0 (NGUY KỊCH - KHÔNG ĐO ĐƯỢC)\n"
+                            f"🫁 Nhịp thở: 0 (NGUY KỊCH - KHÔNG ĐO ĐƯỢC)\n\n"
+                            f"🚑 Yêu cầu gọi xe cấp cứu (115) ngay lập tức!"
+                        )
+                    else:
+                        msg_text = (
+                            f"🚨 [BÁO ĐỘNG] PHÁT HIỆN TÉ NGÃ/GỤC BẤT THƯỜNG!\n"
+                            f"🕒 Thời gian: {dt_str}\n"
+                            f"🚹 Mục tiêu: Patient #{fall_event.get('track_id')}\n\n"
+                            f"📊 ĐÁNH GIÁ SINH TỒN (RADAR):\n"
+                            f"🫀 Nhịp tim: {bpm} BPM (BÌNH THƯỜNG)\n"
+                            f"🫁 Nhịp thở: {breath} (BÌNH THƯỜNG)\n\n"
+                            f"🛑 Vui lòng gọi ngay cho nạn nhân hoặc mở Camera trực tiếp để kiểm tra!"
+                        )
+
+                    threading.Thread(
+                        target=send_telegram_alert,
+                        args=(latest_mjpeg_bytes, msg_text),
+                        daemon=True,
+                    ).start()
+                else:
+                    logger.warning("Bỏ qua gửi Telegram do đang trong thời gian Cooldown (60s).")
             
             await asyncio.sleep(0.2)
     except WebSocketDisconnect:

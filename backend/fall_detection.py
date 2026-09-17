@@ -168,24 +168,25 @@ class FallDetector:
         # 1. Torso leans far back/side (posture_change >= 20.0)
         # 2. Head drops straight down to chest/desk (head_hip_drop >= 0.08)
         # 3. Mũi tụt sát xuống vai (head_below_shoulder) - Cực kỳ chính xác cho gục gập cổ
-        # 4. Đầu có vẻ tụt mạnh so với vai nhưng không cắt ngang (vì xài tai làm fallback) (head_shoulder_drop >= 0.08)
-        # 5. Đầu dãn to ra do gục thẳng về phía ống kính camera (head_shoulder_expansion >= 0.10)
-        # 6. Mất dấu khuôn mặt (Mũi, Mắt) khi đang ngồi (Face Occlusion / Face Lost) do cúi gập mặt giấu đi.
-        face_lost_slump = not obs.face_visible and any(o.face_visible for o in track.observations)
+        # Phản hồi Tối thượng (Definitive Fix) cho Gục thẳng bị Sai lệch Phối cảnh (Perspective Distortion):
+        # Khi ngồi thẳng, khoảng cách từ đầu đến vai chỉ chiếm ~25% chiều cao cơ thể (hs_dist = 0.25).
+        # Nhưng khi GỤC THẲNG lên bàn, phần thân dưới bị bàn che khuất, nên Bounding Box chỉ còn là Cái Đầu và Bộ Vai.
+        # Lúc này vai sẽ nằm ở ĐÁY của bounding box. Tức là hs_dist sẽ tăng vọt lên > 60% (0.60).
+        desk_slump = (hs_dist >= 0.60) and (not obs.face_visible)
         
         chair_slump = (
             posture_change >= 20.0
             or head_hip_drop >= 0.08
             or head_below_shoulder
             or head_shoulder_drop >= 0.08
-            or head_shoulder_expansion >= 0.10
-            or (not obs.face_visible and (posture_change >= 10.0 or head_shoulder_drop >= 0.04 or head_shoulder_expansion >= 0.05))
+            or desk_slump
+            or (not obs.face_visible and (posture_change >= 10.0 or head_shoulder_expansion >= 0.05))
         )
         
         # --- DEBUG LOGGING ---
         if True:
             with open("fall_debug.log", "a") as f:
-                f.write(f"[{obs.timestamp:.1f}] posture_change: {posture_change:.1f} | head_hip_drop: {head_hip_drop:.3f} | hs_drop: {head_shoulder_drop:.3f} | head_below: {head_below_shoulder} | chair_slump: {chair_slump} | stable: {stable} | prior_up: {prior_upright} | horiz: {horizontal} | angle: {obs.spine_angle:.1f} | h_ratio: {obs.aspect_ratio:.2f}\n")
+                f.write(f"[{obs.timestamp:.1f}] hs_dist: {hs_dist:.2f} | desk_slump: {desk_slump} | p_change: {posture_change:.1f} | hs_drop: {head_shoulder_drop:.3f} | hs_exp: {head_shoulder_expansion:.3f} | chair_slump: {chair_slump}\n")
         # ---------------------
         
         gradual_collapse = (
@@ -209,7 +210,7 @@ class FallDetector:
         )
         
         transition = horizontal_transition or gradual_collapse or vertical_collapse or failed_recovery
-        collapsed_posture = horizontal or posture_change >= 20.0 or head_hip_drop >= 0.08 or drop >= 0.35 or head_below_shoulder or head_shoulder_drop >= 0.08 or head_shoulder_expansion >= 0.10 or (not obs.face_visible and (posture_change >= 10.0 or head_shoulder_drop >= 0.04 or head_shoulder_expansion >= 0.05))
+        collapsed_posture = horizontal or chair_slump or drop >= 0.35
 
         if obs.is_camera_moving:
             transition = False

@@ -17,6 +17,14 @@ def init_db():
             image_path TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS vital_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL,
+            bpm INTEGER,
+            breath INTEGER
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -32,4 +40,18 @@ def log_alert(event_code: str, message: str, image_path: str):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Lỗi khi ghi DB: {e}")
+        print(f"Database error: {e}")
+
+def log_vitals(bpm: int, breath: int):
+    """Ghi log sinh hiệu vào CSDL"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO vital_logs (timestamp, bpm, breath)
+            VALUES (?, ?, ?)
+        ''', (time.time(), bpm, breath))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Database error: {e}")

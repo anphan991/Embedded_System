@@ -42,17 +42,29 @@ logging.info("     CÔNG CỤ GIẢ LẬP PHẦN CỨNG ESP32     ")
 logging.info("=========================================")
 logging.info("Nhấn 1: Gửi trạng thái Servo MOVING (Đang xoay)")
 logging.info("Nhấn 2: Gửi trạng thái Servo STOPPED (Dừng xoay)")
+logging.info("Nhấn 3: Gửi dữ liệu Sinh hiệu BÌNH THƯỜNG (BPM=75, Breath=18)")
+logging.info("Nhấn 4: Gửi dữ liệu Sinh hiệu NGUY KỊCH (BPM=0, Breath=0)")
 logging.info("Nhấn Ctrl+C để thoát")
 
 try:
     while True:
-        cmd = input("Lệnh (1/2): ").strip()
+        cmd = input("Lệnh (1/2/3/4): ").strip()
         if cmd == "1":
             client.publish("embedded/servo/status", "MOVING")
-            logging.info("-> Đã phát tín hiệu MOVING. (Backend sẽ đóng băng thuật toán té ngã)")
+            logging.info("Đã gửi: MOVING")
         elif cmd == "2":
             client.publish("embedded/servo/status", "STOPPED")
-            logging.info("-> Đã phát tín hiệu STOPPED. (Backend tiếp tục nhận diện té ngã)")
+            logging.info("Đã gửi: STOPPED")
+        elif cmd == "3":
+            import random
+            bpm = random.randint(65, 85)
+            breath = random.randint(16, 22)
+            payload = f'{{"bpm": {bpm}, "breath": {breath}}}'
+            client.publish("embedded/radar/vitals", payload)
+            logging.info(f"Đã gửi: Sinh hiệu NGẪU NHIÊN (BPM={bpm}, Breath={breath})")
+        elif cmd == "4":
+            client.publish("embedded/radar/vitals", '{"bpm": 0, "breath": 0}')
+            logging.info("Đã gửi: Sinh hiệu NGUY KỊCH (BPM=0, Breath=0)")
         else:
             logging.info("Lệnh không hợp lệ.")
 except KeyboardInterrupt:

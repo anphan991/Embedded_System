@@ -1,4 +1,4 @@
-# Hướng dẫn Khởi chạy Dự án: Hệ thống Giám sát & Bám sát Mục tiêu
+﻿# Hướng dẫn Khởi chạy Dự án: Hệ thống Giám sát & Bám sát Mục tiêu
 
 
 ## 1. Yêu cầu Nền tảng 
@@ -67,29 +67,34 @@ Dự án đã được tối ưu hóa toàn diện cho việc triển khai trên
   - Thay đổi hệ thống Multiprocessing sang chuẩn `daemon=True` và xử lý triệt để lỗi kẹt hàng đợi (Queue Deadlock), giúp ứng dụng tắt nhanh, sạch gọn khi bấm `Ctrl + C`.
   - Cải tiến cử chỉ Hủy báo động (X-Gesture) với dung sai tay mở rộng, thân thiện hơn với người bệnh khi thao tác.
 
-## Update Mới Nhất
-### 1. Amnesia Bug
-- **Vấn đề:** Trước đây, khi giơ tay chữ X để tắt báo động giả, AI sẽ xóa sạch lịch sử theo dõi. Nếu nạn nhân lúc này đang ngồi trên ghế và tiếp tục ngã xuống đất, AI sẽ bỏ qua vì không thấy họ "đứng thẳng" trước đó.
+- **Amnesia Bug:** Trước đây, khi giơ tay chữ X để tắt báo động giả, AI sẽ xóa sạch lịch sử theo dõi. Nếu nạn nhân lúc này đang ngồi trên ghế và tiếp tục ngã xuống đất, AI sẽ bỏ qua vì không thấy họ "đứng thẳng" trước đó.
 - **Giải pháp:** Sửa đổi `main.py` để cử chỉ chữ X chỉ Reset trạng thái còi và làm nguội cảnh báo (Cooldown), nhưng **giữ lại (preserve)** toàn bộ lịch sử tư thế. Nhờ đó, các cú ngã liên hoàn hoặc ngã sau khi hủy báo động giả đều được bắt chính xác.
 
-### 2. Bắt lỗi "Ngã từ từ / Trôi từ trên ghế" 
-- **Vấn đề:** 
+- **Bắt lỗi "Ngã từ từ / Trôi từ trên ghế"** 
   - Khung thời gian so sánh (History Window) 2.5s quá ngắn. Nếu ngã mất 5-8 giây, tốc độ quá chậm để kích hoạt.
   - Khi gục trên ghế, phần Hông không rơi xuống đất, dẫn đến logic kiểm tra `drop` (Tụt trọng tâm) bị đánh trượt.
 - **Giải pháp:**
   - Tăng `history_seconds` lên `5.0s` và dùng hàm `max_spine` / `min_com_y` để quét toàn bộ lịch sử, lấy mốc đứng cao nhất làm chuẩn để so sánh. Dù ngã chậm đến đâu cũng bị phát hiện.
   - Cập nhật hàm `gradual_collapse` trong `fall_detection.py`: Hủy bỏ yêu cầu "tụt Hông" đối với trường hợp gục trên ghế. Thay vào đó, nếu Tỉ lệ khoảng cách Đầu - Hông bị tụt mạnh (`head_hip_drop >= 0.15`), AI sẽ lập tức báo động!
 
-### 3. Khử nhiễu "Nằm nghiêng / Cuộn tròn" 
-- **Vấn đề:** Khi nằm nghiêng, khung xương bị che khuất một phần khiến AI nội suy sai, làm các khớp xương nhảy múa liên tục trên màn hình. AI thấy rung lắc mạnh nên đánh giá nạn nhân "chưa nằm im" và từ chối báo động.
+- **Khử nhiễu "Nằm nghiêng / Cuộn tròn"** Khi nằm nghiêng, khung xương bị che khuất một phần khiến AI nội suy sai, làm các khớp xương nhảy múa liên tục trên màn hình. AI thấy rung lắc mạnh nên đánh giá nạn nhân "chưa nằm im" và từ chối báo động.
 - **Giải pháp:**
   - Viết thêm bộ lọc **Exponential Moving Average (EMA)** vào `main.py` để làm mượt tuyệt đối Góc lưng và Trọng tâm.
   - Nới lỏng ngưỡng chịu nhiễu `max_post_impact_speed` từ `0.45` lên `0.90`. Nạn nhân nằm nghiêng hoặc cuộn tròn sẽ được nhận diện là đã nằm im ổn định.
 
-### 4. Thiết lập MQTT 
+- **Thiết lập MQTT**
 - Tích hợp file cấu hình `mosquitto_local.conf` để mở Port 1883 `0.0.0.0` và tắt xác thực `allow_anonymous true`, sẵn sàng cho mạch ESP32 kết nối vào mạng WiFi.
 - Bổ sung tín hiệu Heartbeat vào `mock_hardware.py` để liên tục kiểm chứng đường truyền MQTT.
 
+## Update Mới Nhất
+
+>Cập nhật giao diện & Cảnh báo Telegram 
+
+>* **Tích hợp CSDL SQLite:** Hệ thống tự động ghi lại lịch sử té ngã kèm hình ảnh và log sinh hiệu (mỗi 2 giây/lần trong chế độ test) vào `local_alerts.db`.
+>* **Medical Dashboard Độc lập:** Chuyển biểu đồ sinh hiệu sang một trang `/vitals` riêng trên Next.js
+>* **Telegram Debounce & Vitals:** Tích hợp tính năng báo động Telegram khi có người ngã. Áp dụng cơ chế rate limit 60 giây để chống spam. Tin nhắn tự động trích xuất nhịp tim và nhịp thở để cảnh báo y tế ngay trên đoạn chat.
+
+>"Lưu ý: có thể xóa thủ công file local_alerts.db này bất cứ lúc nào nếu muốn làm sạch dữ liệu cũ, vì khi khởi chạy main.py, hệ thống sẽ tự động tạo lại một file CSDL mới."
 
 ## 9 TO DO
 
@@ -139,5 +144,3 @@ Khi Pan/Tilt di chuyển camera, góc nhìn thay đổi, hệ tọa độ của 
 
 **Đề xuất nâng cấp:**
 - Phải tính toán ma trận xoay (Rotation Matrix). Nghĩa là, tọa độ X, Y mà Radar báo về phải được cộng/trừ bù trừ với góc quay Pan/Tilt hiện tại của Servo để đưa về cùng một hệ tọa độ chuẩn hóa trước khi đưa ra quyết định cảnh báo té ngã phối hợp (Sensor Fusion).
-
-Trước khi nạp code xuống phần cứng, nên xây dựng một **Script test giả lập (Mock Hardware)** trên Python để gửi nhận các gói tin MQTT ảo, kết hợp cùng 1 video được thu sẵn, từ đó tinh chỉnh hệ số `Deadband` và xem hệ thống xử lý `Saccadic Masking` (mù tạm thời lúc quay) ra sao.
