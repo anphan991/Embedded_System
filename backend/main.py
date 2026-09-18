@@ -77,12 +77,22 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     
     is_camera_moving = False
-    current_bpm = 0
-    current_breath = 0
-    last_vital_log = 0
+    current_radar_x = 0.0
+    current_radar_y = 0.0
+    current_radar_speed = 0.0
+    last_radar_log = 0
     
+    last_zones_fetch = 0
+    cached_safe_zones = []
+    cached_danger_zones = []
+    cached_room_config = {"width": 6.0, "length": 6.0, "radar_x": 3.0, "radar_y": 0.0}
+    
+    wandering_start = 0.0
+    wandering_alert_sent = False
+
     def on_mqtt_message(client, userdata, msg):
-        nonlocal is_camera_moving, current_bpm, current_breath, last_vital_log
+        nonlocal is_camera_moving, current_radar_x, current_radar_y, current_radar_speed, last_radar_log
+        nonlocal wandering_start, wandering_alert_sent, last_zones_fetch, cached_safe_zones, cached_danger_zones, cached_room_config
         try:
             if msg.topic == "embedded/servo/status":
                 payload = msg.payload.decode('utf-8').strip().upper()
@@ -90,17 +100,82 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     is_camera_moving = True
                 elif payload == "STOPPED":
                     is_camera_moving = False
-            elif msg.topic == "embedded/radar/vitals":
+            elif msg.topic == "embedded/radar/data":
                 import json
                 try:
-                    vitals = json.loads(msg.payload.decode('utf-8'))
-                    current_bpm = int(vitals.get("bpm", 0))
-                    current_breath = int(vitals.get("breath", 0))
+                    data = json.loads(msg.payload.decode('utf-8'))
+                    raw_x = float(data.get("x", 0.0))
+                    raw_y = float(data.get("y", 0.0))
+                    current_radar_speed = float(data.get("speed", 0.0))
                     
-                    # Log vào DB mỗi 2 giây (Chỉ để Test, sau này nên đổi thành 30s hoặc 60s)
-                    if time.time() - last_vital_log > 2:
-                        log_vitals(current_bpm, current_breath)
-                        last_vital_log = time.time()
+                    # Cập nhật cache Zones và Room mỗi 10 giây
+                    if time.time() - last_zones_fetch > 10:
+                        from database import get_all_zones, get_room_config
+                        all_zones = get_all_zones()
+                        cached_safe_zones = [z for z in all_zones if z["type"] == "SAFE"]
+                        cached_danger_zones = [z for z in all_zones if z["type"] == "DANGER"]
+                        cached_room_config = get_room_config()
+                        last_zones_fetch = time.time()
+
+                    # Lấy góc xoay (Yaw)
+                    angle = float(cached_room_config.get("radar_angle", 0.0))
+                    import math
+                    theta = math.radians(angle)
+                    
+                    # Phép xoay 2D
+                    rot_x = raw_x * math.cos(theta) + raw_y * math.sin(theta)
+                    rot_y = -raw_x * math.sin(theta) + raw_y * math.cos(theta)
+
+                    # ÁP DỤNG PHÉP TỊNH TIẾN TỌA ĐỘ (Coordinate Translation)
+                    current_radar_x = cached_room_config["radar_x"] + rot_x
+                    current_radar_y = cached_room_config["radar_y"] + rot_y
+
+                    # Kiểm tra Danger Zone (Cảnh báo NGAY LẬP TỨC nếu dẫm vào vùng cấm)
+                    in_danger = False
+                    for dz in cached_danger_zones:
+                        if dz["x_min"] <= current_radar_x <= dz["x_max"] and dz["y_min"] <= current_radar_y <= dz["y_max"]:
+                            in_danger = True
+                            break
+                    
+                    if in_danger:
+                        if time.time() - last_radar_log > 5: # Tránh spam log
+                            logger.warning(f"CẢNH BÁO XÂM NHẬP VÙNG NGUY HIỂM ({current_radar_x}, {current_radar_y})!")
+                            # Có thể bắn Telegram luôn ở đây nếu muốn
+                    
+                    # Logic Cảnh báo Đi lang thang ban đêm (Dementia/Wandering)
+                    # Khung giờ: 23:00 đêm đến 05:00 sáng
+                    current_hour = int(time.strftime("%H"))
+                    if current_hour >= 23 or current_hour < 5:
+                        # Kiểm tra xem có đang ở trong Safe Zone không
+                        in_safe = False
+                        if not cached_safe_zones:
+                            in_safe = current_radar_x < 0.0 # Fallback nếu chưa cấu hình
+                        else:
+                            for sz in cached_safe_zones:
+                                if sz["x_min"] <= current_radar_x <= sz["x_max"] and sz["y_min"] <= current_radar_y <= sz["y_max"]:
+                                    in_safe = True
+                                    break
+                        
+                        # Ra khỏi giường (NOT in_safe) và Đang di chuyển (speed > 0.1)
+                        if not in_safe and current_radar_speed > 0.1:
+                            if wandering_start == 0.0:
+                                wandering_start = time.time()
+                            elif time.time() - wandering_start > 300: # 5 phút liên tục
+                                if not wandering_alert_sent:
+                                    logger.warning("PHÁT HIỆN ĐI LANG THANG BAN ĐÊM!")
+                                    wandering_alert_sent = True
+                        else:
+                            wandering_start = 0.0
+                            wandering_alert_sent = False
+                    else:
+                        wandering_start = 0.0
+                        wandering_alert_sent = False
+
+                    # Log vào DB mỗi 2 giây
+                    if time.time() - last_radar_log > 2:
+                        from database import log_radar_data
+                        log_radar_data(current_radar_x, current_radar_y, current_radar_speed)
+                        last_radar_log = time.time()
                 except json.JSONDecodeError:
                     pass
         except Exception:
@@ -112,7 +187,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     try:
         mqtt_client.connect(broker, 1883, 60)
         mqtt_client.subscribe("embedded/servo/status")
-        mqtt_client.subscribe("embedded/radar/vitals")
+        mqtt_client.subscribe("embedded/radar/data")
         mqtt_client.loop_start()
         logger.info(f"Process 2: Connected to MQTT broker at {broker}")
     except Exception as e:
@@ -335,8 +410,9 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                         "track_id": obj_id, 
                         "reason": decision.reason, 
                         "timestamp": time.time(),
-                        "bpm": current_bpm,
-                        "breath": current_breath
+                        "pos_x": current_radar_x,
+                        "pos_y": current_radar_y,
+                        "speed": current_radar_speed
                     }
                     try: mqtt_client.publish("embedded/servo/buzzer", "ON")
                     except Exception: pass
@@ -354,21 +430,16 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
 
         fall_detector.prune(time.monotonic())
         
-        # --- Vẽ HUD Nhịp tim / Nhịp thở lên góc phải màn hình ---
-        if current_bpm > 0 or current_breath > 0:
-            hud_text = f"BPM: {current_bpm} | Breath: {current_breath}"
-            # Góc trên bên phải
+        # --- Vẽ HUD Radar 2D lên góc phải màn hình ---
+        if current_radar_x != 0.0 or current_radar_y != 0.0:
+            hud_text = f"X: {current_radar_x:.1f}m | Y: {current_radar_y:.1f}m | V: {current_radar_speed:.2f}m/s"
             frame_h, frame_w = annotated_frame.shape[:2]
             text_size = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
             text_x = frame_w - text_size[0] - 20
             
-            # Cảnh báo màu đỏ nếu nhịp tim = 0 hoặc nhịp thở = 0 (khi đã nhận được dữ liệu)
-            color = (0, 0, 255) if current_bpm < 40 or current_breath < 10 else (0, 255, 255)
+            # Cảnh báo màu đỏ nếu tốc độ bằng 0 trong thời gian dài (có thể đang bất tỉnh) hoặc ở vùng rìa
+            color = (0, 255, 255)
             cv2.putText(annotated_frame, hud_text, (text_x, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            
-            # Nếu đang có người ngã (fall_event), Radar có thể dùng để đánh giá sống còn
-            if fall_event is not None and current_bpm < 40:
-                fall_event["reason"] += " + NO VITALS DETECTED"
         # --------------------------------------------------------
 
         # Gửi cảnh báo sang FastAPI
@@ -507,18 +578,58 @@ async def video_frame_generator() -> AsyncGenerator[bytes, None]:
 async def video_feed() -> StreamingResponse:
     return StreamingResponse(video_frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-@app.get("/api/v1/vitals/history")
-async def get_vital_history(limit: int = 50):
+@app.get("/api/v1/radar/history")
+async def get_radar_history(limit: int = 50):
     import sqlite3
     try:
         conn = sqlite3.connect("local_alerts.db")
         c = conn.cursor()
-        c.execute('SELECT timestamp, bpm, breath FROM vital_logs ORDER BY timestamp DESC LIMIT ?', (limit,))
+        c.execute('SELECT timestamp, pos_x, pos_y, speed FROM radar_logs ORDER BY timestamp DESC LIMIT ?', (limit,))
         rows = c.fetchall()
         conn.close()
-        # Đảo ngược lại để xếp theo thứ tự thời gian cũ -> mới cho biểu đồ
-        data = [{"timestamp": r[0], "bpm": r[1], "breath": r[2]} for r in rows[::-1]]
+        data = [{"timestamp": r[0], "pos_x": r[1], "pos_y": r[2], "speed": r[3]} for r in rows[::-1]]
         return {"status": "success", "data": data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+from fastapi import Request
+
+@app.get("/api/v1/config/zones")
+async def get_zones_api():
+    from database import get_all_zones
+    zones = get_all_zones()
+    return {"status": "success", "data": zones}
+
+@app.post("/api/v1/config/zones")
+async def update_zones_api(request: Request):
+    try:
+        data = await request.json()
+        zones = data.get("zones", [])
+        from database import update_zones
+        update_zones(zones)
+        return {"status": "success", "message": "Zones updated successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/v1/config/room")
+async def get_room_config_api():
+    from database import get_room_config
+    config = get_room_config()
+    return {"status": "success", "data": config}
+
+@app.post("/api/v1/config/room")
+async def update_room_config_api(request: Request):
+    try:
+        data = await request.json()
+        from database import update_room_config
+        update_room_config(
+            width=float(data.get("width", 6.0)),
+            length=float(data.get("length", 6.0)),
+            radar_x=float(data.get("radar_x", 3.0)),
+            radar_y=float(data.get("radar_y", 0.0)),
+            radar_angle=float(data.get("radar_angle", 0.0))
+        )
+        return {"status": "success", "message": "Room config updated successfully"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -571,29 +682,32 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if time.time() - last_telegram_sent > 60:
                     last_telegram_sent = time.time()
                     
-                    bpm = fall_event.get("bpm", 0)
-                    breath = fall_event.get("breath", 0)
+                    pos_x = fall_event.get("pos_x", 0.0)
+                    pos_y = fall_event.get("pos_y", 0.0)
+                    speed = fall_event.get("speed", 0.0)
                     dt_str = time.strftime("%H:%M - %d/%m/%Y")
                     
-                    if bpm == 0:
+                    if speed == 0.0:
                         msg_text = (
                             f"🚨 [BÁO ĐỘNG] PHÁT HIỆN TÉ NGÃ/GỤC BẤT THƯỜNG!\n"
                             f"🕒 Thời gian: {dt_str}\n"
                             f"🚹 Mục tiêu: Patient #{fall_event.get('track_id')}\n\n"
-                            f"📊 ĐÁNH GIÁ SINH TỒN (RADAR):\n"
-                            f"🫀 Nhịp tim: 0 (NGUY KỊCH - KHÔNG ĐO ĐƯỢC)\n"
-                            f"🫁 Nhịp thở: 0 (NGUY KỊCH - KHÔNG ĐO ĐƯỢC)\n\n"
-                            f"🚑 Yêu cầu gọi xe cấp cứu (115) ngay lập tức!"
+                            f"📍 VỊ TRÍ (RADAR 2D):\n"
+                            f"🔸 Tọa độ X: {pos_x:.2f} m\n"
+                            f"🔸 Tọa độ Y: {pos_y:.2f} m\n"
+                            f"⚠️ Tốc độ: 0 m/s (BẤT ĐỘNG HOÀN TOÀN)\n\n"
+                            f"🚑 Yêu cầu gọi người nhà kiểm tra ngay lập tức!"
                         )
                     else:
                         msg_text = (
                             f"🚨 [BÁO ĐỘNG] PHÁT HIỆN TÉ NGÃ/GỤC BẤT THƯỜNG!\n"
                             f"🕒 Thời gian: {dt_str}\n"
                             f"🚹 Mục tiêu: Patient #{fall_event.get('track_id')}\n\n"
-                            f"📊 ĐÁNH GIÁ SINH TỒN (RADAR):\n"
-                            f"🫀 Nhịp tim: {bpm} BPM (BÌNH THƯỜNG)\n"
-                            f"🫁 Nhịp thở: {breath} (BÌNH THƯỜNG)\n\n"
-                            f"🛑 Vui lòng gọi ngay cho nạn nhân hoặc mở Camera trực tiếp để kiểm tra!"
+                            f"📍 VỊ TRÍ (RADAR 2D):\n"
+                            f"🔸 Tọa độ X: {pos_x:.2f} m\n"
+                            f"🔸 Tọa độ Y: {pos_y:.2f} m\n"
+                            f"🔹 Tốc độ: {speed:.2f} m/s (CÒN CỬ ĐỘNG)\n\n"
+                            f"🛑 Vui lòng mở Camera trực tiếp để kiểm tra!"
                         )
 
                     threading.Thread(
