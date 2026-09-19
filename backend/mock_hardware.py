@@ -45,6 +45,7 @@ logging.info("Nhấn 3: Tọa độ NGẪU NHIÊN (X=0.5 -> 3.0, Speed=0.3 -> 1.
 logging.info("Nhấn 4: Tọa độ ĐỨNG YÊN (X=1.5, Y=2.0, Speed=0.0)")
 logging.info("Nhấn 5: Kịch bản NGỦ TRÊN GIƯỜNG (Safe Zone: X = -1.5, Speed = 0.0)")
 logging.info("Nhấn 6: Kịch bản ĐI LANG THANG (Danger Zone: X = 2.5, Speed = 0.5)")
+logging.info("Nhấn 7: Kịch bản ĐI BỘ VẼ BẢN ĐỒ (Vẽ một hình chữ nhật xung quanh phòng)")
 logging.info("Nhấn Ctrl+C để thoát")
 
 import threading
@@ -52,8 +53,10 @@ import time
 
 # Trạng thái giả lập hiện tại
 current_mock_state = None
+walk_step = 0
 
 def mock_publisher():
+    global walk_step
     while True:
         if current_mock_state == "3":
             x = round(random.uniform(0.5, 3.0), 2)
@@ -70,6 +73,19 @@ def mock_publisher():
             y = round(random.uniform(2.8, 3.2), 2)
             speed = round(random.uniform(0.4, 0.7), 2)
             client.publish("embedded/radar/data", f'{{"x": {x}, "y": {y}, "speed": {speed}}}')
+        elif current_mock_state == "7":
+            # Vẽ hình chữ nhật từ X: -2.0 -> 2.0 và Y: 1.0 -> 4.0 (Tính theo tọa độ gốc Radar)
+            path = [(-2 + (i/10)*4, 1) for i in range(11)] + \
+                   [(2, 1 + (i/10)*3) for i in range(1, 11)] + \
+                   [(2 - (i/10)*4, 4) for i in range(1, 11)] + \
+                   [(-2, 4 - (i/10)*3) for i in range(1, 11)]
+            x, y = path[walk_step % len(path)]
+            # Thêm nhiễu bước chân nhỏ
+            x += random.uniform(-0.1, 0.1)
+            y += random.uniform(-0.1, 0.1)
+            speed = round(random.uniform(0.8, 1.2), 2)
+            client.publish("embedded/radar/data", f'{{"x": {round(x,2)}, "y": {round(y,2)}, "speed": {speed}}}')
+            walk_step += 1
         time.sleep(1)
 
 # Chạy luồng gửi dữ liệu ngầm
@@ -77,14 +93,14 @@ threading.Thread(target=mock_publisher, daemon=True).start()
 
 try:
     while True:
-        cmd = input("Lệnh (1/2/3/4/5/6/0 để dừng): ").strip()
+        cmd = input("Lệnh (1/2/3/4/5/6/7/0 để dừng): ").strip()
         if cmd == "1":
             client.publish("embedded/servo/status", "MOVING")
             logging.info("Đã gửi: MOVING (Chỉ gửi 1 lần)")
         elif cmd == "2":
             client.publish("embedded/servo/status", "STOPPED")
             logging.info("Đã gửi: STOPPED (Chỉ gửi 1 lần)")
-        elif cmd in ["3", "4", "5", "6"]:
+        elif cmd in ["3", "4", "5", "6", "7"]:
             current_mock_state = cmd
             logging.info(f"Đã chuyển sang chế độ liên tục: {cmd}")
         elif cmd == "0":

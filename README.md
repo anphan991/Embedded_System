@@ -1,4 +1,4 @@
-﻿# Hướng dẫn Khởi chạy Dự án: Hệ thống Giám sát & Bám sát Mục tiêu
+# Hướng dẫn Khởi chạy Dự án: Hệ thống Giám sát & Bám sát Mục tiêu
 
 
 ## 1. Yêu cầu Nền tảng 
@@ -86,18 +86,35 @@ Dự án đã được tối ưu hóa toàn diện cho việc triển khai trên
 - Tích hợp file cấu hình `mosquitto_local.conf` để mở Port 1883 `0.0.0.0` và tắt xác thực `allow_anonymous true`, sẵn sàng cho mạch ESP32 kết nối vào mạng WiFi.
 - Bổ sung tín hiệu Heartbeat vào `mock_hardware.py` để liên tục kiểm chứng đường truyền MQTT.
 
-## Update Mới Nhất
 
->Cập nhật giao diện & Cảnh báo Telegram 
+- Cập nhật giao diện & Cảnh báo Telegram 
 
->* **Tích hợp CSDL SQLite:** Hệ thống tự động ghi lại lịch sử té ngã kèm hình ảnh và log sinh hiệu (mỗi 2 giây/lần trong chế độ test) vào `local_alerts.db`.
->* **Medical Dashboard Độc lập:** Chuyển biểu đồ sinh hiệu sang một trang `/vitals` riêng trên Next.js
->* **Telegram Debounce & Vitals:** Tích hợp tính năng báo động Telegram khi có người ngã. Áp dụng cơ chế rate limit 60 giây để chống spam. Tin nhắn tự động trích xuất nhịp tim và nhịp thở để cảnh báo y tế ngay trên đoạn chat.
+* **Tích hợp CSDL SQLite:** Hệ thống tự động ghi lại lịch sử té ngã kèm hình ảnh và log sinh hiệu (mỗi 2 giây/lần trong chế độ test) vào `local_alerts.db`.
+-* **Medical Dashboard Độc lập:** Chuyển biểu đồ sinh hiệu sang một trang `/vitals` riêng trên Next.js
+-* **Telegram Debounce & Vitals:** Tích hợp tính năng báo động Telegram khi có người ngã. Áp dụng cơ chế rate limit 60 giây để chống spam. Tin nhắn tự động trích xuất nhịp tim và nhịp thở để cảnh báo y tế ngay trên đoạn chat.
 
 >"Lưu ý: có thể xóa thủ công file local_alerts.db này bất cứ lúc nào nếu muốn làm sạch dữ liệu cũ, vì khi khởi chạy main.py, hệ thống sẽ tự động tạo lại một file CSDL mới."
 
-## 9 TO DO
+## Update Mới Nhất
+> **Hệ thống Phân tích Không gian :**  Bản đồ 2D Minimap trực tiếp, vẽ tọa độ mục tiêu theo thời gian thực (Polling mỗi 1.5s).
 
+> **Cảnh báo đi lang thang ban đêm:** Tự động phát hiện nếu người già ra khỏi Giường (X > 0) và di chuyển liên tục hơn 5 phút trong khung giờ 23:00 - 05:00.
+
+> **Telegram Alert:** Gắn trực tiếp Tọa độ X, Y và Speed vào tin nhắn cảnh báo ngã thay vì nhịp tim.
+
+## 9. Cấu hình Không gian 
+
+- **Kích thước phòng** Cho phép nhập Chiều rộng (X) và Chiều dài (Y) của căn phòng. Bản đồ Radar 2D sẽ tự động căn chỉnh và co giãn lưới trục theo tỷ lệ thực tế.
+- **Vị trí & Góc quét Radar:** 
+  - Khai báo vị trí treo Radar trên các bức tường (X, Y).
+  - Chọn hướng quay của Radar (`0°`, `90°`, `180°`, `270°`) qua Dropdown.
+  - **Coordinate Translation:** Backend Python tự động áp dụng ma trận xoay 2D và tịnh tiến tọa độ nguyên bản của cảm biến về đúng vị trí thực tế trong phòng. Mọi điểm dữ liệu lưu vào DB hay hiện trên Web đều là tọa độ thực đã xử lý.
+- **Hình quạt phủ sóng:** 
+  - Một vùng màu xanh lam mô phỏng chùm tia quét vật lý (bán kính 6m, góc mở 120 độ) của cảm biến LD2450 được vẽ đè lên Bản đồ Radar. 
+  - Thuật toán vẽ SVG đã được lập trình thủ công bằng lượng giác để đảm bảo hình quạt luôn hiển thị tỷ lệ thực ngay cả khi bản đồ chữ nhật bị nén, giúp người dùng dễ dàng phát hiện các điểm mù trong phòng để lắp đặt Radar cho tối ưu.
+
+
+## 11. TO DO
 ### 1. Vấn đề Trượt bối cảnh do Camera Panning 
 **Phân tích sự cố:** 
 Mặc dù thuật toán trong `fall_detection.py` đã rất tốt khi dùng `posture_change` (góc cột sống thay đổi) để tránh việc mọi Bounding Box dịch chuyển bị tính là ngã. Tuy nhiên, khi Servo MG996R quay nhanh:
@@ -144,3 +161,4 @@ Khi Pan/Tilt di chuyển camera, góc nhìn thay đổi, hệ tọa độ của 
 
 **Đề xuất nâng cấp:**
 - Phải tính toán ma trận xoay (Rotation Matrix). Nghĩa là, tọa độ X, Y mà Radar báo về phải được cộng/trừ bù trừ với góc quay Pan/Tilt hiện tại của Servo để đưa về cùng một hệ tọa độ chuẩn hóa trước khi đưa ra quyết định cảnh báo té ngã phối hợp (Sensor Fusion).
+
