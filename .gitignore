@@ -50,3 +50,13 @@ yarn-error.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# -----------------------
+# Agent Skills & Files
+# -----------------------
+.agents/
+.gemini/
+
+# Runtime logs & states
+*.log
+camera_mode.txt

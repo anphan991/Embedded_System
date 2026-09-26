@@ -69,7 +69,7 @@ def camera_process(raw_q: mp.Queue, shutdown_flag):
 # ---------------------------------------------------------
 # TIẾN TRÌNH 2: AI & MQTT CONSUMER (Tính toán song song)
 # ---------------------------------------------------------
-def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, reid_store, shutdown_flag):
+def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_flag):
     logger.info("Process 2 (AI Core & MQTT): Started. Optimizing for Host/VPS...")
     
     # 1. Khởi tạo MQTT (Giao tiếp với ESP32)
@@ -158,14 +158,8 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, reid_store
                         
                         # Ra khỏi giường (NOT in_safe) và Đang di chuyển (speed > 0.1)
                         if not in_safe and current_radar_speed > 0.1:
-                            # TÍNH NĂNG: Nếu có Caregiver trong phòng, tắt báo động lang thang
-                            caregiver_present = False
-                            active_p = reid_store.get("active_persons", []) if 'reid_store' in locals() else []
-                            for p in active_p:
-                                if reid_store.get("patient_track_id") != p.get("id"):
-                                    caregiver_present = True
-                                    
-                            if caregiver_present:
+                            # TÍNH NĂNG: Nếu phòng có >= 2 người, tắt báo động lang thang
+                            if 'global_person_count' in globals() and global_person_count >= 2:
                                 # Bỏ qua báo động vì có người nhà giám sát
                                 wandering_start = 0.0
                                 wandering_alert_sent = False
@@ -282,13 +276,18 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, reid_store
         fall_event = None
         current_active_persons = []
 
+        # Khai báo biến toàn cục đếm người cho MQTT callback
+        global global_person_count
+        global_person_count = 0
+        
         if len(results) > 0 and results[0].boxes and results[0].boxes.id is not None:
-            # Kiểm tra xem patient_track_id hiện tại có đang nằm trong khung hình không
-            # Nếu ĐANG CÓ MẶT, cấm Auto-Recover (để không bị giật lock sang người khác)
-            tracked_ids = [int(x.item()) for x in results[0].boxes.id]
-            patient_is_visible = ('reid_store' in locals() and reid_store.get("patient_track_id") in tracked_ids)
-            best_match_id = None
-            best_match_dist = 0.15  # Ngưỡng tối đa
+            # Lọc đếm người có độ tự tin > 0.5
+            valid_boxes = [conf for conf in results[0].boxes.conf if conf > 0.5]
+            global_person_count = len(valid_boxes)
+            
+            if global_person_count >= 2:
+                # Vẽ thông báo MUTED lên giữa màn hình
+                cv2.putText(annotated_frame, "MUTED: MULTIPLE PEOPLE PRESENT", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
 
             last_target_seen = time.time()
             target_lost_sent = False
@@ -298,47 +297,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, reid_store
             for i in range(len(boxes.id)):
                 obj_id = int(boxes.id[i].item())
                 x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-                # --- RE-ID LOGIC (Color Histogram) ---
-                crop_y1, crop_y2, crop_x1, crop_x2 = max(0, int(y1)), int(y2), max(0, int(x1)), int(x2)
-                crop_img = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                hist_list = None
-                if crop_img.size > 0:
-                    import cv2, numpy as np
-                    h, w, _ = crop_img.shape
-                    # Cắt cực kỳ sát vào giữa ngực để loại bỏ phông nền và khuôn mặt
-                    cy1, cy2 = int(h * 0.2), int(h * 0.6)
-                    cx1, cx2 = int(w * 0.3), int(w * 0.7)
-                    shirt_crop = crop_img[cy1:max(cy1+1, cy2), cx1:max(cx1+1, cx2)]
-                    hsv = cv2.cvtColor(shirt_crop, cv2.COLOR_BGR2HSV)
-                    hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
-                    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-                    hist_list = hist.flatten().tolist()
-                
-                # Cập nhật danh sách người đang có mặt
-                current_active_persons.append({
-                    "id": obj_id,
-                    "box": [x1, y1, x2, y2],
-                    "hist": hist_list
-                })
-                
-                # So sánh nếu chưa có Patient
-                locked_hist = reid_store.get("locked_hist")
-                patient_track_id = reid_store.get("patient_track_id")
-                
-                if locked_hist and hist_list:
-                    locked_hist_np = np.array(locked_hist, dtype=np.float32)
-                    current_hist_np = np.array(hist_list, dtype=np.float32)
-                    # Bhattacharyya distance (smaller is better)
-                    dist = cv2.compareHist(locked_hist_np, current_hist_np, cv2.HISTCMP_BHATTACHARYYA)
-                    
-                    if dist < 0.15:  # Threshold khá nhạy
-                        reid_store["patient_track_id"] = obj_id
-
-                is_patient = (reid_store.get("patient_track_id") == obj_id)
-                # Draw label
-                label_color = (0, 255, 0) if is_patient else (0, 165, 255)
-                label_text = f"PATIENT {obj_id}" if is_patient else f"CAREGIVER {obj_id}"
-                cv2.putText(annotated_frame, label_text, (int(x1), max(0, int(y1)-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2)
+                cv2.putText(annotated_frame, f"Person {obj_id}", (int(x1), max(0, int(y1)-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 
                 # Bắn tọa độ mục tiêu với Deadband 15%
@@ -451,6 +410,9 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, reid_store
                     posture_motion = abs(spine_angle - prior[1]) / 90.0 / dt
                 previous_features[obj_id] = (current_t, spine_angle, com_y)
                 detection_confidence = float(boxes.conf[i].item()) if boxes.conf is not None else 0.0
+                # Chỉ chạy Fall Detector nếu có đúng 1 người trong phòng (tiết kiệm CPU)
+                if global_person_count >= 2:
+                    continue
                 decision = fall_detector.update(obj_id, FallObservation(
                     timestamp=current_t,
                     detection_confidence=detection_confidence,
@@ -466,21 +428,15 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, reid_store
                     face_visible=face_visible,
                     is_camera_moving=is_camera_moving
                 ))
-                if decision.newly_confirmed:
-                    is_caregiver = ('reid_store' in locals() and reid_store.get("patient_track_id") is not None and reid_store.get("patient_track_id") != obj_id)
-                    if is_caregiver:
-                        logger.warning(f"CẢNH BÁO TÉ NGÃ - NGƯỜI NHÀ (Track ID {obj_id})!")
-                    else:
-                        logger.warning(f"CẢNH BÁO TÉ NGÃ - BỆNH NHÂN (Track ID {obj_id})!")
-                    
+                if decision.newly_confirmed and global_person_count == 1:
+                    logger.warning(f"CẢNH BÁO KHẨN CẤP: BỆNH NHÂN ĐƠN ĐỘC TÉ NGÃ (Track ID {obj_id})!")
                     fall_event = {
-                        "person_type": "CAREGIVER" if is_caregiver else "PATIENT",
+                        "person_type": "PATIENT",
                         "track_id": obj_id, 
                         "reason": decision.reason, 
                         "timestamp": time.time(),
                         "pos_x": current_radar_x,
-                        "pos_y": current_radar_y,
-                        "speed": current_radar_speed
+                        "pos_y": current_radar_y
                     }
                     try: mqtt_client.publish("embedded/servo/buzzer", "ON")
                     except Exception: pass
@@ -525,10 +481,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, reid_store
                 except: pass
             mjpeg_q.put_nowait(buffer.tobytes())
             
-        if 'current_active_persons' in locals():
-            if not patient_is_visible and best_match_id is not None:
-                reid_store["patient_track_id"] = best_match_id
-            reid_store['active_persons'] = current_active_persons
+        
 
         # Kiểm soát FPS
         elapsed = time.time() - loop_start
@@ -592,20 +545,14 @@ def watchdog_task():
         # Tự phục hồi AI
         if p_ai and not p_ai.is_alive():
             logger.error("WATCHDOG: AI Process Died! Restarting...")
-            p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q, reid_store_global, shutdown_flag))
+            p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q, shutdown_flag))
             p_ai.daemon = True
             p_ai.start()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global raw_q, mjpeg_q, alert_q, shutdown_flag, p_cam, p_ai, reid_store_global
+    global raw_q, mjpeg_q, alert_q, shutdown_flag, p_cam, p_ai
     
-    manager = mp.Manager()
-    reid_store_global = manager.dict()
-    reid_store_global["active_persons"] = []
-    reid_store_global["locked_hist"] = None
-    reid_store_global["patient_track_id"] = None
-
     raw_q = mp.Queue(maxsize=1)
 
     mjpeg_q = mp.Queue(maxsize=1)
@@ -614,7 +561,7 @@ async def lifespan(app: FastAPI):
     
     p_cam = mp.Process(target=camera_process, args=(raw_q, shutdown_flag))
     p_cam.daemon = True
-    p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q, reid_store_global, shutdown_flag))
+    p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q, shutdown_flag))
     p_ai.daemon = True
     p_cam.start()
     p_ai.start()
@@ -714,51 +661,43 @@ async def update_room_config_api(request: Request):
         return {"status": "error", "message": str(e)}
 
 
-# --- RE-ID API ENDPOINTS ---
-@app.get("/api/v1/tracking/persons")
-def get_active_persons():
-    if not reid_store_global: return {"status": "error", "data": []}
-    persons = reid_store_global.get("active_persons", [])
-    patient_id = reid_store_global.get("patient_track_id", None)
-    
-    res = []
-    for p in persons:
-        res.append({
-            "id": p["id"],
-            "is_patient": (p["id"] == patient_id),
-            "box": p["box"]
-        })
-    return {"status": "success", "data": res}
+
+# --- CAMERA MANUAL CONTROL API ---
+camera_mode = "AUTO"
 
 from pydantic import BaseModel
-class LockRequest(BaseModel):
-    track_id: int
+class CameraMoveRequest(BaseModel):
+    direction: str  # UP, DOWN, LEFT, RIGHT, STOP
 
-@app.post("/api/v1/tracking/lock_patient")
-def lock_patient(req: LockRequest):
-    if not reid_store_global: return {"status": "error"}
-    persons = reid_store_global.get("active_persons", [])
-    
-    target_hist = None
-    for p in persons:
-        if p["id"] == req.track_id:
-            target_hist = p.get("hist")
-            break
-            
-    if target_hist:
-        reid_store_global["locked_hist"] = target_hist
-        reid_store_global["patient_track_id"] = req.track_id
-        return {"status": "success", "message": f"Locked {req.track_id} as Patient"}
-    return {"status": "error", "message": "Track ID not found or no histogram"}
 
-@app.post("/api/v1/tracking/unlock_patient")
-def unlock_patient():
-    if reid_store_global:
-        reid_store_global["locked_hist"] = None
-        reid_store_global["patient_track_id"] = None
-    return {"status": "success"}
+@app.post("/api/v1/camera/mode")
+def set_camera_mode(mode: str):
+    global camera_mode
+    if mode in ["AUTO", "MANUAL"]:
+        camera_mode = mode
+        # Write to file for IPC
+        with open("camera_mode.txt", "w") as f:
+            f.write(mode)
+        return {"status": "success", "mode": camera_mode}
+    return {"status": "error"}
+
+
+@app.post("/api/v1/camera/move")
+def move_camera(req: CameraMoveRequest):
+    global camera_mode
+    if camera_mode == "MANUAL":
+        import paho.mqtt.publish as publish
+        import os
+        broker = os.getenv("MQTT_BROKER", "localhost")
+        try:
+            publish.single("embedded/servo/manual", req.direction, hostname=broker)
+            return {"status": "success"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    return {"status": "error", "message": "Must be in MANUAL mode"}
 
 @app.websocket("/api/v1/ws/alerts")
+
 
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()

@@ -1,164 +1,101 @@
-# Hướng dẫn Khởi chạy Dự án: Hệ thống Giám sát & Bám sát Mục tiêu
+# Hướng dẫn khởi chạy dự án: Hệ thống giám sát & bám sát mục tiêu
 
-
-## 1. Yêu cầu Nền tảng 
+## 1. Yêu cầu nền tảng
 - **Python:** Phiên bản 3.10 trở lên.
 - **Node.js:** Phiên bản LTS (v20.x trở lên).
 
-## 2. Thiết lập Đặc quyền Thực thi (Dành riêng cho Windows PowerShell)
+## 2. Thiết lập đặc quyền thực thi (Dành riêng cho Windows PowerShell)
 Nếu gặp lỗi `cannot be loaded because running scripts is disabled`, hãy chạy lệnh sau (chỉ cần làm 1 lần):
 ```powershell
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
 ```
 
-## 3. Cài đặt và Khởi chạy MQTT Broker (Mosquitto) 
-Hệ thống sử dụng MQTT để giao tiếp giữa Backend và phần cứng (ESP32).
+## 3. Cài đặt và khởi chạy MQTT Broker (Mosquitto)
+Hệ thống sử dụng MQTT để giao tiếp giữa máy chủ backend và phần cứng (ESP32).
 1. Tải và cài đặt Mosquitto: [Link tải Windows](https://mosquitto.org/files/binary/win64/mosquitto-2.0.18-install-windows-x64.exe)
 2. Mở một cửa sổ PowerShell mới tại thư mục `backend`, chạy lệnh khởi động Mosquitto cùng file cấu hình (để cho phép ESP32 kết nối):
 ```powershell
 & "C:\Program Files\mosquitto\mosquitto.exe" -c mosquitto_local.conf -v
 ```
-> Khởi động MQTT trước khi khởi động backend
+> **Lưu ý:** Khởi động MQTT trước khi khởi động backend.
 
-## 4. Khởi chạy Backend & AI
-Mở Terminal mới ở thư mục `backend` và cấu hình Python:
+## 4. Khởi chạy backend & AI
+Mở một cửa sổ Terminal mới ở thư mục `backend` và cấu hình môi trường Python:
 ```powershell
 python -m venv venv
 .\venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 ```
-*Ghi chú: Máy chủ AI lắng nghe tại: `http://localhost:8000`. Khi chạy, AI sẽ kết nối tới MQTT Broker ở localhost.*
+*Ghi chú: Máy chủ AI lắng nghe tại `http://localhost:8000`. Khi chạy, AI sẽ tự động kết nối tới MQTT Broker ở localhost.*
 
-## 5. Khởi chạy Giao diện Web
-Mở một cửa sổ Terminal mới:
+## 5. Khởi chạy giao diện web
+Mở một cửa sổ Terminal mới tại thư mục `frontend`:
 ```powershell
-cd frontend
 npm install
 npm run dev
 ```
-*Ghi chú: Giao diện hoạt động tại: `http://localhost:3000`.*
+*Ghi chú: Giao diện web hoạt động tại `http://localhost:3000`.*
 
-## 6. Kiểm thử Tích hợp Phần cứng Giả lập (Mock Hardware)
-Để kiểm tra thuật toán giao tiếp Servo mà không cần phần cứng thực tế, mở một Terminal mới tại thư mục `backend`:
+## 6. Mock Hardware
+Để kiểm tra thuật toán giao tiếp servo mà không cần phần cứng thực tế, mở một Terminal mới tại thư mục `backend`:
 ```powershell
 python mock_hardware.py
 ```
-- **Test Deadband:** Đứng trước camera và di chuyển ra mép ảnh. Cửa sổ mock sẽ in log lệnh quay Servo. Đứng ở giữa ảnh, lệnh quay sẽ ngắt.
-- **Test Saccadic Masking:** Nhấn phím `1` (MOVING) trên cửa sổ giả lập để mô phỏng Servo đang quay nhanh. Cúi gập người ngã. Thuật toán té ngã sẽ bị đóng băng (không báo động). Nhấn phím `2` (STOPPED) để mở khóa thuật toán.
+- **Kiểm tra Deadband:** Đứng trước camera và di chuyển ra mép ảnh. Cửa sổ giả lập sẽ in log lệnh quay servo. Khi đứng ở giữa ảnh, lệnh quay sẽ tự ngắt.
+- **Kiểm tra che khuất chuyển động:** Nhấn phím `1` (MOVING) trên cửa sổ giả lập để mô phỏng động cơ đang quay nhanh. Cúi gập người ngã. Thuật toán té ngã sẽ bị đóng băng (không báo động ảo). Nhấn phím `2` (STOPPED) để mở khóa thuật toán.
 
-## 7. Các Tính Năng An Toàn
-Hệ thống được thiết kế với cơ chế Fault-tolerance:
-- **Cử chỉ Hủy báo động (Gesture Cancellation):** Khi còi hú, giơ 2 tay bắt chéo chữ X để AI tự động hủy còi. Lịch sử đứng thẳng vẫn được AI ghi nhớ để bắt cú ngã kế tiếp.
-- **Lưu trữ (Database & Snapshots):** Khi phát hiện té ngã, hệ thống tự động chụp ảnh hiện trường lưu vào thư mục `backend/snapshots/`.
-- **Gửi Cảnh báo Telegram:** Đọc tệp `backend/.env` và cấu hình Token Bot.
-- **Watchdog & Heartbeat:** Máy chủ liên tục phát nhịp tim (Heartbeat `PING`) qua MQTT cho ESP32. Nếu đứt kết nối, AI tự phục hồi.
+## 7. Các tính năng an toàn
+Hệ thống được thiết kế với cơ chế chịu lỗi (Fault-tolerance):
+- **Cử chỉ hủy báo động :** Khi còi hú, người dùng giơ 2 tay bắt chéo (chữ X) để AI tự động tắt còi. Lịch sử đứng thẳng vẫn được AI ghi nhớ để theo dõi cú ngã kế tiếp.
+- **Lưu trữ tự động:** Khi phát hiện té ngã, hệ thống tự động chụp ảnh hiện trường và lưu vào thư mục `backend/snapshots/`.
+- **Gửi cảnh báo Telegram:** Hệ thống đọc tệp `backend/.env` và sử dụng token bot để gửi cảnh báo y tế.
+- **Watchdog:** Máy chủ liên tục phát tín hiệu `PING` qua MQTT cho ESP32. Nếu đứt kết nối, AI sẽ tự phục hồi.
 
-## 8. Các Bản Cập Nhật Gần Đây 
-Dự án đã được tối ưu hóa toàn diện cho việc triển khai trên máy chủ đám mây hoặc máy tính Host:
-- **Tự động cấu hình Phần cứng (Hardware Auto-tuning):** Hệ thống tự động quét phần cứng. Nếu có Card rời NVIDIA (GPU), AI sẽ biên dịch sang `TensorRT` (FP16). Nếu chạy thuần CPU, AI tự động dùng `OpenVINO` để ép xung tập lệnh, giúp tăng gấp ba tốc độ xử lý mà không cần cấu hình tay.
-- **Thuật toán Ngã theo trạng thái (Per-track Temporal State Machine):** Mỗi người được xử lý độc lập theo `track_id`. Hệ thống yêu cầu quan sát được baseline ổn định rồi mới xác nhận chuyển tiếp bất thường; tư thế nằm ngang đơn lẻ không đủ để báo động.
-- **Bao phủ nhiều kịch bản:** phát hiện chuyển tiếp đứng → nằm, ngã từ ghế, gục từ từ và đổ sụp không hoàn toàn nằm ngang bằng sự kết hợp của trọng tâm, góc thân, khoảng cách đầu–hông, dịch chuyển chuẩn hóa theo chiều cao cơ thể và bất động sau sự kiện.
-- **Chống báo động giả:** người nằm sẵn, người đứng yên, di chuyển chậm và chuyển động do pan-tilt được lọc. Không khẳng định “bất tỉnh” chỉ từ RGB camera; cảnh báo được diễn đạt là sự kiện cần kiểm tra.
-- **Kiểm thử tự động:** `backend/test_fall_detection.py` bao phủ các tình huống tĩnh, chuyển tiếp, gục từ ghế và multi-person.
-- **Sửa lỗi Lật hình Camera:** Tích hợp lật ngang (Mirror) tự động bằng `cv2.flip` để Web hiển thị hình ảnh thuận mắt.
-- **Tối ưu Băng thông:** 
-  - Nén luồng Stream MJPEG bằng thuật toán nén chất lượng (`JPEG_QUALITY = 65`) giảm một nửa gánh nặng cho mạng. 
-  - Thay đổi hệ thống Multiprocessing sang chuẩn `daemon=True` và xử lý triệt để lỗi kẹt hàng đợi (Queue Deadlock), giúp ứng dụng tắt nhanh, sạch gọn khi bấm `Ctrl + C`.
-  - Cải tiến cử chỉ Hủy báo động (X-Gesture) với dung sai tay mở rộng, thân thiện hơn với người bệnh khi thao tác.
+## 8. Lịch sử cập nhật 
 
-- **Amnesia Bug:** Trước đây, khi giơ tay chữ X để tắt báo động giả, AI sẽ xóa sạch lịch sử theo dõi. Nếu nạn nhân lúc này đang ngồi trên ghế và tiếp tục ngã xuống đất, AI sẽ bỏ qua vì không thấy họ "đứng thẳng" trước đó.
-- **Giải pháp:** Sửa đổi `main.py` để cử chỉ chữ X chỉ Reset trạng thái còi và làm nguội cảnh báo (Cooldown), nhưng **giữ lại (preserve)** toàn bộ lịch sử tư thế. Nhờ đó, các cú ngã liên hoàn hoặc ngã sau khi hủy báo động giả đều được bắt chính xác.
+### Backend & AI
 
-- **Bắt lỗi "Ngã từ từ / Trôi từ trên ghế"** 
-  - Khung thời gian so sánh (History Window) 2.5s quá ngắn. Nếu ngã mất 5-8 giây, tốc độ quá chậm để kích hoạt.
-  - Khi gục trên ghế, phần Hông không rơi xuống đất, dẫn đến logic kiểm tra `drop` (Tụt trọng tâm) bị đánh trượt.
-- **Giải pháp:**
-  - Tăng `history_seconds` lên `5.0s` và dùng hàm `max_spine` / `min_com_y` để quét toàn bộ lịch sử, lấy mốc đứng cao nhất làm chuẩn để so sánh. Dù ngã chậm đến đâu cũng bị phát hiện.
-  - Cập nhật hàm `gradual_collapse` trong `fall_detection.py`: Hủy bỏ yêu cầu "tụt Hông" đối với trường hợp gục trên ghế. Thay vào đó, nếu Tỉ lệ khoảng cách Đầu - Hông bị tụt mạnh (`head_hip_drop >= 0.15`), AI sẽ lập tức báo động!
+*   **Tối giản và chống rò rỉ bộ nhớ (`backend/main.py`):**
+    *   **Xóa logic dư thừa:** Lược bỏ hoàn toàn hàm nhận diện màu áo `cv2.calcHist()`, thuật toán đổi hệ màu HSV và đối chiếu `cv2.compareHist`.
+    *   **Ngăn chặn Crash:** Gỡ bỏ biến chia sẻ (shared variable) `reid_store` trong thư viện Multiprocessing, chấm dứt triệt để lỗi rò rỉ bộ nhớ khi chạy lâu dài.
+*   **Solo Protection Mode:**
+    *   Bổ sung bộ lọc độ tin cậy `conf > 0.5` cho Yolo Bounding Box.
+    *   **Rẽ nhánh (Fallback):** Thêm điều kiện `if global_person_count >= 2: continue`. Khi có nhiều người, AI ngừng tính toán góc ngã và radar để tiết kiệm CPU, đồng thời hiển thị thông báo `MUTED: MULTIPLE PEOPLE PRESENT` lên màn hình.
+    *   **Chống giật động cơ :** Đóng băng luồng MQTT xuất lệnh (`embedded/servo/tracking`) để camera đứng yên bao quát toàn cảnh khi phát hiện đông người.
+*   **API điều khiển thủ công (`backend/main.py` & `backend/mock_hardware.py`):**
+    *   **REST API:** Viết mới 2 API `POST /api/v1/camera/mode` và `POST /api/v1/camera/move` để hỗ trợ Joystick ảo trên giao diện web.
+    *   **Flag:** Tiến trình AI (`ai_process`) sẽ đọc tín hiệu từ file `camera_mode.txt` để tự động nhường quyền truyền lệnh MQTT (`embedded/servo/manual`) khi người dùng thao tác.
+    *   **Heartbeat PING:** Bổ sung gói tin nhịp tim vào `mock_hardware.py` để mô phỏng giữ kết nối liên tục với máy chủ.
+*   **Vá lỗi thuật toán té ngã (`backend/fall_detection.py` & `backend/main.py`):**
+    *   **Lỗi Amnesia (Quên lịch sử):** Sửa đổi luồng logic của cử chỉ X (Hủy báo động). Thay vì xóa mảng lịch sử tư thế, hệ thống chỉ đưa cờ báo động vào trạng thái làm nguội (Cooldown). Lịch sử khung xương vẫn được bảo tồn để bắt các cú ngã liên hoàn.
+    *   **Lỗi ngã từ từ (Gradual Fall):** Tăng `history_seconds` lên `5.0s`. Xây dựng hàm `max_spine` và `min_com_y` để quét toàn bộ chiều dài lịch sử thay vì so sánh với khung hình liền kề.
+    *   **Lỗi gục trên ghế:** Cập nhật hàm `gradual_collapse`, hủy bỏ điều kiện tụt hông (hip drop) bắt buộc. Thay bằng logic: nếu tỉ lệ khoảng cách đầu - hông tụt đột biến (`head_hip_drop >= 0.15`), kích hoạt cảnh báo ngay lập tức.
+    *   **Lỗi rung lắc khi cuộn tròn:** Khai báo bộ lọc trung bình động theo cấp số nhân (EMA Filter) trong `main.py` để làm mượt tuyệt đối các góc xương nội suy. Nới lỏng ngưỡng `max_post_impact_speed` từ `0.45` lên `0.90` để nhận diện chính xác trạng thái bất tỉnh.
 
-- **Khử nhiễu "Nằm nghiêng / Cuộn tròn"** Khi nằm nghiêng, khung xương bị che khuất một phần khiến AI nội suy sai, làm các khớp xương nhảy múa liên tục trên màn hình. AI thấy rung lắc mạnh nên đánh giá nạn nhân "chưa nằm im" và từ chối báo động.
-- **Giải pháp:**
-  - Viết thêm bộ lọc **Exponential Moving Average (EMA)** vào `main.py` để làm mượt tuyệt đối Góc lưng và Trọng tâm.
-  - Nới lỏng ngưỡng chịu nhiễu `max_post_impact_speed` từ `0.45` lên `0.90`. Nạn nhân nằm nghiêng hoặc cuộn tròn sẽ được nhận diện là đã nằm im ổn định.
+### Phần giao diện Web (Frontend)
 
-- **Thiết lập MQTT**
-- Tích hợp file cấu hình `mosquitto_local.conf` để mở Port 1883 `0.0.0.0` và tắt xác thực `allow_anonymous true`, sẵn sàng cho mạch ESP32 kết nối vào mạng WiFi.
-- Bổ sung tín hiệu Heartbeat vào `mock_hardware.py` để liên tục kiểm chứng đường truyền MQTT.
+*   **Kiến trúc nền tảng và đa ngôn ngữ:**
+    *   **Theme (`app/globals.css`, `app/ThemeProvider.tsx`):** Cấu hình biến thể Tailwind v4 `@custom-variant dark (&:is(.dark *))` và tích hợp thư viện `next-themes` cho Dark mode.
+    *   **i18n (`app/context/LanguageContext.tsx`):** Khởi tạo bộ từ điển nội bộ (`en`, `vi`). Thiết lập hook `useTranslation()` và cơ chế tự động ghi nhớ (hydrate) ngôn ngữ xuống `localStorage`.
+    *   **State Management (`app/context/AlertsContext.tsx`, `app/layout.tsx`):** Chuyển dịch kết nối WebSocket ra Global Context để duy trì liên kết khi chuyển trang. Cấu trúc lại dữ liệu cảnh báo với ID sinh ngẫu nhiên, hỗ trợ hàm `acknowledgeMultiple` để xử lý mảng.
+*   **Màn hình Dashboard & Điều hướng:**
+    *   **Sidebar (`app/Sidebar.tsx`):** Thêm nút gạt chế độ tối/sáng và chuyển đổi ngôn ngữ. Dịch động các tiêu đề tĩnh bằng hàm `t()`.
+    *   **Giám sát (`app/page.tsx`):** Thay thế CSS z-index bằng API nguyên bản `element.requestFullscreen()` để hiển thị camera toàn màn hình hoàn hảo. Chèn đồng hồ thời gian thực (OSD clock) và tự động map mã lỗi từ backend (`t("alert." + alert.eventCode)`) sang tiếng Việt.
+    *   **Joystick ảo (`app/CameraControlPanel.tsx`):** Xây dựng component phím chữ thập (D-Pad). Bắt sự kiện `onMouseDown` truyền hướng đi (LEFT/RIGHT...) và `onMouseUp` truyền lệnh phanh (STOP) qua API.
+*   **Chức năng mới:**
+    *   **Nhật ký (`app/logs/page.tsx`):** Code hoàn toàn mới. Thêm thanh tìm kiếm từ khóa/thời gian, Dropdown lọc trạng thái. Xây dựng logic Checkbox `Set<string>` để chọn nhiều và xác nhận lỗi hàng loạt.
+    *   **Cài đặt (`app/settings/page.tsx`):** Trình bày 4 khối giao diện (AI, Camera, Integrations, Database). Viết hàm `useEffect` đồng bộ mọi chỉ số vào `localStorage`. Sửa lỗi UI của nút gạt bằng class `dark:peer-checked:bg-indigo-600`.
+*   **Trang Phân tích Radar (`app/analytics/page.tsx` & `app/RadarMap.tsx`):**
+    *   **Logic dữ liệu:** Sửa đường dẫn import bị sai và tái cấu trúc Object Props truyền vào Radar (đổi mm sang m, truyền mảng `zones`).
+    *   **Giao diện vùng an toàn:** Khôi phục cụm Input thiết lập mốc tọa độ X/Y (Min/Max). Ràng buộc thay đổi từ Input trực tiếp làm thay đổi hình chiếu Recharts ReferenceArea trên bản đồ ngay lập tức.
+    *   **Layout Fix:** Xóa thẻ Header bị trùng lặp. Đặt `flex-1 overflow-hidden h-full` cho thẻ main. Kích hoạt `overflow-y-auto` riêng cho cột cài đặt bên trái, ép cột radar bên phải khóa cứng 100% chiều cao (Không bắt người dùng cuộn chuột toàn trang).
+    *   **Lỗi xén viền:** Loại bỏ thuộc tính `aspect={rWidth / rLength}` và `maxHeight` của thư viện Recharts vì chúng tính toán sai chiều cao khi phòng rộng. Ép lại `width="100%"` và `height="100%"`, nới `margin-bottom: 40` để trục Y hiện đầy đủ.
+    *   **Light Mode:** Nâng độ tương phản (Contrast) của Radar Coverage và SAFE/DANGER Zones (fillOpacity 0.15). Sơn lại lưới tọa độ (Cartesian Grid) và số đo sang mã màu `#cbd5e1`, `#94a3b8` để hiển thị sắc nét hơn trên nền sáng.
 
+## 9. Cấu hình không gian radar
+- **Kích thước phòng:** Cho phép nhập chiều rộng và chiều dài thực tế. Bản đồ 2D sẽ tự động căn chỉnh lưới trục theo tỷ lệ tương ứng.
+- **Vị trí và góc quét:** Khai báo vị trí treo radar trên tường và hướng quay (`0°`, `90°`, `180°`, `270°`). Máy chủ tự động áp dụng ma trận xoay và tịnh tiến tọa độ cảm biến về đúng vị trí thực tế trong phòng.
+- **Hình quạt phủ sóng:** Vùng màu xanh lam mô phỏng chùm tia quét của cảm biến LD2450 (bán kính 6m, góc mở 120 độ) được vẽ đè lên bản đồ để dễ dàng phát hiện điểm mù.
 
-- Cập nhật giao diện & Cảnh báo Telegram 
-
-* **Tích hợp CSDL SQLite:** Hệ thống tự động ghi lại lịch sử té ngã kèm hình ảnh và log sinh hiệu (mỗi 2 giây/lần trong chế độ test) vào `local_alerts.db`.
--* **Medical Dashboard Độc lập:** Chuyển biểu đồ sinh hiệu sang một trang `/vitals` riêng trên Next.js
--* **Telegram Debounce & Vitals:** Tích hợp tính năng báo động Telegram khi có người ngã. Áp dụng cơ chế rate limit 60 giây để chống spam. Tin nhắn tự động trích xuất nhịp tim và nhịp thở để cảnh báo y tế ngay trên đoạn chat.
-
->"Lưu ý: có thể xóa thủ công file local_alerts.db này bất cứ lúc nào nếu muốn làm sạch dữ liệu cũ, vì khi khởi chạy main.py, hệ thống sẽ tự động tạo lại một file CSDL mới."
-
-## Update Mới Nhất
-> **Hệ thống Phân tích Không gian :**  Bản đồ 2D Minimap trực tiếp, vẽ tọa độ mục tiêu theo thời gian thực (Polling mỗi 1.5s).
-
-> **Cảnh báo đi lang thang ban đêm:** Tự động phát hiện nếu người già ra khỏi Giường (X > 0) và di chuyển liên tục hơn 5 phút trong khung giờ 23:00 - 05:00.
-
-> **Telegram Alert:** Gắn trực tiếp Tọa độ X, Y và Speed vào tin nhắn cảnh báo ngã thay vì nhịp tim.
-
-## 9. Cấu hình Không gian 
-
-- **Kích thước phòng** Cho phép nhập Chiều rộng (X) và Chiều dài (Y) của căn phòng. Bản đồ Radar 2D sẽ tự động căn chỉnh và co giãn lưới trục theo tỷ lệ thực tế.
-- **Vị trí & Góc quét Radar:** 
-  - Khai báo vị trí treo Radar trên các bức tường (X, Y).
-  - Chọn hướng quay của Radar (`0°`, `90°`, `180°`, `270°`) qua Dropdown.
-  - **Coordinate Translation:** Backend Python tự động áp dụng ma trận xoay 2D và tịnh tiến tọa độ nguyên bản của cảm biến về đúng vị trí thực tế trong phòng. Mọi điểm dữ liệu lưu vào DB hay hiện trên Web đều là tọa độ thực đã xử lý.
-- **Hình quạt phủ sóng:** 
-  - Một vùng màu xanh lam mô phỏng chùm tia quét vật lý (bán kính 6m, góc mở 120 độ) của cảm biến LD2450 được vẽ đè lên Bản đồ Radar. 
-  - Thuật toán vẽ SVG đã được lập trình thủ công bằng lượng giác để đảm bảo hình quạt luôn hiển thị tỷ lệ thực ngay cả khi bản đồ chữ nhật bị nén, giúp người dùng dễ dàng phát hiện các điểm mù trong phòng để lắp đặt Radar cho tối ưu.
-
-
-## 11. TO DO
-### 1. Vấn đề Trượt bối cảnh do Camera Panning 
-**Phân tích sự cố:** 
-Mặc dù thuật toán trong `fall_detection.py` đã rất tốt khi dùng `posture_change` (góc cột sống thay đổi) để tránh việc mọi Bounding Box dịch chuyển bị tính là ngã. Tuy nhiên, khi Servo MG996R quay nhanh:
-- Dẫn đến hiện tượng **Motion Blur** (mờ nhòe hình ảnh). Bounding Box của MediaPipe có thể bị mất chớp nhoáng, khiến `track_id` bị đứt gãy.
-- Vận tốc tương đối (`downward_speed`) theo trục Y trên khung hình có thể vô tình vọt lên cao do cả người và nền cùng bị kéo giật xuống.
-
-**Đề xuất nâng cấp:**
-- **Saccadic Masking (Mù tạm thời):** Giống như mắt người khi liếc nhanh sẽ không xử lý hình ảnh. Backend AI cần một trạng thái `is_panning`. Khi ESP32 chuẩn bị kích hoạt Servo quay ở góc lớn, nó sẽ gửi cờ (flag) qua UDP/MQTT cho Backend để AI "Bỏ qua (Skip)" các khung hình trong khoảng 200-500ms cho đến khi Servo dừng lại và hình ảnh ổn định.
-- **Global Motion Compensation (Bù trừ chuyển động):** ESP32 liên tục gửi góc Pan/Tilt hiện tại lên Backend. Bạn dùng thông số góc này (hoặc hàm tính quang lưu Optical Flow của OpenCV trên nền video) để trừ đi lượng vận tốc dịch chuyển tương đối của khung hình trước khi tính toán `downward_speed` cho người.
-
-### 2. Sự cố Sụt áp mạch và Nhiễu điện (Power Brownout)
-**Phân tích sự cố:** 
-Động cơ Servo MG996R khi tải nặng hoặc lúc bắt đầu khởi động có dòng đỉnh (Stall Current) cực lớn (lên tới 1.5A - 2.5A mỗi động cơ). Nếu bạn cấp nguồn chung hoặc nguồn không đủ khỏe:
-- Vi điều khiển ESP32 / ESP32-CAM sẽ bị sụt điện áp đột ngột dẫn đến lỗi **Brownout Detector was triggered** và reset liên tục.
-- Tín hiệu I2C/UART của Radar HLK-LD2450 bị nhiễu.
-
-**Đề xuất nâng cấp:**
-- **Phân tách nguồn triệt để:** Sử dụng mạch hạ áp (như XL4015 5A) để cấp nguồn riêng rẽ cho Servo. Nguồn 5V của ESP và cảm biến phải đi đường riêng. Chỉ nối chung Ground (GND).
-- **Thêm tụ bù (Decoupling Capacitor):** Bắt buộc hàn thêm các tụ điện hóa dung lượng lớn (khoảng 470µF đến 1000µF) vào sát hai cực VCC và GND của mỗi Servo để gánh dòng khởi động.
-
-### 3. Jittering (Rung lắc khung hình) do vòng lặp PID 
-**Phân tích sự cố:**
-Thuật toán AI (MediaPipe) cung cấp tọa độ liên tục, nhưng các điểm khớp xương luôn có độ rung nội tại (noise) ngay cả khi người đứng yên. Khi bạn nạp tọa độ này xuống bộ điều khiển PID của ESP32, Servo sẽ liên tục nhích qua nhích lại từng milimet gây ra hiện tượng rung bần bật video (Jittering).
-
-**Đề xuất nâng cấp:**
-- **Áp dụng Vùng chết (Deadband Threshold):** Không nên yêu cầu Servo căn người vào chính giữa 100%. Hãy đặt một vùng biên (ví dụ: ±20% ở vùng trung tâm khung hình). Chỉ khi người đi ra khỏi vùng an toàn này, ESP32 mới bắt đầu tính toán và nội suy PID để xoay Servo bám theo.
-- **Bộ lọc Kalman/Low-pass:** Xử lý tọa độ `(com_y, com_x)` của AI qua một bộ lọc làm mượt tĩnh trước khi gửi qua MQTT/UDP, tránh việc Servo phản ứng thái quá với các tọa độ bị nhiễu.
-
-### 4. Bất đồng bộ thời gian thực (Latency Mismatch & Sensor Fusion)
-**Phân tích sự cố:**
-Thiết kế kiến trúc phân tán giữa ESP32 (Radar, Servo) và Máy tính Host (Xử lý Ảnh). 
-- Ảnh tải qua luồng MJPEG.
-- Lệnh tọa độ và trạng thái gửi qua MQTT hoặc UDP.
-Hai đường truyền mạng này có độ trễ khác nhau. Khi máy tính nhận được 1 Frame ảnh của quá khứ (ví dụ trễ 200ms) và ra lệnh quay, lúc này Radar đã đo được đối tượng ở vị trí mới, dẫn đến sự "so le" về không gian và thời gian.
-
-**Đề xuất nâng cấp:**
-- **Timestamp Tagging:** Mọi khung hình MJPEG phát từ ESP32-CAM và dữ liệu Radar phải được đính kèm một nhãn thời gian (Timestamp) tại phần cứng trước khi phát đi. Backend Python sẽ có một bộ đệm (Buffer) nhỏ để khớp đúng luồng thông tin của Radar với đúng Frame ảnh của Camera tại cùng một thời điểm.
-
-### 5. Sự xung đột Hệ Quy Chiếu (Camera vs Radar)
-**Phân tích sự cố:**
-- HLK-LD2450 trả về tọa độ Đứng/Ngồi/Nằm trong không gian vật lý tĩnh.
-- AI nhận diện tọa độ trên mặt phẳng ảnh (Pixels).
-Khi Pan/Tilt di chuyển camera, góc nhìn thay đổi, hệ tọa độ của Radar (nếu cố định) sẽ không còn khớp với những gì camera nhìn thấy. 
-
-**Đề xuất nâng cấp:**
-- Phải tính toán ma trận xoay (Rotation Matrix). Nghĩa là, tọa độ X, Y mà Radar báo về phải được cộng/trừ bù trừ với góc quay Pan/Tilt hiện tại của Servo để đưa về cùng một hệ tọa độ chuẩn hóa trước khi đưa ra quyết định cảnh báo té ngã phối hợp (Sensor Fusion).
 

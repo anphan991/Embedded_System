@@ -1,6 +1,9 @@
 "use client";
 import { useEffect, useState, useRef } from 'react';
 import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceArea } from 'recharts';
+import { Map, RefreshCw } from 'lucide-react';
+import { useTheme } from 'next-themes';
+import { useTranslation } from './context/LanguageContext';
 
 export type ZoneConfig = {
   type: string;
@@ -25,31 +28,26 @@ interface RadarMapProps {
 }
 
 const RadarCoverageShape = (props: any) => {
-  const { x, y, width, height, radarX, radarY, radarAngle, rWidth, rLength } = props;
+  const { x, y, width, height, radarX, radarY, radarAngle, rWidth, rLength, isDark } = props;
   
   if (typeof x !== 'number' || isNaN(x) || isNaN(width) || isNaN(y) || isNaN(height)) return null;
 
-  const R = 6; // 6m radius
+  const R = 6;
 
-  // Convert angles to radians (0 = facing +Y, 90 = facing +X)
   const leftAngle = ((radarAngle - 60) * Math.PI) / 180;
   const rightAngle = ((radarAngle + 60) * Math.PI) / 180;
 
-  // Conversion functions from Room Coordinates to SVG Pixel Coordinates
   const toPixelX = (roomX: number) => x + (roomX / rWidth) * width;
-  const toPixelY = (roomY: number) => y + height - (roomY / rLength) * height; // SVG Y is inverted
+  const toPixelY = (roomY: number) => y + height - (roomY / rLength) * height;
 
-  // Center point
   const cx = toPixelX(radarX);
   const cy = toPixelY(radarY);
   
-  // Left and Right edge points of the arc
   const startX = toPixelX(radarX + R * Math.sin(leftAngle));
   const startY = toPixelY(radarY + R * Math.cos(leftAngle));
   const endX = toPixelX(radarX + R * Math.sin(rightAngle));
   const endY = toPixelY(radarY + R * Math.cos(rightAngle));
 
-  // Ellipse radii in pixels (in case the grid is not perfectly square due to margins)
   const rx = (R / rWidth) * width;
   const ry = (R / rLength) * height;
 
@@ -57,12 +55,12 @@ const RadarCoverageShape = (props: any) => {
     <g>
       <path 
         d={`M ${cx} ${cy} L ${startX} ${startY} A ${rx} ${ry} 0 0 1 ${endX} ${endY} Z`} 
-        fill="rgba(59, 130, 246, 0.15)" 
-        stroke="rgba(59, 130, 246, 0.6)" 
+        fill={isDark ? "rgba(59, 130, 246, 0.15)" : "rgba(59, 130, 246, 0.15)"} 
+        stroke={isDark ? "rgba(59, 130, 246, 0.4)" : "rgba(59, 130, 246, 0.7)"} 
         strokeDasharray="4 4"
       />
-      <circle cx={cx} cy={cy} r={5} fill="#3b82f6" stroke="#fff" strokeWidth={2} />
-      <text x={cx} y={cy + 16} textAnchor="middle" fill="#60a5fa" fontSize={11} fontWeight="bold" fontFamily="monospace">RADAR</text>
+      <circle cx={cx} cy={cy} r={5} fill="#2563eb" stroke={isDark ? "#111827" : "#fff"} strokeWidth={2} />
+      <text x={cx} y={cy + 16} textAnchor="middle" fill={isDark ? "#60a5fa" : "#2563eb"} fontSize={10} fontWeight="700" fontFamily="sans-serif">RADAR</text>
     </g>
   );
 };
@@ -70,8 +68,10 @@ const RadarCoverageShape = (props: any) => {
 export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
   const [data, setData] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const { theme } = useTheme();
+  const { t } = useTranslation();
+  const isDark = theme === 'dark';
   
-  // Footstep Trail Mapping states
   const [isRecording, setIsRecording] = useState(false);
   const [trail, setTrail] = useState<any[]>([]);
   const isRecordingRef = useRef(isRecording);
@@ -90,14 +90,11 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
             time: new Date(item.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
           }));
           
-          // Lấy điểm mới nhất
           const latestPoint = formattedData[formattedData.length - 1];
           setData([latestPoint]);
 
-          // Nếu đang bật chế độ vẽ bản đồ, lưu vết chân
           if (isRecordingRef.current) {
             setTrail(prev => {
-              // Tránh lưu 2 điểm trùng nhau liên tiếp
               if (prev.length > 0) {
                 const last = prev[prev.length - 1];
                 if (last.id === latestPoint.id || (last.pos_x === latestPoint.pos_x && last.pos_y === latestPoint.pos_y)) {
@@ -108,13 +105,13 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
             });
           }
         }
-      });
+      }).catch(() => {});
   };
 
   useEffect(() => {
-    fetchData(); // Fetch initial data
-    const interval = setInterval(fetchData, 1000); // Poll faster (1s) to get smooth trail
-    return () => clearInterval(interval); // Cleanup on unmount
+    fetchData();
+    const interval = setInterval(fetchData, 1000);
+    return () => clearInterval(interval);
   }, []);
 
   const rWidth = Math.max(1, Number(roomConfig.width) || 6);
@@ -123,108 +120,105 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
   const rRadarY = Number(roomConfig.radar_y) || 0;
   const rRadarAngle = Number(roomConfig.radar_angle) || 0;
 
-  // Generate ticks
   const xTicks = [];
   for (let i = 0; i <= rWidth; i++) xTicks.push(i);
   const yTicks = [];
   for (let i = 0; i <= rLength; i++) yTicks.push(i);
 
   return (
-    <div className="w-full flex flex-col md:flex-row gap-6 p-6 bg-[#09090b]">
-      {/* 2D Minimap Section */}
-      <div className="flex-1 min-h-[400px] bg-black/40 border border-white/5 rounded-xl p-4 flex flex-col relative overflow-hidden">
-        <div className="flex items-center justify-between mb-4 border-b border-white/5 pb-2">
-          <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-widest flex items-center gap-3">
-            <span className="w-2 h-2 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.8)] animate-pulse"></span>
-            Live Spatial Map (Radar 2D)
-          </h2>
-          <div className="flex gap-2">
-            {trail.length > 0 && (
-              <button 
-                onClick={() => setTrail([])}
-                className="px-2 py-1 text-[10px] font-mono bg-red-900/30 hover:bg-red-900/60 border border-red-500/30 rounded text-red-300 transition"
-              >
-                ✖ CLEAR TRAIL
-              </button>
+    <div className="w-full flex flex-col h-full p-6">
+      <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800 transition-colors">
+        <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+          <Map className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+          {t("radar.liveMap")}
+        </h2>
+        <div className="flex items-center gap-2">
+          {trail.length > 0 && (
+            <button 
+              onClick={() => setTrail([])}
+              className="px-3 py-1.5 text-[11px] font-semibold bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 rounded-md text-slate-600 dark:text-slate-300 transition shadow-sm"
+            >
+              {t("radar.clearTrail")}
+            </button>
+          )}
+          <button 
+            onClick={() => setIsRecording(!isRecording)}
+            className={`px-3 py-1.5 text-[11px] font-semibold rounded-md transition border shadow-sm flex items-center gap-2 ${
+              isRecording 
+                ? 'bg-amber-50 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-700/50' 
+                : 'bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+            }`}
+          >
+            {isRecording ? (
+              <>
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                {t("radar.recording")}
+              </>
+            ) : (
+              t("radar.recordTrail")
             )}
-            <button 
-              onClick={() => setIsRecording(!isRecording)}
-              className={`px-3 py-1 text-[10px] font-mono rounded transition border flex items-center gap-2 ${isRecording ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 shadow-[0_0_10px_rgba(245,158,11,0.2)]' : 'bg-white/5 hover:bg-white/10 text-gray-300 border-white/10'}`}
-            >
-              {isRecording ? (
-                <>
-                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-                  RECORDING TRAIL...
-                </>
-              ) : (
-                "RECORD TRAIL"
-              )}
-            </button>
-            <button 
-              onClick={fetchData}
-              disabled={loading}
-              className="px-2 py-1 text-[10px] font-mono bg-white/5 hover:bg-white/10 border border-white/10 rounded text-gray-300 transition"
-            >
-              ↻ REFRESH
-            </button>
-          </div>
+          </button>
+          <button 
+            onClick={fetchData}
+            disabled={loading}
+            className="px-3 py-1.5 text-[11px] font-semibold bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 rounded-md text-slate-600 dark:text-slate-300 transition shadow-sm flex items-center gap-1.5"
+          >
+            <RefreshCw className="w-3 h-3" />
+            {t("radar.refresh")}
+          </button>
         </div>
-        
-        <div className="flex-1 w-full flex items-center justify-center relative">
-          <ResponsiveContainer width="100%" aspect={rWidth / rLength} maxHeight={600}>
-            <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#ffffff" strokeOpacity={0.1} />
-              
-              {/* Radar Coverage Arc */}
-              <ReferenceArea 
-                x1={0} x2={rWidth} 
-                y1={0} y2={rLength} 
-                shape={<RadarCoverageShape radarX={rRadarX} radarY={rRadarY} radarAngle={rRadarAngle} rWidth={rWidth} rLength={rLength} />} 
-              />
+      </div>
+      
+      <div className="flex-1 w-full flex items-center justify-center transition-colors min-h-0">
+        <ResponsiveContainer width="100%" height="100%">
+          <ScatterChart margin={{ top: 20, right: 20, bottom: 40, left: 30 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke={isDark ? "#334155" : "#cbd5e1"} />
+            
+            <ReferenceArea 
+              x1={0} x2={rWidth} 
+              y1={0} y2={rLength} 
+              shape={<RadarCoverageShape radarX={rRadarX} radarY={rRadarY} radarAngle={rRadarAngle} rWidth={rWidth} rLength={rLength} isDark={isDark} />} 
+            />
 
-              {/* Vùng động */}
-              {zones.map((z, idx) => {
-                const isSafe = z.type === 'SAFE';
-                const color = isSafe ? '#22c55e' : '#ef4444';
-                return (
-                  <ReferenceArea 
-                    key={idx} 
-                    x1={Number(z.x_min)} x2={Number(z.x_max)} 
-                    y1={Number(z.y_min)} y2={Number(z.y_max)} 
-                    fill={color} 
-                    fillOpacity={0.15} 
-                    stroke={color}
-                    strokeOpacity={0.6}
-                    strokeDasharray="4 4"
-                    label={{ position: 'inside', value: `[${z.type}] ${z.name}`, fill: color, fontSize: 11, fontWeight: 'bold' }}
-                  />
-                );
-              })}
-
-              <XAxis type="number" dataKey="pos_x" name="X" domain={[0, rWidth]} ticks={xTicks} tickFormatter={(v) => v === 0 ? '' : v} stroke="#52525b" tick={{ fill: '#71717a', fontSize: 10 }} />
-              <YAxis type="number" dataKey="pos_y" name="Y" domain={[0, rLength]} ticks={yTicks} tickFormatter={(v) => v === 0 ? '' : v} stroke="#52525b" tick={{ fill: '#71717a', fontSize: 10 }} />
-              <Tooltip 
-                cursor={{ strokeDasharray: '3 3' }}
-                contentStyle={{ backgroundColor: 'rgba(0,0,0,0.8)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: '#fff', fontSize: '12px' }}
-                itemStyle={{ color: '#60a5fa' }}
-              />
-              
-              {/* Footstep Trail */}
-              {trail.length > 0 && (
-                <Scatter 
-                  name="Footsteps" 
-                  data={trail} 
-                  fill="#f59e0b" 
-                  shape="cross" 
-                  line={{ stroke: '#f59e0b', strokeWidth: 2, strokeDasharray: '5 5' }} 
+            {zones.map((z, idx) => {
+              const isSafe = z.type === 'SAFE';
+              const color = isSafe ? '#10b981' : '#ef4444';
+              return (
+                <ReferenceArea 
+                  key={idx} 
+                  x1={Number(z.x_min)} x2={Number(z.x_max)} 
+                  y1={Number(z.y_min)} y2={Number(z.y_max)} 
+                  fill={color} 
+                  fillOpacity={isDark ? 0.15 : 0.15} 
+                  stroke={color}
+                  strokeOpacity={isDark ? 0.6 : 0.8}
+                  strokeDasharray="4 4"
+                  label={{ position: 'inside', value: z.name, fill: color, fontSize: 12, fontWeight: 700 }}
                 />
-              )}
+              );
+            })}
 
-              {/* Current Target */}
-              <Scatter name="Target" data={data} fill="#3b82f6" shape="circle" />
-            </ScatterChart>
-          </ResponsiveContainer>
-        </div>
+            <XAxis type="number" dataKey="pos_x" name="X" domain={[0, rWidth]} ticks={xTicks} tickFormatter={(v) => v === 0 ? '' : v} stroke={isDark ? "#475569" : "#94a3b8"} tick={{ fill: isDark ? '#94a3b8' : '#475569', fontSize: 11, fontWeight: 500 }} />
+            <YAxis type="number" dataKey="pos_y" name="Y" domain={[0, rLength]} ticks={yTicks} tickFormatter={(v) => v === 0 ? '' : v} stroke={isDark ? "#475569" : "#94a3b8"} tick={{ fill: isDark ? '#94a3b8' : '#475569', fontSize: 11, fontWeight: 500 }} />
+            <Tooltip 
+              cursor={{ strokeDasharray: '3 3', stroke: isDark ? '#64748b' : '#94a3b8' }}
+              contentStyle={{ backgroundColor: isDark ? '#1e293b' : '#ffffff', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: '8px', color: isDark ? '#f8fafc' : '#1e293b', fontSize: '12px', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' }}
+              itemStyle={{ color: isDark ? '#60a5fa' : '#2563eb', fontWeight: 500 }}
+            />
+            
+            {trail.length > 0 && (
+              <Scatter 
+                name="Footsteps" 
+                data={trail} 
+                fill="#d97706" 
+                shape="cross" 
+                line={{ stroke: '#f59e0b', strokeWidth: 1.5, strokeDasharray: '4 4' }} 
+              />
+            )}
+
+            <Scatter name="Target" data={data} fill={isDark ? "#3b82f6" : "#2563eb"} shape="circle" />
+          </ScatterChart>
+        </ResponsiveContainer>
       </div>
     </div>
   );
