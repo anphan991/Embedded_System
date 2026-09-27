@@ -1,9 +1,9 @@
-import type { NextConfig } from "next";
+﻿import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Cấp quyền cho mạng nội bộ (WSL/VPN/Điện thoại) tải tính năng Hot Reload
+  // Cáº¥p quyá»n cho máº¡ng ná»™i bá»™ (WSL/VPN/Äiá»‡n thoáº¡i) táº£i tÃ­nh nÄƒng Hot Reload
   allowedDevOrigins: [
-    "172.29.176.1", // IP mạng hiện tại của bạn
+    "172.29.176.1", "100.125.37.122", // IP máº¡ng hiá»‡n táº¡i cá»§a báº¡n
     "localhost", 
     "127.0.0.1"
   ],

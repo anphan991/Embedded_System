@@ -30,7 +30,23 @@ export function AlertsProvider({ children }: { children: React.ReactNode }) {
 
     const initializeWebSocket = () => {
       if (!isMounted) return;
-      wsRef.current = new WebSocket("ws://localhost:8000/api/v1/ws/alerts");
+      
+      // Dynamically determine WebSocket URL for Tailscale support
+      let backendHost = "";
+      const saved = localStorage.getItem('fallguard_settings');
+      if (saved) {
+        try {
+          const data = JSON.parse(saved);
+          if (data.serverUrl) {
+            backendHost = data.serverUrl.replace(/^https?:\/\//, "").replace(/\/api\/v1\/?$/, "");
+          }
+        } catch (e) {}
+      }
+      if (!backendHost) {
+        backendHost = `${window.location.hostname}:8000`;
+      }
+
+      wsRef.current = new WebSocket(`ws://${backendHost}/api/v1/ws/alerts`);
       
       wsRef.current.onopen = () => { if (isMounted) setIsConnected(true); };
       

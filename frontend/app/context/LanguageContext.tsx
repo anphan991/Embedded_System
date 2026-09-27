@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 import React, { createContext, useContext, useState, useEffect } from "react";
 
 type Language = "en" | "vi";
@@ -9,6 +9,11 @@ type Dictionary = {
 
 const translations: Record<Language, Dictionary> = {
   en: {
+    // Desktop Only
+    "common.version": "Version",
+    "common.desktopRequired": "Desktop Required",
+    "common.desktopRequiredDesc": "This feature requires a larger screen. Please access it via a desktop or tablet.",
+    
     // Sidebar
     "nav.liveView": "Live View",
     "nav.radarAnalytics": "Radar Analytics",
@@ -36,28 +41,28 @@ const translations: Record<Language, Dictionary> = {
     "cam.autoDesc": "Camera automatically tracks movement.",
 
     // Radar Analytics
-    "radar.title": "Radar Spatial Analytics",
+    "radar.title": "Radar Analytics",
     "radar.subtitle": "Map configuration and live tracking",
     "radar.saveConfig": "Save Config",
     "radar.saving": "Saving...",
-    "radar.configureMap": "Configure Map",
-    "radar.roomDims": "1. Room Dimensions & Radar Placement",
-    "radar.roomWidth": "Room Width (X)",
-    "radar.roomLength": "Room Length (Y)",
-    "radar.radarPosX": "Radar Pos X",
-    "radar.radarPosY": "Radar Pos Y",
-    "radar.radarYaw": "Radar Yaw (Rotate)",
-    "radar.zoneConstraints": "2. Zone Constraints",
-    "radar.infoText": "Adjust values above and watch the live minimap preview update instantly. Check if the Radar coverage arc covers your zones properly.",
+    "radar.configureMap": "Map Setup",
+    "radar.roomDims": "1. ROOM DIMENSIONS & RADAR POS",
+    "radar.roomWidth": "Width (X)",
+    "radar.roomLength": "Length (Y)",
+    "radar.radarPosX": "Radar Pos (X)",
+    "radar.radarPosY": "Radar Pos (Y)",
+    "radar.radarYaw": "Radar Yaw",
+    "radar.zoneConstraints": "2. SAFE ZONE CONSTRAINTS",
+    "radar.infoText": "Adjust parameters and watch the minimap update instantly. Ensure radar field covers desired areas.",
     "radar.patientStatus": "Patient Status",
     "radar.stable": "Stable / Resting",
     "radar.continuousActive": "Continuous monitoring active",
     "radar.roomEnv": "Room Environment",
-    "radar.radarAt": "Radar at",
+    "radar.radarAt": "Radar located at",
     "radar.sensorStatus": "Sensor Status",
     "radar.online": "LD2450 ONLINE",
     "radar.multiTarget": "Multi-target tracking enabled",
-    "radar.liveMap": "Live spatial map",
+    "radar.liveMap": "Live Spatial Map",
     "radar.clearTrail": "Clear Trail",
     "radar.recordTrail": "Record Trail",
     "radar.recording": "Recording...",
@@ -65,14 +70,14 @@ const translations: Record<Language, Dictionary> = {
 
     // Incident Logs
     "logs.title": "Incident Logs",
-    "logs.subtitle": "Historical records of system alerts",
+    "logs.subtitle": "History of alerts and fall detections",
     "logs.clearLogs": "Clear Logs",
-    "logs.ackSelected": "Ack Selected",
-    "logs.searchPlaceholder": "Search time or message...",
-    "logs.allStatus": "All Status",
+    "logs.ackSelected": "Acknowledge Selected",
+    "logs.searchPlaceholder": "Search by time or message...",
+    "logs.allStatus": "All Statuses",
     "logs.unack": "Unacknowledged",
     "logs.ack": "Acknowledged",
-    "logs.noMatch": "No incidents match your criteria.",
+    "logs.noMatch": "No logs match your search.",
     "logs.time": "Time",
     "logs.eventType": "Event Type",
     "logs.message": "Message",
@@ -80,21 +85,21 @@ const translations: Record<Language, Dictionary> = {
 
     // System Settings
     "settings.title": "System Settings",
-    "settings.subtitle": "Manage AI, Connectivity, Storage, and Integrations",
+    "settings.subtitle": "Manage AI, Connectivity, Storage, and Notifications",
     "settings.saveChanges": "Save Changes",
-    "settings.aiAlgo": "AI Fall Detection Algorithm",
-    "settings.sensitivity": "Sensitivity Threshold",
-    "settings.sensitivityDesc": "Higher sensitivity detects falls faster but may cause more false alarms. Lower sensitivity is stricter and waits for clearer movement data before triggering an alert.",
+    "settings.aiAlgo": "Fall Detection AI Algorithm",
+    "settings.sensitivity": "Sensitivity Level",
+    "settings.sensitivityDesc": "High sensitivity detects falls faster but may cause false alarms. Low sensitivity requires clearer movement.",
     "settings.multiTarget": "Multi-Target Tracking",
-    "settings.multiTargetDesc": "Allow Radar to track up to 3 people simultaneously in the room.",
-    "settings.camServer": "Camera & Server Endpoints",
+    "settings.multiTargetDesc": "Allow Radar to detect and track up to 3 people simultaneously in the room.",
+    "settings.camServer": "Camera & Backend Connectivity",
     "settings.camIp": "ESP32 Camera IP Address",
     "settings.backendUrl": "Backend API URL",
-    "settings.integrations": "3rd Party Integrations (Push Notifications)",
+    "settings.integrations": "Third-Party Integrations",
     "settings.teleToken": "Telegram Bot Token",
-    "settings.teleTokenDesc": "Required to send instant fall alerts and video snapshots directly to a Telegram group or doctor's chat.",
+    "settings.teleTokenDesc": "Required to send instant fall alerts with images to a Telegram group or doctor.",
     "settings.teleChatId": "Telegram Chat ID",
-    "settings.teleChatIdDesc": "The Token authenticates the bot, while the Chat ID tells the bot exactly which user or group to send the alert to.",
+    "settings.teleChatIdDesc": "Target chat or group ID that will receive the alerts.",
     "settings.zaloToken": "Zalo ZNS API Key (Optional)",
     "settings.storage": "Storage Management (Danger Zone)",
     "settings.clearDb": "Clear Database Logs",
@@ -106,6 +111,11 @@ const translations: Record<Language, Dictionary> = {
     "alert.SYSTEM_ERROR": "System error occurred.",
   },
   vi: {
+    // Desktop Only
+    "common.version": "Phiên bản",
+    "common.desktopRequired": "Chỉ hỗ trợ Máy tính",
+    "common.desktopRequiredDesc": "Tính năng này cần không gian hiển thị lớn. Vui lòng truy cập bằng máy tính PC hoặc Tablet.",
+
     // Sidebar
     "nav.liveView": "Giám sát trực tiếp",
     "nav.radarAnalytics": "Cấu hình thiết bị",

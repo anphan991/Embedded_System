@@ -81,7 +81,21 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
   }, [isRecording]);
 
   const fetchData = () => {
-    fetch(`http://localhost:8000/api/v1/radar/history?limit=30&_t=${Date.now()}`, { cache: "no-store" })
+    let backendHost = "";
+    const saved = localStorage.getItem('fallguard_settings');
+    if (saved) {
+      try {
+        const data = JSON.parse(saved);
+        if (data.serverUrl) {
+          backendHost = data.serverUrl.replace(/^https?:\/\//, "").replace(/\/api\/v1\/?$/, "");
+        }
+      } catch (e) {}
+    }
+    if (!backendHost) {
+      backendHost = `${window.location.hostname}:8000`;
+    }
+
+    fetch(`http://${backendHost}/api/v1/radar/history?limit=30&_t=${Date.now()}`, { cache: "no-store" })
       .then(res => res.json())
       .then(result => {
         if (result.status === "success" && result.data && result.data.length > 0) {

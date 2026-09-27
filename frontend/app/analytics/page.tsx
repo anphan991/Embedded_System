@@ -1,7 +1,8 @@
-"use client";
+﻿"use client";
 import React, { useState } from "react";
 import { Radar, Activity, Maximize2, Save, Map as MapIcon, Crosshair } from "lucide-react";
 import RadarMap from "../RadarMap";
+import DesktopOnly from "../DesktopOnly";
 import { useTranslation } from "../context/LanguageContext";
 
 export type ZoneConfig = {
@@ -44,6 +45,7 @@ export default function AnalyticsPage() {
   };
 
   return (
+    <DesktopOnly>
     <div className="flex-1 flex flex-col h-full bg-[#f4f5f7] dark:bg-[#0b0f19] text-slate-900 dark:text-slate-100 overflow-hidden transition-colors duration-300">
       
       {/* Header */}
@@ -144,8 +146,8 @@ export default function AnalyticsPage() {
                   
                   <div>
                     <div className="flex justify-between text-xs mb-1.5">
-                      <label className="font-medium text-slate-700 dark:text-slate-300">{t("radar.radarYaw")} (°)</label>
-                      <span className="text-slate-500">{config.radarYaw}°</span>
+                      <label className="font-medium text-slate-700 dark:text-slate-300">{t("radar.radarYaw")} (Â°)</label>
+                      <span className="text-slate-500">{config.radarYaw}Â°</span>
                     </div>
                     <input 
                       type="range" min="-180" max="180" step="5"
@@ -248,5 +250,7 @@ export default function AnalyticsPage() {
 
       </main>
     </div>
+    </DesktopOnly>
   );
 }
+

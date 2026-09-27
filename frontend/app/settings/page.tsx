@@ -1,5 +1,6 @@
-"use client";
+﻿"use client";
 import React, { useState } from "react";
+import DesktopOnly from "../DesktopOnly";
 import { Settings, Info, Save, Cpu, Camera, Database, BellRing, DatabaseBackup, Trash2, Smartphone } from "lucide-react";
 import { useTranslation } from "../context/LanguageContext";
 
@@ -59,6 +60,7 @@ export default function SettingsPage() {
   };
 
   return (
+    <DesktopOnly>
     <div className="flex-1 flex flex-col h-full bg-[#f4f5f7] dark:bg-[#0b0f19] text-slate-900 dark:text-slate-100 overflow-y-auto transition-colors duration-300">
       <header className="px-8 py-5 border-b border-slate-200 dark:border-slate-800 bg-[#fdfdfe] dark:bg-[#111827] flex justify-between items-center shrink-0 sticky top-0 z-10 shadow-sm transition-colors">
         <div className="flex items-center gap-3">
@@ -234,5 +236,6 @@ export default function SettingsPage() {
 
       </main>
     </div>
+    </DesktopOnly>
   );
 }

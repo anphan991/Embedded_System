@@ -98,4 +98,18 @@ Hệ thống được thiết kế với cơ chế chịu lỗi (Fault-tolerance
 - **Vị trí và góc quét:** Khai báo vị trí treo radar trên tường và hướng quay (`0°`, `90°`, `180°`, `270°`). Máy chủ tự động áp dụng ma trận xoay và tịnh tiến tọa độ cảm biến về đúng vị trí thực tế trong phòng.
 - **Hình quạt phủ sóng:** Vùng màu xanh lam mô phỏng chùm tia quét của cảm biến LD2450 (bán kính 6m, góc mở 120 độ) được vẽ đè lên bản đồ để dễ dàng phát hiện điểm mù.
 
+## 10. Hướng dẫn thiết lập Tailscale cho Mobile Testing
+Dự án hỗ trợ xem và điều khiển camera trực tiếp qua mạng nội bộ ảo Tailscale mà không cần port forwarding.
 
+### Các bước cài đặt:
+1. **Cài đặt Tailscale:** Cài đặt ứng dụng Tailscale trên cả Máy chủ (PC chạy code) và Thiết bị di động (Điện thoại/Tablet).
+2. **Đăng nhập:** Đăng nhập cùng một tài khoản Tailscale trên cả 2 thiết bị.
+3. **Lấy IP Máy chủ:** Mở ứng dụng Tailscale trên PC, copy địa chỉ IP của máy (thường có dạng `100.x.x.x`).
+4. **Truy cập:** Trên trình duyệt điện thoại, gõ `http://<IP-Tailscale-PC>:3000`.
+
+### Lưu ý quan trọng:
+* **Lỗi trắng màn hình (Next.js 15 CORS):** Theo mặc định, Next.js 15 sẽ chặn fetch JS chunk từ các IP lạ. Nếu dùng điện thoại mới (IP Tailscale mới) để test và gặp hiện tượng "Có UI nhưng không bấm được gì", hãy mở file `frontend/next.config.ts` và thêm IP Tailscale của điện thoại đó vào mảng `allowedDevOrigins`. **Nhớ khởi động lại server (`npm run dev`) sau khi sửa!**
+* **Luồng Stream MJPEG trên iOS/Safari:** Dự án không dùng sự kiện `onLoad` cho thẻ `<img>` stream camera vì iOS Safari không hỗ trợ bắn event này cho luồng multipart MJPEG. Thay vào đó, dự án dùng URL có thêm timestamp `?t=...` để ép trình duyệt không cache video, chống đứng hình.
+* **Bố cục màn hình di động:** Màn hình Giám sát trên điện thoại đã được tối ưu lại Camera nửa trên, PTZ nửa dưới. Phần Nhật ký sự cố bị ẩn đi trên điện thoại để tiết kiệm không gian.
+* **DesktopOnly:** Các trang có biểu đồ phức tạp (`/analytics` và `/settings`) được bọc bằng `<DesktopOnly>`. Khi xem trên thiết bị có bề ngang nhỏ hơn `1024px`, hệ thống sẽ chặn hiển thị và yêu cầu người dùng chuyển qua PC/Tablet để đảm bảo trải nghiệm vẽ bản đồ tốt nhất.
+* **Đa ngôn ngữ & Mã hóa (Encoding):** File `frontend/app/context/LanguageContext.tsx` chứa từ điển tiếng Việt và tiếng Anh. Khi chỉnh sửa file này, **BẮT BUỘC** phải lưu dưới chuẩn `UTF-8` (không dùng ANSI) để tránh lỗi vỡ font tiếng Việt.
