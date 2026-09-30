@@ -32,7 +32,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Constants
-VIDEO_SOURCE = 0
+VIDEO_SOURCE = "http://10.28.125.12:81/stream"
 FALL_DURATION_THRESHOLD_SEC = 1.5
 
 # Tạo thư mục chứa ảnh Snapshot nếu chưa có
@@ -43,26 +43,44 @@ init_db()
 # TIẾN TRÌNH 1: CAMERA PRODUCER (Độc lập phần cứng)
 # ---------------------------------------------------------
 def camera_process(raw_q: mp.Queue, shutdown_flag):
-    logger.info("Process 1 (Camera): Started.")
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
+    logger.info("Process 1 (Camera): Started (urllib HTTP mode).")
+    import urllib.request
+    import numpy as np
+    
+    stream = None
+    while stream is None and not shutdown_flag.value:
+        try:
+            stream = urllib.request.urlopen(VIDEO_SOURCE, timeout=5)
+        except Exception as e:
+            logger.error(f"Camera connect error: {e}")
+            time.sleep(1)
+
+    bytes_data = bytes()
     while not shutdown_flag.value:
-        ret, frame = cap.read()
-        if ret:
-            # Lật ảnh để sửa lỗi bị ngược. 
-            # Dùng 1 để lật ngang (như gương), 0 để lật dọc (nếu camera gắn ngược trên trần), -1 để lật cả ngang và dọc.
-            frame = cv2.flip(frame, 1)
-            
-            if raw_q.full():
-                try: raw_q.get_nowait()
-                except: pass
-            
+        try:
+            bytes_data += stream.read(4096)
+            a = bytes_data.find(b'\xff\xd8')
+            b = bytes_data.find(b'\xff\xd9')
+            if a != -1 and b != -1:
+                jpg = bytes_data[a:b+2]
+                bytes_data = bytes_data[b+2:]
+                frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                
+                if frame is not None:
+                    frame = cv2.flip(frame, 1)
+                    if raw_q.full():
+                        try: raw_q.get_nowait()
+                        except: pass
+                    try:
+                        raw_q.put(frame, timeout=0.1)
+                    except:
+                        pass
+        except Exception as e:
+            time.sleep(0.5)
             try:
-                raw_q.put(frame, timeout=0.1)
+                stream = urllib.request.urlopen(VIDEO_SOURCE, timeout=5)
             except:
                 pass
-        else:
-            time.sleep(0.01)
-    cap.release()
     logger.info("Process 1 (Camera): Exited gracefully.")
 
 
@@ -188,7 +206,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
 
     mqtt_client.on_message = on_mqtt_message
     
-    broker = os.getenv("MQTT_BROKER", "localhost")
+    broker = os.getenv("MQTT_BROKER", "127.0.0.1")
     try:
         mqtt_client.connect(broker, 1883, 60)
         mqtt_client.subscribe("embedded/servo/status")
@@ -663,7 +681,7 @@ async def update_room_config_api(request: Request):
 
 
 # --- CAMERA MANUAL CONTROL API ---
-camera_mode = "AUTO"
+camera_mode = "MANUAL"
 
 from pydantic import BaseModel
 class CameraMoveRequest(BaseModel):
@@ -688,7 +706,7 @@ def move_camera(req: CameraMoveRequest):
     if camera_mode == "MANUAL":
         import paho.mqtt.publish as publish
         import os
-        broker = os.getenv("MQTT_BROKER", "localhost")
+        broker = os.getenv("MQTT_BROKER", "10.28.125.55")
         try:
             publish.single("embedded/servo/manual", req.direction, hostname=broker)
             return {"status": "success"}

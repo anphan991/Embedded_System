@@ -93,6 +93,45 @@ Hệ thống được thiết kế với cơ chế chịu lỗi (Fault-tolerance
     *   **Lỗi xén viền:** Loại bỏ thuộc tính `aspect={rWidth / rLength}` và `maxHeight` của thư viện Recharts vì chúng tính toán sai chiều cao khi phòng rộng. Ép lại `width="100%"` và `height="100%"`, nới `margin-bottom: 40` để trục Y hiện đầy đủ.
     *   **Light Mode:** Nâng độ tương phản (Contrast) của Radar Coverage và SAFE/DANGER Zones (fillOpacity 0.15). Sơn lại lưới tọa độ (Cartesian Grid) và số đo sang mã màu `#cbd5e1`, `#94a3b8` để hiển thị sắc nét hơn trên nền sáng.
 
+---
+
+### Tích hợp phần cứng: ESP32-CAM Stream + Pan/Tilt Servo Control
+
+#### Backend (`backend/main.py`)
+
+*   **Sửa lỗi Stream Camera từ ESP32-CAM (hàm `camera_process`):**
+    *   **Vấn đề gốc:** `cv2.VideoCapture(url, cv2.CAP_FFMPEG)` trên Windows bị lỗi MSMF (Error -138), treo vô thời hạn khi kết nối HTTP stream từ ESP32-CAM.
+    *   **Giải pháp:** Viết lại hoàn toàn hàm `camera_process` — thay `cv2.VideoCapture` bằng `urllib.request.urlopen()` đọc raw byte stream, tự tay parse JPEG frame dựa trên magic bytes `\xff\xd8` (SOI) và `\xff\xd9` (EOI), sau đó dùng `cv2.imdecode(np.frombuffer(...))` để decode. Cơ chế tự động reconnect khi mất tín hiệu.
+    *   **Cập nhật biến:** `VIDEO_SOURCE = "http://10.28.125.12:81/stream"` (IP thực tế của ESP32-CAM trên mạng hotspot).
+
+*   **Sửa lỗi điều khiển Servo qua MQTT (hàm `move_camera`):**
+    *   **Vấn đề gốc 1:** `camera_mode` mặc định là `"AUTO"` khiến API `/api/v1/camera/move` luôn từ chối lệnh với lỗi `"Must be in MANUAL mode"`.
+    *   **Sửa:** Đổi `camera_mode = "AUTO"` → `camera_mode = "MANUAL"` làm giá trị mặc định khi khởi động.
+    *   **Vấn đề gốc 2:** Backend publish MQTT đến `"localhost"` / `"127.0.0.1"` (Windows Service Mosquitto mặc định, không có ESP32 kết nối vào), trong khi ESP32 đang kết nối đến Mosquitto chạy tại IP WiFi `10.28.125.55`.
+    *   **Sửa:** Đổi default broker từ `"localhost"` → `"10.28.125.55"` trong hàm `move_camera`.
+
+#### Frontend (`frontend/app/CameraControlPanel.tsx`)
+
+*   **Sửa lỗi Joystick:**
+    *   **Vấn đề gốc:** Toàn bộ 5 nút bấm (Lên/Xuống/Trái/Phải/Reset) và 2 nút chế độ (Thủ công/Tự động) không có bất kỳ handler `onClick` nào. Bấm không gửi lệnh gì về Backend.
+    *   **Sửa:** Thêm 2 hàm async: `handleMove(dir: string)` gọi `POST /api/v1/camera/move` với body `{direction: dir}`, và `handleModeChange(isAuto: boolean)` gọi `POST /api/v1/camera/mode?mode=...`. Gắn `onClick` vào tất cả các nút.
+    *   **Sửa thêm:** Dùng `window.location.hostname` thay cho `"localhost"` cứng (hardcode) để tương thích khi truy cập qua IP mạng nội bộ hoặc Tailscale.
+
+#### Firmware ESP32 Thường (`firmware/esp32_main/`)
+
+*   **Thêm `ESP32PWM::allocateTimer()` và `servo.setPeriodHertz(50)`** vào `setup()` để kích hoạt đúng xung PWM 50Hz cho thư viện `ESP32Servo`. Thiếu bước này servo không xuất tín hiệu dù code nhận lệnh bình thường.
+*   **Thêm log debug** `Serial.print("NHAN LENH TỪ KÊNH [...]:")` vào `mqttCallback()` để dễ chẩn đoán khi bấm Joystick.
+*   **Thêm `msg.toUpperCase()`** trong `mqttCallback()` để đề phòng frontend gửi chữ thường (`"left"` thay vì `"LEFT"`).
+*   **Đổi `TILT_PIN` từ GPIO 14 → GPIO 27** vì GPIO14 là strapping pin của ESP32, gây xung đột và không xuất PWM ổn định. GPIO27 là chân PWM an toàn.
+*   **Cải thiện `reconnect()`:** Thêm biến đếm `attempts < 5` để tránh vòng lặp vô hạn khi MQTT Broker không phản hồi, cho phép chương trình tiếp tục chạy các tác vụ khác (đọc Radar).
+
+#### Môi trường & Hệ thống
+
+*   **Cài đặt thư viện `paho-mqtt`:** Thư viện này bị thiếu trong môi trường Python của máy host (`pip install paho-mqtt`). Thiếu thư viện này khiến Backend crash âm thầm mỗi lần gọi `publish.single()`.
+*   **Xử lý xung đột 2 tiến trình Mosquitto:** Windows tự động chạy Mosquitto như một Windows Service (PID chạy dưới `SI=0`). Không cần và không thể chạy thêm một instance thủ công nào nữa. Mosquitto Service mặc định (`listener 1883 0.0.0.0` + `allow_anonymous true` trong `backend/mosquitto_local.conf`) đã đủ để ESP32 kết nối.
+
+
+
 ## 9. Cấu hình không gian radar
 - **Kích thước phòng:** Cho phép nhập chiều rộng và chiều dài thực tế. Bản đồ 2D sẽ tự động căn chỉnh lưới trục theo tỷ lệ tương ứng.
 - **Vị trí và góc quét:** Khai báo vị trí treo radar trên tường và hướng quay (`0°`, `90°`, `180°`, `270°`). Máy chủ tự động áp dụng ma trận xoay và tịnh tiến tọa độ cảm biến về đúng vị trí thực tế trong phòng.
