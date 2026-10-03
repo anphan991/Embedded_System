@@ -1,6 +1,8 @@
 ## TÊN ĐỀ TÀI
 **Hệ thống điều khiển vị trí Servo Camera Pan-Tilt theo dõi đối tượng kết hợp thuật toán phản hồi thị giác và cảnh báo hành vi.**
 
+> **Tình trạng tài liệu:** Đây là đề xuất ban đầu, có các hạng mục dự kiến chưa có trong bản đang chạy. Để cài đặt/lắp/nạp hệ thống thực tế, dùng [hướng dẫn vận hành mới](HUONG_DAN_CAI_DAT_VA_VAN_HANH.md). Ảnh bo thật cho thấy **ESP32-CAM dùng ESP-32S và dây camera TY-OV3660**, firmware chọn profile AI Thinker; mô tả S3/OV5640 bên dưới là phương án cũ. Servo MG996R không có cảm biến vị trí trục đưa về ESP32 trong sơ đồ hiện tại, nên log PWM chỉ là lệnh đặt góc; không được dùng như số đo góc thật.
+
 ---
 
 ## 1. MỤC TIÊU DỰ ÁN
@@ -14,8 +16,8 @@ Dự án đặt trọng tâm vào việc thiết kế thuật toán điều khi�
 Hệ thống được thiết kế theo mô hình phân tán (Decoupled Architecture) nhằm cô lập thời gian lấy mẫu của hệ thống cơ điện tử khỏi độ trễ của quá trình xử lý hình ảnh.
 
 Kiến trúc bao gồm 3 phân lớp (Layers):
-*   **Lớp Chấp hành & Cảm biến (Sensing & Actuation):** Bao gồm vi điều khiển trung tâm (ESP32) kết nối trực tiếp với Radar và cơ cấu Servo. Phân lớp này đảm nhiệm vòng lặp điều khiển PID tần số cao.
-*   **Lớp Điện toán biên (Edge Computing):** Sử dụng máy tính nội bộ (Local Host) thu thập luồng dữ liệu Video qua mạng không dây (từ ESP32-S3 CAM). Đóng vai trò là trung tâm xử lý AI và điều phối mạng.
+*   **Lớp Chấp hành & Cảm biến (Sensing & Actuation):** Bao gồm ESP32 kết nối trực tiếp với Radar và cơ cấu Servo. Firmware hiện đặt góc có giới hạn tốc độ theo tọa độ radar; chưa đo góc trục thực để đóng vòng PID vị trí servo.
+*   **Lớp Điện toán biên (Edge Computing):** Sử dụng máy tính nội bộ (Local Host) thu thập luồng dữ liệu Video qua mạng không dây (từ ESP32-CAM đang sử dụng). Đóng vai trò là trung tâm xử lý AI và điều phối mạng.
 *   **Lớp Giao diện & Đám mây (Cloud & UI):** Ứng dụng web được lưu trữ trên nền tảng đám mây, kết nối với Lớp Điện toán biên thông qua mạng riêng ảo, cung cấp giao diện giám sát cho người dùng cuối.
 
 ---
@@ -24,17 +26,17 @@ Kiến trúc bao gồm 3 phân lớp (Layers):
 
 **3.1. Khối Vi điều khiển và Thu thập dữ liệu**
 *   **Vi điều khiển điều khiển cơ khí:** Module ESP32 DevKit V1 (30 chân). Yêu cầu hoạt động ổn định, cung cấp xung PWM chính xác.
-*   **Vi điều khiển thu thập hình ảnh:** Module ESP32-S3 WROOM CAM kèm cảm biến OV5640 (5 Megapixel). Yêu cầu hỗ trợ PSRAM dung lượng cao và tích hợp ngàm cắm Anten ngoài.
+*   **Vi điều khiển thu thập hình ảnh đang dùng:** ESP32-CAM với module `ESP-32S` và dây camera `TY-OV3660-21MM-V3.0`; chọn board Arduino **AI Thinker ESP32-CAM**, xác nhận PID thực tế bằng `:82/status`. ESP32-S3 WROOM CAM + OV5640 là phương án dự kiến ban đầu, không phải bo trong ảnh mới.
 *   **Cảm biến không gian:** Module Radar mmWave HLK-LD2450 (giao tiếp UART).
 *   **Phụ kiện mạng:** 02 Anten rời IPEX 2.4Ghz 3dBi nhằm tăng cường chất lượng truyền dẫn gói tin.
 
 **3.2. Khối Cơ cấu chấp hành**
-*   **Động cơ:** 02 Động cơ Servo MG996R loại Digital (Kỹ thuật số), hành trình 180 độ, sử dụng bánh răng kim loại.
+*   **Động cơ:** 02 động cơ được khai báo là MG996R, dùng bánh răng kim loại. Chưa xác minh model/nhà sản xuất thực tế; không giả định hành trình 180°. Firmware khởi đầu với giới hạn thận trọng và cần hiệu chỉnh theo khung thật.
 *   **Cơ khí:** Bộ khung Pan-Tilt hợp kim nhôm chuyên dụng cho Servo chuẩn MG996R, hoặc bản vẽ in 3D (vật liệu PETG/ABS) với độ cứng vững tương đương.
 
 **3.3. Khối Quản lý năng lượng**
 *   **Nguồn cấp chính:** Adapter nguồn DC 12V - 5A.
-*   **Mạch hạ áp (Buck Converter):** Module XL4015 (chịu tải tối đa 5A). Sử dụng để chuyển đổi điện áp 12V xuống 5V, cấp nguồn song song và độc lập cho cụm Servo và cụm Vi điều khiển.
+*   **Mạch hạ áp (Buck Converter):** Module XL4015 chuyển 12 V xuống điện áp phù hợp. Thông số 5 A của IC không bảo đảm module lắp ráp, dây và đầu nối chịu đủ dòng ở mọi điều kiện. Một module cấp song song không tạo hai đường nguồn độc lập; kiểm tra sụt áp dưới tải, dùng nguồn logic/camera riêng nếu servo làm reset bo.
 
 **3.4. Khối Máy chủ nội bộ (Local Host)**
 
@@ -45,7 +47,7 @@ Kiến trúc bao gồm 3 phân lớp (Layers):
 Dự án được chia thành 4 phân hệ chính, triển khai tuần tự theo danh sách dưới đây.
 
 ### Phân hệ 1: Hệ thống truyền phát Video (Video Streaming Node)
-*   **Nhiệm vụ:** Thiết lập ESP32-S3 CAM trở thành một điểm phát hình ảnh không dây độc lập.
+*   **Nhiệm vụ:** Thiết lập ESP32-CAM đang dùng trở thành một điểm phát hình ảnh không dây độc lập.
 *   **Môi trường & Ngôn ngữ:** Arduino IDE, C++.
 *   **Chi tiết thực hiện:**
     *   Sử dụng thư viện `esp_camera.h`.
@@ -59,18 +61,18 @@ Dự án được chia thành 4 phân hệ chính, triển khai tuần tự theo
 *   **Chi tiết thực hiện:**
     *   Thiết lập chuẩn giao tiếp UART để đọc mảng byte dữ liệu từ Radar HLK-LD2450, trích xuất tọa độ phẳng (X, Y).
     *   Xây dựng mô hình toán học: Chuyển đổi tọa độ Descartes (X, Y) sang tọa độ góc cầu (Pan, Tilt) bằng hàm lượng giác nghịch đảo.
-    *   **Thiết kế bộ điều khiển PID:** Đưa góc sai lệch (Error) vào bộ điều khiển PID rời rạc. Tinh chỉnh các hệ số Kp, Ki, Kd để đạt đáp ứng bước tối ưu (thời gian xác lập nhanh, không vọt lố).
-    *   Xây dựng luồng lắng nghe gói tin UDP không đồng bộ (Asynchronous UDP) để sẵn sàng nhận tín hiệu ghi đè (override) từ máy chủ.
+    *   **Hướng mở rộng:** Nếu lắp cảm biến đo góc trục, có thể thiết kế PID với phản hồi vị trí thực và tinh chỉnh đáp ứng. Firmware hiện dùng nội suy/giới hạn tốc độ lệnh servo để tránh bước nhảy lớn.
+    *   Giao tiếp đang dùng MQTT; UDP không thuộc bản triển khai hiện tại.
 
 ### Phân hệ 3: Máy chủ Trí tuệ nhân tạo và Phân tích logic (AI & Backend Server)
 *   **Nhiệm vụ:** Tiếp nhận hình ảnh, chạy mô hình học sâu (Deep Learning), xử lý logic cảnh báo và cung cấp API.
 *   **Môi trường & Ngôn ngữ:** Python 3.10+, Visual Studio Code.
 *   **Khung công nghệ:** FastAPI, OpenCV (`opencv-python`), MediaPipe, Uvicorn, Thư viện `threading` và `socket`.
 *   **Chi tiết thực hiện:**
-    *   **Xử lý luồng Video:** Sử dụng luồng (Thread) độc lập chạy nền để liên tục lấy khung hình mới nhất từ OpenCV `VideoCapture`, nhằm loại bỏ hoàn toàn độ trễ tích lũy do hàng đợi (buffer) gây ra.
-    *   **Triển khai AI:** Đưa khung hình vào mô hình MediaPipe Pose để trích xuất mảng tọa độ 33 điểm khớp xương người.
+    *   **Xử lý luồng Video hiện tại:** Tiến trình riêng đọc MJPEG bằng HTTP, giữ khung hình mới nhất ở các hàng đợi giới hạn để tránh tích lũy độ trễ.
+    *   **Triển khai AI hiện tại:** Dùng YOLO pose 17 điểm khớp xương, mặc định `yolov8m-pose.pt`.
     *   **Thiết kế thuật toán nhận diện té ngã:** Xây dựng thuật toán theo chuỗi thời gian dựa trên các tham số động lực học: Đạo hàm bậc nhất theo thời gian của tọa độ trục Y (vận tốc rơi) tại điểm tham chiếu (mũi/vai), kết hợp so sánh tương quan vị trí không gian với điểm đầu gối và thời gian duy trì trạng thái.
-    *   **Phản hồi thị giác (Sensor Fusion):** Đo lường mức độ lệch tâm của đối tượng trên khung hình. Gửi tín hiệu bù trừ dạng gói tin UDP xuống Phân hệ 2 để tinh chỉnh quỹ đạo Servo.
+    *   **Phản hồi thị giác (Sensor Fusion):** Đo độ lệch tâm trong khung hình và gửi qua MQTT xuống ESP32 khi có mục tiêu hợp lệ.
 
 ### Phân hệ 4: Giao diện giám sát và Hệ thống mạng (UI Dashboard & Networking)
 *   **Nhiệm vụ:** Xây dựng trung tâm điều khiển trực quan và thiết lập đường truyền bảo mật xuyên mạng.
@@ -116,7 +118,7 @@ Sóng GSM (Module SIM): Tích hợp thêm Module SIM (SIM800L hoặc A7670C 4G) 
 
 Tình huống: Camera bị hỏng phần cứng hoặc bị lấy đồ che lại.
 Phương án dự phòng:
-Tích hợp Radar LD2450 / LD2410 hoạt động độc lập trên ESP32. Trạng thái bình thường, Camera là "Boss" ra quyết định. Nhưng khi máy chủ báo lỗi Camera, ESP32 sẽ tự đưa Radar lên làm "Chỉ huy". Radar dùng sóng xuyên vật cản để dò nhịp thở và khối người bất động, tiếp tục bảo vệ bệnh nhân.
+Tích hợp Radar LD2450 hoạt động độc lập trên ESP32 để bám mục tiêu chuyển động trong vùng cảm biến. LD2450 không được dùng ở đây để xác nhận nhịp thở hay một người nằm bất động; mục tiêu mất khỏi khung radar phải được báo là mất tín hiệu, không được coi là đã an toàn.
 
 
 II. CÁC TÌNH HUỐNG PHẦN MỀM (SOFTWARE FAILURES)

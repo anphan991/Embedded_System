@@ -4,6 +4,7 @@ import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, Responsive
 import { Map, RefreshCw } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { useTranslation } from './context/LanguageContext';
+import { getBackendBaseUrl } from './backendUrl';
 
 export type ZoneConfig = {
   type: string;
@@ -27,10 +28,29 @@ interface RadarMapProps {
   roomConfig: RoomConfig;
 }
 
-const RadarCoverageShape = (props: any) => {
+type RadarCoverageProps = {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  radarX: number;
+  radarY: number;
+  radarAngle: number;
+  rWidth: number;
+  rLength: number;
+  isDark: boolean;
+};
+
+type RadarHistoryItem = { timestamp: number; pos_x: number; pos_y: number; speed: number };
+type RadarPoint = RadarHistoryItem & { time: string };
+type RadarHistoryResponse = { status: string; data?: RadarHistoryItem[] };
+
+const RadarCoverageShape = (props: RadarCoverageProps) => {
   const { x, y, width, height, radarX, radarY, radarAngle, rWidth, rLength, isDark } = props;
   
-  if (typeof x !== 'number' || isNaN(x) || isNaN(width) || isNaN(y) || isNaN(height)) return null;
+  if (typeof x !== 'number' || typeof y !== 'number' ||
+      typeof width !== 'number' || typeof height !== 'number' ||
+      ![x, y, width, height].every(Number.isFinite)) return null;
 
   const R = 6;
 
@@ -66,40 +86,38 @@ const RadarCoverageShape = (props: any) => {
 };
 
 export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
-  const [data, setData] = useState<any[]>([]);
+  const [data, setData] = useState<RadarPoint[]>([]);
   const [loading, setLoading] = useState(false);
   const { theme } = useTheme();
   const { t } = useTranslation();
   const isDark = theme === 'dark';
   
   const [isRecording, setIsRecording] = useState(false);
-  const [trail, setTrail] = useState<any[]>([]);
+  const [trail, setTrail] = useState<RadarPoint[]>([]);
   const isRecordingRef = useRef(isRecording);
+  const fetchInFlightRef = useRef(false);
 
   useEffect(() => {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
 
   const fetchData = () => {
-    let backendHost = "";
-    const saved = localStorage.getItem('fallguard_settings');
-    if (saved) {
-      try {
-        const data = JSON.parse(saved);
-        if (data.serverUrl) {
-          backendHost = data.serverUrl.replace(/^https?:\/\//, "").replace(/\/api\/v1\/?$/, "");
-        }
-      } catch (e) {}
-    }
-    if (!backendHost) {
-      backendHost = `${window.location.hostname}:8000`;
-    }
-
-    fetch(`http://${backendHost}/api/v1/radar/history?limit=30&_t=${Date.now()}`, { cache: "no-store" })
-      .then(res => res.json())
-      .then(result => {
-        if (result.status === "success" && result.data && result.data.length > 0) {
-          const formattedData = result.data.map((item: any) => ({
+    if (fetchInFlightRef.current) return;
+    fetchInFlightRef.current = true;
+    setLoading(true);
+    fetch(`${getBackendBaseUrl()}/api/v1/radar/history?limit=1`, { cache: "no-store" })
+      .then(res => res.ok ? res.json() : null)
+      .then((result: RadarHistoryResponse | null) => {
+        if (result?.status === "success" && result.data && result.data.length > 0) {
+          const latest = result.data[result.data.length - 1];
+          // The database keeps old points after radar disconnects. Do not
+          // present one of those points as a live target.
+          if (!Number.isFinite(Number(latest.timestamp)) ||
+              Date.now() / 1000 - Number(latest.timestamp) > 6) {
+            setData([]);
+            return;
+          }
+          const formattedData = result.data.map((item: RadarHistoryItem) => ({
             ...item,
             time: new Date(item.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
           }));
@@ -111,15 +129,20 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
             setTrail(prev => {
               if (prev.length > 0) {
                 const last = prev[prev.length - 1];
-                if (last.id === latestPoint.id || (last.pos_x === latestPoint.pos_x && last.pos_y === latestPoint.pos_y)) {
+                if (last.pos_x === latestPoint.pos_x && last.pos_y === latestPoint.pos_y) {
                   return prev;
                 }
               }
-              return [...prev, latestPoint];
+              return [...prev, latestPoint].slice(-200);
             });
           }
+        } else {
+          setData([]);
         }
-      }).catch(() => {});
+      }).catch(() => setData([])).finally(() => {
+        fetchInFlightRef.current = false;
+        setLoading(false);
+      });
   };
 
   useEffect(() => {

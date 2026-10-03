@@ -2,8 +2,9 @@ fastapi
 uvicorn
 opencv-python
 ultralytics
+openvino>=2024.0.0
 websockets
-numpy<2.0.0
+numpy>=1.26,<2.6
 onnx
 onnxruntime
 paho-mqtt

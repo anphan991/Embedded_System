@@ -1,5 +1,6 @@
 "use client";
 import React, { createContext, useContext, useEffect, useRef, useState } from "react";
+import { getBackendBaseUrl, SETTINGS_CHANGED_EVENT } from "../backendUrl";
 
 export interface AlertPayload {
   id: string;
@@ -26,35 +27,28 @@ export function AlertsProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let isMounted = true;
-    let reconnectTimeout: NodeJS.Timeout;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
 
     const initializeWebSocket = () => {
       if (!isMounted) return;
       
-      // Dynamically determine WebSocket URL for Tailscale support
-      let backendHost = "";
-      const saved = localStorage.getItem('fallguard_settings');
-      if (saved) {
-        try {
-          const data = JSON.parse(saved);
-          if (data.serverUrl) {
-            backendHost = data.serverUrl.replace(/^https?:\/\//, "").replace(/\/api\/v1\/?$/, "");
-          }
-        } catch (e) {}
-      }
-      if (!backendHost) {
-        backendHost = `${window.location.hostname}:8000`;
-      }
-
-      wsRef.current = new WebSocket(`ws://${backendHost}/api/v1/ws/alerts`);
+      const backendUrl = new URL(getBackendBaseUrl());
+      const wsProtocol = backendUrl.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(`${wsProtocol}//${backendUrl.host}/api/v1/ws/alerts`);
+      wsRef.current = socket;
       
-      wsRef.current.onopen = () => { if (isMounted) setIsConnected(true); };
+      socket.onopen = () => { if (isMounted && wsRef.current === socket) setIsConnected(true); };
       
-      wsRef.current.onmessage = (event: MessageEvent) => {
+      socket.onmessage = (event: MessageEvent) => {
+        if (!isMounted || wsRef.current !== socket) return;
         try {
           const data = JSON.parse(event.data);
           if (data.type === "SYSTEM_ERROR" && isMounted) {
             setIsConnected(false);
+            return;
+          }
+          if (data.type === "SYSTEM_OK" && isMounted) {
+            setIsConnected(true);
             return;
           }
           if (data.type === "CRITICAL_ALERT" && isMounted) {
@@ -68,22 +62,38 @@ export function AlertsProvider({ children }: { children: React.ReactNode }) {
             };
             setAlerts((prevAlerts) => [newAlert, ...prevAlerts]);
           }
-        } catch (error) {}
+        } catch {}
       };
       
-      wsRef.current.onclose = () => {
-        if (isMounted) {
+      socket.onclose = () => {
+        if (isMounted && wsRef.current === socket) {
           setIsConnected(false);
           reconnectTimeout = setTimeout(initializeWebSocket, 3000);
         }
       };
     };
 
+    const reconnectForSettings = () => {
+      clearTimeout(reconnectTimeout);
+      const oldSocket = wsRef.current;
+      wsRef.current = null;
+      oldSocket?.close();
+      setIsConnected(false);
+      initializeWebSocket();
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === "fallguard_settings") reconnectForSettings();
+    };
+
+    window.addEventListener(SETTINGS_CHANGED_EVENT, reconnectForSettings);
+    window.addEventListener("storage", onStorage);
     initializeWebSocket();
     
     return () => {
       isMounted = false;
       clearTimeout(reconnectTimeout);
+      window.removeEventListener(SETTINGS_CHANGED_EVENT, reconnectForSettings);
+      window.removeEventListener("storage", onStorage);
       if (wsRef.current) wsRef.current.close();
     };
   }, []);

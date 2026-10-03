@@ -99,8 +99,8 @@ def get_room_config():
 
 def update_room_config(width: float, length: float, radar_x: float, radar_y: float, radar_angle: float):
     """Cập nhật cấu hình phòng"""
+    conn = sqlite3.connect(DB_PATH)
     try:
-        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('DELETE FROM room_config')
         c.execute('''
@@ -108,9 +108,11 @@ def update_room_config(width: float, length: float, radar_x: float, radar_y: flo
             VALUES (?, ?, ?, ?, ?)
         ''', (width, length, radar_x, radar_y, radar_angle))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-    except Exception as e:
-        print(f"Database error: {e}")
 
 def get_all_zones():
     """Lấy danh sách các vùng không gian"""
@@ -127,8 +129,8 @@ def get_all_zones():
 
 def update_zones(zones: list):
     """Xóa các vùng cũ và lưu cấu hình vùng mới"""
+    conn = sqlite3.connect(DB_PATH)
     try:
-        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('DELETE FROM zones_config')
         for z in zones:
@@ -137,9 +139,11 @@ def update_zones(zones: list):
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (z["type"], z["name"], z["x_min"], z["x_max"], z["y_min"], z["y_max"]))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-    except Exception as e:
-        print(f"Database error: {e}")
 
 def log_alert(event_code: str, message: str, image_path: str):
     """Ghi log cảnh báo vào CSDL"""

@@ -1,5 +1,13 @@
 # Hướng dẫn khởi chạy dự án: Hệ thống giám sát & bám sát mục tiêu
 
+> **Camera:** Người lắp đã nạp bằng board **AI Thinker ESP32-CAM** và xem được hình với FPS thấp; firmware camera nay mặc định profile AI Thinker theo bằng chứng đó. Mô tả ESP32-S3 WROOM CAM + OV5640 trong đề xuất cũ và ảnh trang bán hàng chưa xác nhận được bo thực tế. Xem [hướng dẫn lắp mạch và chẩn đoán](hardware/SETUP_DIAGNOSTICS.md); chụp bo thật khi có thể để xác nhận. Firmware servo/radar dành riêng cho ESP32 DevKit GPIO13/27.
+
+> **Nguồn hiện tại:** một XL4015 đang cấp chung hai MG996R, hai ESP32 và LD2450; chưa đo sụt áp dưới tải. Cần đo tại đầu servo/camera lúc chuyển động và ưu tiên đường nguồn servo riêng đủ dòng, GND chung. Đây là nghi vấn phần cứng trực tiếp đối với hiện tượng servo đứng yên và stream đứng hình.
+
+Thông số hoạt động hiện tại xem tại `GET /api/v1/video/status`, `GET /api/v1/servo/diag` và bảng chẩn đoán trên dashboard. Các giá trị FPS, thời gian suy luận, số khung rơi và lệnh PWM được đo/log để xác định điểm nghẽn; không có cam kết 30 FPS hay xác nhận trục servo đã quay chỉ từ log góc đích.
+
+Cảnh báo ngã được backend xử lý và ghi ảnh/DB/gửi Telegram ngay cả khi không mở dashboard; WebSocket phát cùng một sự kiện tới mọi dashboard đang kết nối. Hàng đợi cảnh báo có giới hạn 16 sự kiện để không bỏ mất các phát hiện gần nhau trong điều kiện bình thường, và ghi log nếu vượt giới hạn.
+
 ## 1. Yêu cầu nền tảng
 - **Python:** Phiên bản 3.10 trở lên.
 - **Node.js:** Phiên bản LTS (v20.x trở lên).
@@ -13,7 +21,7 @@ Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
 ## 3. Cài đặt và khởi chạy MQTT Broker (Mosquitto)
 Hệ thống sử dụng MQTT để giao tiếp giữa máy chủ backend và phần cứng (ESP32).
 1. Tải và cài đặt Mosquitto: [Link tải Windows](https://mosquitto.org/files/binary/win64/mosquitto-2.0.18-install-windows-x64.exe)
-2. Mở một cửa sổ PowerShell mới tại thư mục `backend`, chạy lệnh khởi động Mosquitto cùng file cấu hình (để cho phép ESP32 kết nối):
+2. Trước tiên kiểm tra Mosquitto đã chạy như Windows Service chưa bằng `Get-Service mosquitto -ErrorAction SilentlyContinue`. Nếu service đang chạy, dùng chính instance đó và kiểm tra nó cho phép ESP32 kết nối qua mạng LAN; **không mở thêm broker thủ công trên cổng 1883**. Chỉ khi không có service/instance đang chạy, mở PowerShell tại thư mục `backend` và khởi động với cấu hình của dự án:
 ```powershell
 & "C:\Program Files\mosquitto\mosquitto.exe" -c mosquitto_local.conf -v
 ```
@@ -65,7 +73,7 @@ Hệ thống được thiết kế với cơ chế chịu lỗi (Fault-tolerance
     *   **Chống giật động cơ :** Đóng băng luồng MQTT xuất lệnh (`embedded/servo/tracking`) để camera đứng yên bao quát toàn cảnh khi phát hiện đông người.
 *   **API điều khiển thủ công (`backend/main.py` & `backend/mock_hardware.py`):**
     *   **REST API:** Viết mới 2 API `POST /api/v1/camera/mode` và `POST /api/v1/camera/move` để hỗ trợ Joystick ảo trên giao diện web.
-    *   **Flag:** Tiến trình AI (`ai_process`) sẽ đọc tín hiệu từ file `camera_mode.txt` để tự động nhường quyền truyền lệnh MQTT (`embedded/servo/manual`) khi người dùng thao tác.
+    *   **Chế độ:** Backend giữ trạng thái AUTO/MANUAL và gửi qua `embedded/servo/mode`; ESP32 chỉ nhận lệnh joystick `embedded/servo/manual` khi ở MANUAL. File `camera_mode.txt` chỉ ghi lại chế độ, tiến trình AI không đọc file này.
     *   **Heartbeat PING:** Bổ sung gói tin nhịp tim vào `mock_hardware.py` để mô phỏng giữ kết nối liên tục với máy chủ.
 *   **Vá lỗi thuật toán té ngã (`backend/fall_detection.py` & `backend/main.py`):**
     *   **Lỗi Amnesia (Quên lịch sử):** Sửa đổi luồng logic của cử chỉ X (Hủy báo động). Thay vì xóa mảng lịch sử tư thế, hệ thống chỉ đưa cờ báo động vào trạng thái làm nguội (Cooldown). Lịch sử khung xương vẫn được bảo tồn để bắt các cú ngã liên hoàn.
@@ -102,7 +110,7 @@ Hệ thống được thiết kế với cơ chế chịu lỗi (Fault-tolerance
 *   **Sửa lỗi Stream Camera từ ESP32-CAM (hàm `camera_process`):**
     *   **Vấn đề gốc:** `cv2.VideoCapture(url, cv2.CAP_FFMPEG)` trên Windows bị lỗi MSMF (Error -138), treo vô thời hạn khi kết nối HTTP stream từ ESP32-CAM.
     *   **Giải pháp:** Viết lại hoàn toàn hàm `camera_process` — thay `cv2.VideoCapture` bằng `urllib.request.urlopen()` đọc raw byte stream, tự tay parse JPEG frame dựa trên magic bytes `\xff\xd8` (SOI) và `\xff\xd9` (EOI), sau đó dùng `cv2.imdecode(np.frombuffer(...))` để decode. Cơ chế tự động reconnect khi mất tín hiệu.
-    *   **Cập nhật biến:** `VIDEO_SOURCE = "http://10.28.125.12:81/stream"` (IP thực tế của ESP32-CAM trên mạng hotspot).
+    *   **Cập nhật địa chỉ:** đặt `VIDEO_SOURCE=http://<IP-ESP32-CAM>:81/stream` trong `backend/.env` theo IP Serial Monitor in ra, rồi khởi động lại backend. IP mẫu trong code là `10.28.125.12`; hotspot có thể cấp IP khác sau khi reset.
 
 *   **Sửa lỗi điều khiển Servo qua MQTT (hàm `move_camera`):**
     *   **Vấn đề gốc 1:** `camera_mode` mặc định là `"AUTO"` khiến API `/api/v1/camera/move` luôn từ chối lệnh với lỗi `"Must be in MANUAL mode"`.
@@ -117,13 +125,13 @@ Hệ thống được thiết kế với cơ chế chịu lỗi (Fault-tolerance
     *   **Sửa:** Thêm 2 hàm async: `handleMove(dir: string)` gọi `POST /api/v1/camera/move` với body `{direction: dir}`, và `handleModeChange(isAuto: boolean)` gọi `POST /api/v1/camera/mode?mode=...`. Gắn `onClick` vào tất cả các nút.
     *   **Sửa thêm:** Dùng `window.location.hostname` thay cho `"localhost"` cứng (hardcode) để tương thích khi truy cập qua IP mạng nội bộ hoặc Tailscale.
 
-#### Firmware ESP32 Thường (`firmware/esp32_main/`)
+#### Firmware ESP32 Thường (`hardware/esp32_servo_radar/esp32_servo_radar.ino`)
 
-*   **Thêm `ESP32PWM::allocateTimer()` và `servo.setPeriodHertz(50)`** vào `setup()` để kích hoạt đúng xung PWM 50Hz cho thư viện `ESP32Servo`. Thiếu bước này servo không xuất tín hiệu dù code nhận lệnh bình thường.
+*   **Cấu hình `ESP32PWM::allocateTimer()` và `servo.setPeriodHertz(50)`** trong `setup()` để cấp xung PWM 50 Hz cho servo; log `attached` và `pulse_us` giúp xác định lệnh PWM có được tạo hay không.
 *   **Thêm log debug** `Serial.print("NHAN LENH TỪ KÊNH [...]:")` vào `mqttCallback()` để dễ chẩn đoán khi bấm Joystick.
 *   **Thêm `msg.toUpperCase()`** trong `mqttCallback()` để đề phòng frontend gửi chữ thường (`"left"` thay vì `"LEFT"`).
-*   **Đổi `TILT_PIN` từ GPIO 14 → GPIO 27** vì GPIO14 là strapping pin của ESP32, gây xung đột và không xuất PWM ổn định. GPIO27 là chân PWM an toàn.
-*   **Cải thiện `reconnect()`:** Thêm biến đếm `attempts < 5` để tránh vòng lặp vô hạn khi MQTT Broker không phản hồi, cho phép chương trình tiếp tục chạy các tác vụ khác (đọc Radar).
+*   **Dùng GPIO13 cho PAN và GPIO27 cho TILT.** Dây tín hiệu phải đúng hai chân này trên ESP32 Dev Module thường; nếu lắp chân khác, sửa hằng `PAN_PIN`/`TILT_PIN` trước khi nạp.
+*   **Cải thiện `reconnect()`:** Thử lại có khoảng cách trong vòng lặp chính, để việc mất MQTT không chặn đọc radar và cập nhật servo.
 
 #### Môi trường & Hệ thống
 
@@ -137,6 +145,25 @@ Hệ thống được thiết kế với cơ chế chịu lỗi (Fault-tolerance
 - **Vị trí và góc quét:** Khai báo vị trí treo radar trên tường và hướng quay (`0°`, `90°`, `180°`, `270°`). Máy chủ tự động áp dụng ma trận xoay và tịnh tiến tọa độ cảm biến về đúng vị trí thực tế trong phòng.
 - **Hình quạt phủ sóng:** Vùng màu xanh lam mô phỏng chùm tia quét của cảm biến LD2450 (bán kính 6m, góc mở 120 độ) được vẽ đè lên bản đồ để dễ dàng phát hiện điểm mù.
 
+### Kết nối radar và servo
+- Dự án dùng hai bo riêng: nạp `hardware/esp32_servo_radar/esp32_servo_radar.ino` vào **ESP32 DevKit** để đọc LD2450 và điều khiển servo; chỉ nạp `hardware/esp32_cam_stream/esp32_cam_stream.ino` vào **bo camera đã xác minh** sau khi chọn đúng profile pin ở đầu sketch. Không nạp nhầm hai sketch cho nhau.
+- LD2450: cấp VCC 5V, nối GND chung; TX của radar vào GPIO16 (RX2) và RX radar vào GPIO17 (TX2) nếu cần cấu hình radar từ ESP32. UART mặc định là 256000 baud, 8N1.
+- Servo pan nhận tín hiệu ở GPIO13, servo tilt ở GPIO27. Dùng nguồn servo riêng theo điện áp và dòng định mức của servo; nối GND nguồn servo với GND ESP32. Không cấp nguồn servo từ chân 3.3V của ESP32.
+- Gắn radar cố định trên phần đế, mặt anten hướng vào phòng và trùng hướng nhìn giữa với camera khi servo ở góc 90°. Firmware dùng tọa độ radar cục bộ để tính góc servo; không gắn radar lên phần pan đang xoay.
+- Trong trang **Cấu hình thiết bị**, nhập kích thước phòng, vị trí radar và góc quay theo bản đồ; các ô hiện đơn vị mm. Nhấn **Lưu cấu hình** để lưu xuống backend. Cấu hình này phục vụ bản đồ và vùng an toàn/nguy hiểm; góc xoay servo vẫn lấy trực tiếp từ tọa độ X/Y của radar.
+- Mặc định firmware giả định camera cao 1500 mm và ngắm vào tâm thân người cao 900 mm. Hiệu chỉnh `CAMERA_HEIGHT_MM` và `TARGET_HEIGHT_MM` lúc chạy bằng Serial/MQTT hoặc `POST /api/v1/servo/config`; giá trị lưu NVS. Xem [các lệnh và giới hạn an toàn](hardware/SETUP_DIAGNOSTICS.md).
+
+### Xử lý trễ joystick, khựng hình và AUTO không quay
+
+**Hướng dẫn đang áp dụng:** [Lắp mạch và chẩn đoán](hardware/SETUP_DIAGNOSTICS.md). Các bước ngắn bên dưới dùng profile AI Thinker theo lần nạp và xem được hình mà người lắp đã xác nhận; hướng dẫn chi tiết có cách kiểm tra lại bo và nguồn.
+
+1. Nạp `hardware/esp32_servo_radar/esp32_servo_radar.ino` cho **ESP32 Dev Module thường**. Chỉ nạp `hardware/esp32_cam_stream/esp32_cam_stream.ino` cho bo camera sau khi đã xác nhận profile chân và board Arduino theo bo thực tế. Mở Serial Monitor từng bo ở 115200 baud.
+2. Nhập IP in trên Serial của bo camera vào **Cài đặt hệ thống → Địa chỉ IP Camera ESP32**, rồi bấm **Lưu thay đổi**: backend lưu `VIDEO_SOURCE` vào `.env`, kết nối lại camera và bỏ khung hình/trạng thái AI từ nguồn cũ. Có thể đặt tay `VIDEO_SOURCE=http://<IP-camera>:81/stream` trong `backend/.env` rồi khởi động lại backend. Nếu broker MQTT đổi IP, đặt `MQTT_BROKER=<IP-broker>` trong backend và gửi `MQTT_HOST=<IP-broker>` qua Serial ESP32 DevKit để lưu NVS; phải phối hợp đổi cùng lúc để không mất điều khiển. Chỉ chạy **một** tiến trình `python main.py` trên cổng 8000; khởi động lại backend sau khi sửa `.env` bằng tay.
+3. Dashboard mặc định chọn **Trực tiếp**: đây là JPEG mới nhất từ bo camera qua backend, không bị tốc độ suy luận AI chặn. Nút **Lớp phủ AI** giữ hình có bounding box/cảnh báo; pipeline AI mặc định giới hạn tối đa 15 khung hình mới/giây và CPU có thể thấp hơn. Backend chỉ duy trì một kết nối đọc tới camera để tránh tranh luồng. `GET /api/v1/video/status` báo `online`, FPS và tuổi khung hình; Serial bo camera báo `[CAM-DIAG] fps=... jpeg=... rssi=...` mỗi 5 giây khi có người xem.
+4. Nếu cả URL camera trực tiếp `http://<IP-camera>:81/stream` cũng giật, hãy **dừng backend trước khi mở URL trực tiếp** (sketch camera phục vụ một stream dài hạn), rồi xem `[CAM-DIAG] fps`, PSRAM và RSSI tại `http://<IP-camera>:82/status`. Giữ bo và điểm phát Wi-Fi 2.4 GHz gần nhau, dùng nguồn đúng thông số bo và ổn định dưới tải. Có thể thử `http://<IP-camera>:82/tune?framesize=QVGA&quality=20` khi chạy để giảm tải, đổi lại AI khó nhận người ở xa hơn. Không thể bảo đảm 30 FPS cố định trên ESP32 qua Wi-Fi.
+5. Joystick gửi một lệnh ngay khi nhấn rồi giữ tối đa một yêu cầu HTTP đang xử lý; khi nhả nút gửi `STOP`. Backend gắn số thứ tự cho lệnh HTTP và lệnh MQTT, ESP32 bỏ lệnh MQTT cũ đến muộn; payload chữ đơn như `LEFT` vẫn được hỗ trợ. Lệnh STOP dùng MQTT QoS 1 và giao diện báo lỗi nếu backend/broker không xác nhận. Backend dùng kết nối MQTT duy trì. Nếu còn trễ, xem Serial ESP32 có nhận `[MQTT] ... embedded/servo/manual` ngay lúc nhấn không. `GET /api/v1/camera/mode` cần có `mqtt_connected: true`. Nếu MQTT đến ngay nhưng trục vẫn chậm, kiểm tra nguồn 5 V **ngay tại servo khi đang quay**, dây tín hiệu GPIO13/27 và tải cơ khí; dòng nguồn phải đáp ứng dòng kẹt của đúng model servo. Nếu nhãn nguồn chỉ ghi 1 A hoặc không rõ dòng, xác nhận lại model servo và dòng nguồn trước khi thử cả hai trục dưới tải.
+6. Khi bấm AUTO, chờ `hardware_online: true` và `hardware_mode: "AUTO"` ở `GET /api/v1/camera/mode`. Log `[AUTO]` chỉ chứng minh đã tính **góc đích**. Log `[SERVO-DIAG]` cho `target`, `current`, `cmd`, `pulse_us`, `attached`: nếu `target` đổi nhưng `current/cmd` đứng yên, xem đường cập nhật firmware; nếu `current/cmd/pulse_us` đổi mà trục đứng yên, kiểm tra chân tín hiệu thực, nguồn/dây và xung PWM 50 Hz. `attached=0` nghĩa là PWM chưa gắn vào chân. Radar phải cố định trên đế; chỉnh `CAMERA_HEIGHT_MM`, `TARGET_HEIGHT_MM`, `PAN_DIR`, `TILT_DIR` và offset theo cách lắp thực tế sau khi servo đã quay được.
+
 ## 10. Hướng dẫn thiết lập Tailscale cho Mobile Testing
 Dự án hỗ trợ xem và điều khiển camera trực tiếp qua mạng nội bộ ảo Tailscale mà không cần port forwarding.
 
@@ -148,7 +175,7 @@ Dự án hỗ trợ xem và điều khiển camera trực tiếp qua mạng nộ
 
 ### Lưu ý quan trọng:
 * **Lỗi trắng màn hình (Next.js 15 CORS):** Theo mặc định, Next.js 15 sẽ chặn fetch JS chunk từ các IP lạ. Nếu dùng điện thoại mới (IP Tailscale mới) để test và gặp hiện tượng "Có UI nhưng không bấm được gì", hãy mở file `frontend/next.config.ts` và thêm IP Tailscale của điện thoại đó vào mảng `allowedDevOrigins`. **Nhớ khởi động lại server (`npm run dev`) sau khi sửa!**
-* **Luồng Stream MJPEG trên iOS/Safari:** Dự án không dùng sự kiện `onLoad` cho thẻ `<img>` stream camera vì iOS Safari không hỗ trợ bắn event này cho luồng multipart MJPEG. Thay vào đó, dự án dùng URL có thêm timestamp `?t=...` để ép trình duyệt không cache video, chống đứng hình.
+* **Luồng Stream MJPEG trên iOS/Safari:** Không dựa riêng vào `onLoad` của thẻ `<img>` để xác định còn hình mới. Dashboard hỏi `/api/v1/video/status` theo định kỳ và tự kết nối lại khi nguồn camera hoặc luồng AI gián đoạn.
 * **Bố cục màn hình di động:** Màn hình Giám sát trên điện thoại đã được tối ưu lại Camera nửa trên, PTZ nửa dưới. Phần Nhật ký sự cố bị ẩn đi trên điện thoại để tiết kiệm không gian.
 * **DesktopOnly:** Các trang có biểu đồ phức tạp (`/analytics` và `/settings`) được bọc bằng `<DesktopOnly>`. Khi xem trên thiết bị có bề ngang nhỏ hơn `1024px`, hệ thống sẽ chặn hiển thị và yêu cầu người dùng chuyển qua PC/Tablet để đảm bảo trải nghiệm vẽ bản đồ tốt nhất.
 * **Đa ngôn ngữ & Mã hóa (Encoding):** File `frontend/app/context/LanguageContext.tsx` chứa từ điển tiếng Việt và tiếng Anh. Khi chỉnh sửa file này, **BẮT BUỘC** phải lưu dưới chuẩn `UTF-8` (không dùng ANSI) để tránh lỗi vỡ font tiếng Việt.

@@ -1,6 +1,6 @@
 "use client";
 import React, { useState } from "react";
-import { useAlerts } from "../context/AlertsContext";
+import { useAlerts, type AlertPayload } from "../context/AlertsContext";
 import { useTranslation } from "../context/LanguageContext";
 import { Clock, ShieldAlert, CheckCircle2, Trash2, Search, Filter, CheckSquare } from "lucide-react";
 
@@ -12,7 +12,7 @@ export default function LogsPage() {
   const [statusFilter, setStatusFilter] = useState<"ALL" | "UNACK" | "ACK">("ALL");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  const getAlertMessage = (alert: any) => {
+  const getAlertMessage = (alert: AlertPayload) => {
     const key = `alert.${alert.eventCode}`;
     const translated = t(key);
     return translated !== key ? translated : alert.message;
@@ -90,7 +90,7 @@ export default function LogsPage() {
           
           <select 
             value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as any)}
+            onChange={(e) => setStatusFilter(e.target.value as "ALL" | "UNACK" | "ACK")}
             className="bg-slate-50 dark:bg-[#0b0f19] border border-slate-200 dark:border-slate-700 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500 text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
           >
             <option value="ALL">{t("logs.allStatus")}</option>

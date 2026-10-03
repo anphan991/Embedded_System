@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, ShieldAlert, Settings, Camera, Radar, Moon, Sun, Globe, Menu, X } from "lucide-react";
+import { Activity, ShieldAlert, Settings, Camera, Radar, Moon, Sun, Menu, X } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 import { useTranslation } from "./context/LanguageContext";
@@ -11,16 +11,12 @@ export default function Sidebar() {
   const pathname = usePathname();
   const { theme, setTheme } = useTheme();
   const { t, language, setLanguage } = useTranslation();
-  const [mounted, setMounted] = useState(false);
   const [isOpen, setIsOpen] = useState(false); // For mobile drawer
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
 
   // Close sidebar on mobile when navigating
   useEffect(() => {
-    setIsOpen(false);
+    const frame = requestAnimationFrame(() => setIsOpen(false));
+    return () => cancelAnimationFrame(frame);
   }, [pathname]);
   
   const navItems = [
@@ -66,7 +62,7 @@ export default function Sidebar() {
             <h1 className="font-semibold text-slate-900 dark:text-slate-100 tracking-tight text-lg">FallGuard</h1>
           </div>
           
-          {mounted && (
+          {(
             <div className="flex items-center gap-1">
               <button
                 onClick={() => setLanguage(language === 'en' ? 'vi' : 'en')}

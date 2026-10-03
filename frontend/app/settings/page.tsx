@@ -1,8 +1,10 @@
 ﻿"use client";
 import React, { useState } from "react";
 import DesktopOnly from "../DesktopOnly";
-import { Settings, Info, Save, Cpu, Camera, Database, BellRing, DatabaseBackup, Trash2, Smartphone } from "lucide-react";
+import ServoCalibrationPanel from "../ServoCalibrationPanel";
+import { Settings, Save, Cpu, Camera, Database, BellRing, Trash2, Smartphone } from "lucide-react";
 import { useTranslation } from "../context/LanguageContext";
+import { getBackendBaseUrl, SETTINGS_CHANGED_EVENT } from "../backendUrl";
 
 export default function SettingsPage() {
   const { t } = useTranslation();
@@ -13,8 +15,10 @@ export default function SettingsPage() {
   const [multiTarget, setMultiTarget] = useState(true);
 
   // 2. Camera & Server
-  const [camIp, setCamIp] = useState("192.168.1.100");
-  const [serverUrl, setServerUrl] = useState("http://localhost:8000/api/v1");
+  const [camIp, setCamIp] = useState("");
+  const [serverUrl, setServerUrl] = useState("");
+  const loadedCamIpRef = React.useRef("");
+  const camIpEditedRef = React.useRef(false);
 
   // 4. Integrations
   const [telegramToken, setTelegramToken] = useState("");
@@ -23,6 +27,9 @@ export default function SettingsPage() {
 
   // Load saved settings on mount
   React.useEffect(() => {
+    let active = true;
+    const frame = requestAnimationFrame(() => {
+    const backendUrl = `${getBackendBaseUrl()}/api/v1`;
     const saved = localStorage.getItem('fallguard_settings');
     if (saved) {
       try {
@@ -30,26 +37,57 @@ export default function SettingsPage() {
         if (data.aiSensitivity !== undefined) setAiSensitivity(data.aiSensitivity);
         if (data.multiTarget !== undefined) setMultiTarget(data.multiTarget);
         if (data.camIp) setCamIp(data.camIp);
-        if (data.serverUrl) setServerUrl(data.serverUrl);
         if (data.telegramToken) setTelegramToken(data.telegramToken);
         if (data.telegramChatId) setTelegramChatId(data.telegramChatId);
         if (data.zaloToken) setZaloToken(data.zaloToken);
-      } catch (e) {}
+      } catch {}
     }
+    setServerUrl(backendUrl);
+    fetch(`${backendUrl}/config/camera`, { cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((result) => {
+        if (!active) return;
+        if (result?.status === "success" && result.camera_ip) {
+          loadedCamIpRef.current = result.camera_ip;
+          if (!camIpEditedRef.current) setCamIp(result.camera_ip);
+        }
+      })
+      .catch(() => {});
+    });
+    return () => { active = false; cancelAnimationFrame(frame); };
   }, []);
 
-  const handleSave = () => {
+  const handleSave = async () => {
     setSaving(true);
-    
-    // Persist to browser storage
-    const data = { aiSensitivity, multiTarget, camIp, serverUrl, telegramToken, telegramChatId, zaloToken };
-    localStorage.setItem('fallguard_settings', JSON.stringify(data));
-
-    // Simulate API call to backend
-    setTimeout(() => {
+    let cameraSaveFailed = false;
+    try {
+      if (camIpEditedRef.current && !camIp.trim()) {
+        cameraSaveFailed = true;
+      } else if (camIpEditedRef.current && camIp.trim() !== loadedCamIpRef.current) {
+        const apiBase = serverUrl.trim().replace(/\/+$/, "").replace(/\/api\/v1$/i, "") + "/api/v1";
+        const response = await fetch(`${apiBase}/config/camera`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ camera_ip: camIp.trim() }),
+        });
+        const result = await response.json();
+        if (!response.ok || result.status !== "success") {
+          cameraSaveFailed = true;
+        } else {
+          loadedCamIpRef.current = result.camera_ip;
+          camIpEditedRef.current = false;
+        }
+      }
+    } catch {
+      cameraSaveFailed = true;
+    } finally {
+      // Other settings remain local to this browser as before.
+      const data = { aiSensitivity, multiTarget, camIp, serverUrl, telegramToken, telegramChatId, zaloToken };
+      localStorage.setItem('fallguard_settings', JSON.stringify(data));
+      window.dispatchEvent(new Event(SETTINGS_CHANGED_EVENT));
       setSaving(false);
-      alert("Settings saved successfully!");
-    }, 600);
+      alert(t(cameraSaveFailed ? "settings.cameraSaveFailed" : "settings.saved"));
+    }
   };
 
   const handleClearDatabase = () => {
@@ -140,10 +178,11 @@ export default function SettingsPage() {
               <input 
                 type="text" 
                 value={camIp}
-                onChange={(e) => setCamIp(e.target.value)}
+                onChange={(e) => { camIpEditedRef.current = true; setCamIp(e.target.value); }}
                 className="w-full bg-white dark:bg-[#0b0f19] border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 px-4 py-2 rounded-lg text-sm font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
                 placeholder="192.168.x.x"
               />
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("settings.camIpHint")}</p>
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">{t("settings.backendUrl")}</label>
@@ -157,6 +196,8 @@ export default function SettingsPage() {
             </div>
           </div>
         </section>
+
+        <ServoCalibrationPanel serverUrl={serverUrl} />
 
         {/* Section 3: Integrations */}
         <section className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 shadow-sm rounded-xl overflow-hidden transition-colors">

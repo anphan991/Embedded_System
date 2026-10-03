@@ -2,8 +2,35 @@
 import React, { useState, useEffect, useRef } from "react";
 import CameraControlPanel from "./CameraControlPanel";
 import { AlertCircle, Clock, ShieldAlert, CheckCircle2, ChevronRight, ChevronLeft, Maximize, Minimize } from "lucide-react";
-import { useAlerts } from "./context/AlertsContext";
+import { useAlerts, type AlertPayload } from "./context/AlertsContext";
 import { useTranslation } from "./context/LanguageContext";
+import { getBackendBaseUrl } from "./backendUrl";
+
+type VideoDiagnostics = {
+  raw_fps: number;
+  ai_fps: number;
+  ai_decode_fps: number;
+  ai_target_fps: number;
+  ai_limit_fps: number;
+  ai_work_ms: number;
+  raw_kBps: number;
+  jpeg_kB: number;
+  decode_ms: number;
+  inference_ms: number;
+  encode_ms: number;
+  pipeline_ms: number;
+  preview_dropped: number;
+  ai_input_dropped: number;
+  ai_output_dropped: number;
+  camera_reconnects: number;
+  radar_age_seconds: number | null;
+  preview_frame_version: number;
+  ai_frame_version: number;
+  live_viewers: number;
+  ai_viewers: number;
+  camera_worker_alive: boolean;
+  ai_worker_alive: boolean;
+};
 
 export default function SurveillanceDashboard() {
   const { alerts, isConnected, acknowledgeAlert } = useAlerts();
@@ -11,8 +38,18 @@ export default function SurveillanceDashboard() {
   const [isPanelOpen, setIsPanelOpen] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [liveTime, setLiveTime] = useState("");
-  const [streamUrl, setStreamUrl] = useState("");
+  const [backendBaseUrl, setBackendBaseUrl] = useState("");
+  const [streamKind, setStreamKind] = useState<"live" | "ai">("live");
+  const [streamRetry, setStreamRetry] = useState(0);
+  const [streamError, setStreamError] = useState(false);
+  const [videoOnline, setVideoOnline] = useState<boolean | null>(null);
+  const [videoDiagnostics, setVideoDiagnostics] = useState<VideoDiagnostics | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamUrl = backendBaseUrl
+    ? `${backendBaseUrl}/api/v1/video/${streamKind === "live" ? "live" : "stream"}`
+    : "";
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -26,24 +63,62 @@ export default function SurveillanceDashboard() {
       setLiveTime(formatted);
     }, 1000);
 
-    // Resolve API Host dynamically
-    let backendHost = "";
-    const saved = localStorage.getItem('fallguard_settings');
-    if (saved) {
-      try {
-        const data = JSON.parse(saved);
-        if (data.serverUrl) {
-          backendHost = data.serverUrl.replace(/^https?:\/\//, "").replace(/\/api\/v1\/?$/, "");
-        }
-      } catch (e) {}
-    }
-    if (!backendHost) {
-      backendHost = `${window.location.hostname}:8000`;
-    }
-    setStreamUrl(`http://${backendHost}/api/v1/video/stream`);
+    const frame = requestAnimationFrame(() => setBackendBaseUrl(getBackendBaseUrl()));
 
-    return () => clearInterval(timer);
+    return () => { clearInterval(timer); cancelAnimationFrame(frame); };
   }, []);
+
+  useEffect(() => {
+    if (!backendBaseUrl) return;
+    let active = true;
+    let previouslyOnline: boolean | null = null;
+    const checkVideo = async () => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 1500);
+      try {
+        const response = await fetch(`${backendBaseUrl}/api/v1/video/status`, { cache: "no-store", signal: controller.signal });
+        const data = await response.json();
+        const online = response.ok && data.status === "success" && data.online === true &&
+          (streamKind === "live" || data.ai_online === true);
+        if (!active) return;
+        setVideoDiagnostics(response.ok && data.status === "success" ? data : null);
+        setVideoOnline(online);
+        if (online && previouslyOnline === false) setStreamRetry((value) => value + 1);
+        previouslyOnline = online;
+      } catch {
+        if (!active) return;
+        setVideoOnline(false);
+        setVideoDiagnostics(null);
+        previouslyOnline = false;
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    };
+    void checkVideo();
+    const timer = setInterval(checkVideo, 2000);
+    return () => { active = false; clearInterval(timer); };
+  }, [backendBaseUrl, streamKind]);
+
+  // Some browsers/proxies can leave an MJPEG <img> open but frozen without an
+  // error event. A periodic reconnect bounds that silent failure to one minute.
+  useEffect(() => {
+    if (!backendBaseUrl || videoOnline !== true) return;
+    const timer = window.setInterval(() => setStreamRetry((value) => value + 1), 60000);
+    return () => window.clearInterval(timer);
+  }, [backendBaseUrl, streamKind, videoOnline]);
+
+  useEffect(() => () => {
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+  }, []);
+
+  const handleStreamError = () => {
+    setStreamError(true);
+    if (retryTimerRef.current) return;
+    retryTimerRef.current = setTimeout(() => {
+      retryTimerRef.current = null;
+      setStreamRetry((value) => value + 1);
+    }, 2000);
+  };
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -63,7 +138,7 @@ export default function SurveillanceDashboard() {
     }
   };
 
-  const getAlertMessage = (alert: any) => {
+  const getAlertMessage = (alert: AlertPayload) => {
     const key = `alert.${alert.eventCode}`;
     const translated = t(key);
     return translated !== key ? translated : alert.message;
@@ -98,14 +173,36 @@ export default function SurveillanceDashboard() {
             {/* Live MJPEG Stream */}
             {streamUrl && (
               <img 
+                key={`${streamKind}-${streamRetry}`}
                 src={streamUrl} 
                 alt="Live Camera Feed"
                 className="relative z-10 w-full h-full object-contain"
-                
-                
-                style={{}}
+                style={streamKind === "live" ? { transform: "scaleX(-1)" } : undefined}
+                onLoad={() => setStreamError(false)}
+                onError={handleStreamError}
               />
             )}
+
+            {(videoOnline === false || streamError) && (
+              <div className="absolute inset-0 z-[15] flex items-center justify-center bg-slate-900/85 text-xs font-semibold text-white">
+                {t("live.streamWaiting")}
+              </div>
+            )}
+
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex rounded-lg bg-black/65 p-1 text-xs text-white shadow-sm">
+              <button
+                onClick={() => { setStreamKind("live"); setStreamError(false); }}
+                className={`rounded-md px-2.5 py-1 ${streamKind === "live" ? "bg-white text-slate-900" : "text-white/80"}`}
+              >
+                {t("live.rawVideo")}
+              </button>
+              <button
+                onClick={() => { setStreamKind("ai"); setStreamError(false); }}
+                className={`rounded-md px-2.5 py-1 ${streamKind === "ai" ? "bg-white text-slate-900" : "text-white/80"}`}
+              >
+                {t("live.aiOverlay")}
+              </button>
+            </div>
             
             {/* OSD: Overlay Camera Info & Live Timestamp */}
             <div className="absolute top-4 right-4 z-20 flex flex-col items-end gap-1 pointer-events-none scale-90 lg:scale-100 origin-top-right">
@@ -114,8 +211,21 @@ export default function SurveillanceDashboard() {
               </div>
             </div>
 
-            <div className="absolute bottom-4 left-4 z-20 bg-black/60 backdrop-blur-md px-2.5 py-1.5 rounded text-[10px] lg:text-[11px] font-mono text-white/90 border border-white/10 pointer-events-none scale-90 lg:scale-100 origin-bottom-left">
-              CAM_01 / BED_A
+            <div className="absolute bottom-4 left-4 z-20 bg-black/70 backdrop-blur-md px-2.5 py-1.5 rounded text-[10px] lg:text-[11px] font-mono text-white/90 border border-white/10 scale-90 lg:scale-100 origin-bottom-left max-w-[85%]">
+              <button onClick={() => setShowDiagnostics((value) => !value)} className="text-left hover:text-white" title="Video diagnostics">
+                CAM_01 · RAW {videoDiagnostics?.raw_fps ?? "--"} FPS · AI overlay {videoDiagnostics?.ai_fps ?? "--"} FPS (target {videoDiagnostics?.ai_target_fps ?? "--"}) · {videoDiagnostics?.raw_kBps ?? "--"} KB/s · DIAG {showDiagnostics ? "−" : "+"}
+              </button>
+              {showDiagnostics && videoDiagnostics && (
+                <div className="mt-1 border-t border-white/20 pt-1 leading-4 whitespace-normal">
+                  RAW received {videoDiagnostics.raw_fps} FPS · AI decoded {videoDiagnostics.ai_decode_fps} FPS<br />
+                  AI output {videoDiagnostics.ai_fps} FPS · target {videoDiagnostics.ai_target_fps} / ceiling {videoDiagnostics.ai_limit_fps} FPS<br />
+                  JPEG {videoDiagnostics.jpeg_kB} KB · JPEG decode {videoDiagnostics.decode_ms} ms · AI work {videoDiagnostics.ai_work_ms} ms/frame<br />
+                  infer {videoDiagnostics.inference_ms} ms · encode {videoDiagnostics.encode_ms} ms · pipeline {videoDiagnostics.pipeline_ms} ms<br />
+                  drops {videoDiagnostics.preview_dropped}/{videoDiagnostics.ai_input_dropped}/{videoDiagnostics.ai_output_dropped} · reconnect {videoDiagnostics.camera_reconnects}<br />
+                  frame {videoDiagnostics.preview_frame_version}/{videoDiagnostics.ai_frame_version} · viewers {videoDiagnostics.live_viewers}/{videoDiagnostics.ai_viewers}<br />
+                  radar age {videoDiagnostics.radar_age_seconds ?? "--"} s · workers {videoDiagnostics.camera_worker_alive ? "CAM OK" : "CAM DOWN"}/{videoDiagnostics.ai_worker_alive ? "AI OK" : "AI DOWN"}
+                </div>
+              )}
             </div>
             
             <button 

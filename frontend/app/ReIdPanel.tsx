@@ -1,26 +1,24 @@
 ﻿"use client";
 import React, { useEffect, useState } from "react";
 
+type TrackedPerson = { id: number; is_patient: boolean };
+
 export default function ReIdPanel() {
   const [enabled, setEnabled] = useState(false);
-  const [persons, setPersons] = useState<any[]>([]);
+  const [persons, setPersons] = useState<TrackedPerson[]>([]);
 
   useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (enabled) {
-      interval = setInterval(() => {
+    if (!enabled) return;
+    const interval = setInterval(() => {
         fetch('http://localhost:8000/api/v1/tracking/persons')
           .then(res => res.json())
-          .then(data => {
-            if (data.status === 'success') {
+          .then((data: { status?: string; data?: TrackedPerson[] }) => {
+            if (data.status === 'success' && Array.isArray(data.data)) {
               setPersons(data.data);
             }
           })
           .catch(() => {});
       }, 1000);
-    } else {
-      setPersons([]);
-    }
     return () => clearInterval(interval);
   }, [enabled]);
 
@@ -46,7 +44,7 @@ export default function ReIdPanel() {
           Smart Lock-On Re-ID
         </h2>
         <button 
-          onClick={() => { setEnabled(!enabled); if(enabled) unlockPatient(); }}
+          onClick={() => { setEnabled(!enabled); if (enabled) { setPersons([]); unlockPatient(); } }}
           className={`px-3 py-1 text-[10px] font-mono rounded transition border ${enabled ? 'bg-purple-900/30 text-purple-300 border-purple-500/50' : 'bg-white/5 hover:bg-white/10 text-gray-300 border-white/10'}`}
         >
           {enabled ? "ON" : "OFF"}

@@ -1,9 +1,10 @@
 ﻿"use client";
-import React, { useState } from "react";
-import { Radar, Activity, Maximize2, Save, Map as MapIcon, Crosshair } from "lucide-react";
+import React, { useEffect, useState } from "react";
+import { Radar, Activity, Maximize2, Save, Map as MapIcon } from "lucide-react";
 import RadarMap from "../RadarMap";
 import DesktopOnly from "../DesktopOnly";
 import { useTranslation } from "../context/LanguageContext";
+import { getBackendBaseUrl } from "../backendUrl";
 
 export type ZoneConfig = {
   type: string;
@@ -30,12 +31,99 @@ export default function AnalyticsPage() {
   ]);
 
   const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("");
 
-  const handleSave = () => {
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadConfig = async () => {
+      try {
+        const baseUrl = getBackendBaseUrl();
+        const [roomResponse, zonesResponse] = await Promise.all([
+          fetch(`${baseUrl}/api/v1/config/room`, { cache: "no-store" }),
+          fetch(`${baseUrl}/api/v1/config/zones`, { cache: "no-store" }),
+        ]);
+        if (!roomResponse.ok || !zonesResponse.ok) return;
+
+        const [roomResult, zonesResult] = await Promise.all([
+          roomResponse.json(),
+          zonesResponse.json(),
+        ]);
+        if (cancelled) return;
+
+        if (roomResult.status === "success" && roomResult.data) {
+          const room = roomResult.data;
+          setConfig({
+            roomWidth: Math.round(Number(room.width) * 1000),
+            roomLength: Math.round(Number(room.length) * 1000),
+            radarPosX: Math.round(Number(room.radar_x) * 1000),
+            radarPosY: Math.round(Number(room.radar_y) * 1000),
+            radarYaw: Number(room.radar_angle) || 0,
+          });
+        }
+
+        if (zonesResult.status === "success" && Array.isArray(zonesResult.data)) {
+          setZones(zonesResult.data.map((zone: ZoneConfig) => ({
+            ...zone,
+            x_min: Math.round(Number(zone.x_min) * 1000),
+            x_max: Math.round(Number(zone.x_max) * 1000),
+            y_min: Math.round(Number(zone.y_min) * 1000),
+            y_max: Math.round(Number(zone.y_max) * 1000),
+          })));
+        }
+      } catch {
+        // Keep the local defaults if the backend is offline.
+      }
+    };
+
+    loadConfig();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleSave = async () => {
     setSaving(true);
-    setTimeout(() => {
+    setSaveStatus("");
+    try {
+      const baseUrl = getBackendBaseUrl();
+      const [roomResponse, zonesResponse] = await Promise.all([
+        fetch(`${baseUrl}/api/v1/config/room`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            width: config.roomWidth / 1000,
+            length: config.roomLength / 1000,
+            radar_x: config.radarPosX / 1000,
+            radar_y: config.radarPosY / 1000,
+            radar_angle: config.radarYaw,
+          }),
+        }),
+        fetch(`${baseUrl}/api/v1/config/zones`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            zones: zones.map((zone) => ({
+              ...zone,
+              x_min: Number(zone.x_min) / 1000,
+              x_max: Number(zone.x_max) / 1000,
+              y_min: Number(zone.y_min) / 1000,
+              y_max: Number(zone.y_max) / 1000,
+            })),
+          }),
+        }),
+      ]);
+      const [roomResult, zonesResult] = await Promise.all([
+        roomResponse.json(),
+        zonesResponse.json(),
+      ]);
+      if (!roomResponse.ok || !zonesResponse.ok || roomResult.status !== "success" || zonesResult.status !== "success") {
+        throw new Error("Radar configuration could not be saved");
+      }
+      setSaveStatus(t("radar.saved"));
+    } catch {
+      setSaveStatus(t("radar.saveFailed"));
+    } finally {
       setSaving(false);
-    }, 600);
+    }
   };
 
   const handleZoneChange = (index: number, field: keyof ZoneConfig, value: string) => {
@@ -74,6 +162,7 @@ export default function AnalyticsPage() {
           <Save className="w-4 h-4" />
           {saving ? t("radar.saving") : t("radar.saveConfig")}
         </button>
+        {saveStatus && <span role="status" className="text-xs font-medium text-slate-500">{saveStatus}</span>}
       </header>
 
       {/* Main Content - Full Height Flex */}
@@ -101,7 +190,10 @@ export default function AnalyticsPage() {
                     <input 
                       type="range" min="2000" max="8000" step="100"
                       value={config.roomWidth} 
-                      onChange={(e) => setConfig({...config, roomWidth: Number(e.target.value)})}
+                      onChange={(e) => {
+                        const roomWidth = Number(e.target.value);
+                        setConfig((prev) => ({ ...prev, roomWidth, radarPosX: Math.min(prev.radarPosX, roomWidth) }));
+                      }}
                       className="w-full accent-indigo-600"
                     />
                   </div>
@@ -113,7 +205,10 @@ export default function AnalyticsPage() {
                     <input 
                       type="range" min="2000" max="8000" step="100"
                       value={config.roomLength} 
-                      onChange={(e) => setConfig({...config, roomLength: Number(e.target.value)})}
+                      onChange={(e) => {
+                        const roomLength = Number(e.target.value);
+                        setConfig((prev) => ({ ...prev, roomLength, radarPosY: Math.min(prev.radarPosY, roomLength) }));
+                      }}
                       className="w-full accent-indigo-600"
                     />
                   </div>

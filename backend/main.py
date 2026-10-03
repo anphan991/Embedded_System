@@ -1,8 +1,3 @@
-"""
-Module: Vision Feedback & Fall Detection API (Phase 4: Mission-Critical)
-Description: Commercial-grade distributed backend with Watchdog, SQLite, Telegram & Gestures.
-"""
-
 import asyncio
 import logging
 import multiprocessing as mp
@@ -12,15 +7,21 @@ import time
 import threading
 import requests
 import math
+import ipaddress
+import json
+import socket
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
+from urllib.parse import urlsplit
 
 import cv2
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
+from pydantic import BaseModel
 
 from database import init_db, log_alert, log_vitals
 from fall_detection import FallDetector, FallObservation
@@ -32,7 +33,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Constants
-VIDEO_SOURCE = "http://10.28.125.12:81/stream"
+VIDEO_SOURCE = os.getenv("VIDEO_SOURCE", "http://10.28.125.12:81/stream")
+CONTROL_MQTT_BROKER = os.getenv("MQTT_BROKER", "10.28.125.55")
+POSE_MODEL_PATH = os.getenv("POSE_MODEL_PATH", "yolov8m-pose.pt")
+try:
+    AI_FPS_LIMIT = max(1, min(30, int(os.getenv("AI_FPS_LIMIT", "30"))))
+except ValueError:
+    AI_FPS_LIMIT = 30
+    logger.warning("Invalid AI_FPS_LIMIT; using 30 FPS")
+
+# Begin conservatively; measured inference cost sets the later decode rate.
+AI_INITIAL_FPS = min(AI_FPS_LIMIT, 15)
+
+# Indexes in the two small shared-memory diagnostic arrays. Rates represent
+# frames completed by that stage, not the browser's rendered frame rate.
+CAM_FPS, CAM_KBPS, CAM_JPEG_KB, CAM_DECODE_MS, CAM_PREVIEW_DROPS, CAM_AI_INPUT_DROPS, CAM_RECONNECTS, CAM_AI_DECODE_FPS = range(8)
+AI_FPS, AI_INFER_MS, AI_ENCODE_MS, AI_PIPELINE_MS, AI_OUTPUT_DROPS, AI_LAST_RADAR_AT, AI_RADAR_ERRORS, AI_WORK_MS = range(8)
+VIDEO_DIAG_INTERVAL_SEC = 5.0
 FALL_DURATION_THRESHOLD_SEC = 1.5
 
 # Tạo thư mục chứa ảnh Snapshot nếu chưa có
@@ -42,53 +59,171 @@ init_db()
 # ---------------------------------------------------------
 # TIẾN TRÌNH 1: CAMERA PRODUCER (Độc lập phần cứng)
 # ---------------------------------------------------------
-def camera_process(raw_q: mp.Queue, shutdown_flag):
+def put_latest_frame(frame_q: mp.Queue, frame):
+    """Keep the newest frame so a slow consumer cannot create seconds of lag."""
+    try:
+        frame_q.put_nowait(frame)
+        return False
+    except queue.Full:
+        try:
+            frame_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            frame_q.put_nowait(frame)
+        except queue.Full:
+            pass
+        return True
+
+
+def camera_process(raw_q: mp.Queue, preview_q: mp.Queue, last_frame_at,
+                   camera_source_ref, camera_generation_ref, camera_metrics_ref,
+                   ai_target_fps_ref, shutdown_flag):
     logger.info("Process 1 (Camera): Started (urllib HTTP mode).")
     import urllib.request
     import numpy as np
-    
-    stream = None
-    while stream is None and not shutdown_flag.value:
-        try:
-            stream = urllib.request.urlopen(VIDEO_SOURCE, timeout=5)
-        except Exception as e:
-            logger.error(f"Camera connect error: {e}")
-            time.sleep(1)
 
-    bytes_data = bytes()
+    stream = None
+    active_source = None
+    active_generation = -1
+    bytes_data = bytearray()
+    # OV5640 can produce larger JPEGs than OV2640. Bound malformed streams
+    # without discarding valid high-resolution frames at 1 MiB.
+    max_jpeg_bytes = 4 * 1024 * 1024
+    last_ai_decode = 0.0
+    end_search_from = 2
+    diag_started = time.monotonic()
+    frames_in = bytes_in = frames_decoded = 0
+    decode_ms_sum = 0.0
+    preview_drops = ai_input_drops = reconnects = 0
     while not shutdown_flag.value:
-        try:
-            bytes_data += stream.read(4096)
-            a = bytes_data.find(b'\xff\xd8')
-            b = bytes_data.find(b'\xff\xd9')
-            if a != -1 and b != -1:
-                jpg = bytes_data[a:b+2]
-                bytes_data = bytes_data[b+2:]
-                frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                
-                if frame is not None:
-                    frame = cv2.flip(frame, 1)
-                    if raw_q.full():
-                        try: raw_q.get_nowait()
-                        except: pass
-                    try:
-                        raw_q.put(frame, timeout=0.1)
-                    except:
-                        pass
-        except Exception as e:
-            time.sleep(0.5)
+        now = time.monotonic()
+        window = now - diag_started
+        if window >= VIDEO_DIAG_INTERVAL_SEC:
+            with camera_metrics_ref.get_lock():
+                camera_metrics_ref[CAM_FPS] = frames_in / window
+                camera_metrics_ref[CAM_AI_DECODE_FPS] = frames_decoded / window
+                camera_metrics_ref[CAM_KBPS] = bytes_in / window / 1024.0
+                camera_metrics_ref[CAM_JPEG_KB] = bytes_in / frames_in / 1024.0 if frames_in else 0.0
+                camera_metrics_ref[CAM_DECODE_MS] = decode_ms_sum / frames_decoded if frames_decoded else 0.0
+                camera_metrics_ref[CAM_PREVIEW_DROPS] += preview_drops
+                camera_metrics_ref[CAM_AI_INPUT_DROPS] += ai_input_drops
+                camera_metrics_ref[CAM_RECONNECTS] += reconnects
+                cumulative_reconnects = int(camera_metrics_ref[CAM_RECONNECTS])
+            logger.info("[VIDEO-INGEST] raw_fps=%.1f ai_decode_fps=%.1f KB/s=%.1f jpeg_kB=%.1f decode_ms=%.1f preview_drop=%d ai_input_drop=%d reconnects=%d",
+                        frames_in / window, frames_decoded / window,
+                        bytes_in / window / 1024.0,
+                        bytes_in / frames_in / 1024.0 if frames_in else 0.0,
+                        decode_ms_sum / frames_decoded if frames_decoded else 0.0,
+                        preview_drops, ai_input_drops, cumulative_reconnects)
+            diag_started = now
+            frames_in = bytes_in = frames_decoded = 0
+            decode_ms_sum = 0.0
+            preview_drops = ai_input_drops = reconnects = 0
+        with camera_source_ref.get_lock():
+            configured_source = camera_source_ref.get_obj().value
+            configured_generation = camera_generation_ref.value
+        if stream is not None and (configured_source != active_source or
+                                   configured_generation != active_generation):
             try:
-                stream = urllib.request.urlopen(VIDEO_SOURCE, timeout=5)
-            except:
+                stream.close()
+            except Exception:
                 pass
+            stream = None
+            bytes_data.clear()
+            last_ai_decode = 0.0
+            end_search_from = 2
+            diag_started = time.monotonic()
+            frames_in = bytes_in = frames_decoded = 0
+            decode_ms_sum = 0.0
+            preview_drops = ai_input_drops = 0
+        if stream is None:
+            try:
+                stream = urllib.request.urlopen(configured_source, timeout=2)
+                if active_source is not None:
+                    reconnects += 1
+                active_source = configured_source
+                active_generation = configured_generation
+                bytes_data.clear()
+                end_search_from = 2
+                logger.info("Camera stream connected: %s", active_source)
+            except Exception as e:
+                logger.warning("Camera connect error: %s", e)
+                time.sleep(1)
+                continue
+
+        try:
+            chunk = stream.read1(8192)
+            if not chunk:
+                raise ConnectionError("camera stream closed")
+            bytes_data.extend(chunk)
+
+            while True:
+                start = bytes_data.find(b'\xff\xd8')
+                if start < 0:
+                    if len(bytes_data) > max_jpeg_bytes:
+                        del bytes_data[:-1]
+                    break
+                if start:
+                    del bytes_data[:start]
+                    end_search_from = max(2, end_search_from - start)
+                end = bytes_data.find(b'\xff\xd9', end_search_from)
+                if end < 0:
+                    end_search_from = max(2, len(bytes_data) - 1)
+                    if len(bytes_data) > max_jpeg_bytes:
+                        logger.warning("Discarding oversized/incomplete camera JPEG")
+                        bytes_data.clear()
+                        end_search_from = 2
+                    break
+
+                jpg = bytes(bytes_data[:end + 2])
+                del bytes_data[:end + 2]
+                end_search_from = 2
+                ingested_at = time.monotonic()
+                frames_in += 1
+                bytes_in += len(jpg)
+                with camera_source_ref.get_lock():
+                    if camera_generation_ref.value != active_generation:
+                        break
+                    preview_drops += put_latest_frame(preview_q, (active_generation, jpg))
+                    with last_frame_at.get_lock():
+                        last_frame_at.value = time.time()
+
+                if ingested_at - last_ai_decode >= 1.0 / max(1.0, ai_target_fps_ref.value):
+                    decode_started = time.perf_counter()
+                    frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        frames_decoded += 1
+                        decode_ms_sum += (time.perf_counter() - decode_started) * 1000.0
+                        last_ai_decode = ingested_at
+                        frame = cv2.flip(frame, 1)
+                        with camera_source_ref.get_lock():
+                            if camera_generation_ref.value == active_generation:
+                                ai_input_drops += put_latest_frame(raw_q, (active_generation, frame, ingested_at))
+        except Exception as e:
+            logger.warning("Camera stream interrupted: %s", e)
+            try:
+                stream.close()
+            except Exception:
+                pass
+            stream = None
+            bytes_data.clear()
+            end_search_from = 2
+            time.sleep(0.5)
+
+    if stream is not None:
+        stream.close()
     logger.info("Process 1 (Camera): Exited gracefully.")
 
 
 # ---------------------------------------------------------
 # TIẾN TRÌNH 2: AI & MQTT CONSUMER (Tính toán song song)
 # ---------------------------------------------------------
-def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_flag):
+def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
+               camera_generation_ref, ai_metrics_ref, ai_target_fps_ref,
+               shutdown_flag):
     logger.info("Process 2 (AI Core & MQTT): Started. Optimizing for Host/VPS...")
+    global global_person_count
     
     # 1. Khởi tạo MQTT (Giao tiếp với ESP32)
     import paho.mqtt.client as mqtt
@@ -99,6 +234,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     current_radar_y = 0.0
     current_radar_speed = 0.0
     last_radar_log = 0
+    last_danger_log = 0.0
     
     last_zones_fetch = 0
     cached_safe_zones = []
@@ -107,10 +243,23 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     
     wandering_start = 0.0
     wandering_alert_sent = False
+    last_mqtt_warning = 0.0
+
+    def on_mqtt_connect(client, userdata, flags, reason_code, properties):
+        if reason_code != 0:
+            logger.warning("AI MQTT connection refused: %s", reason_code)
+            return
+        client.subscribe("embedded/servo/status")
+        client.subscribe("embedded/radar/data")
+        logger.info("AI MQTT connected and subscribed to radar/servo status")
+
+    def on_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+        logger.warning("AI MQTT disconnected: %s", reason_code)
 
     def on_mqtt_message(client, userdata, msg):
-        nonlocal is_camera_moving, current_radar_x, current_radar_y, current_radar_speed, last_radar_log
+        nonlocal is_camera_moving, current_radar_x, current_radar_y, current_radar_speed, last_radar_log, last_danger_log
         nonlocal wandering_start, wandering_alert_sent, last_zones_fetch, cached_safe_zones, cached_danger_zones, cached_room_config
+        nonlocal last_mqtt_warning
         try:
             if msg.topic == "embedded/servo/status":
                 payload = msg.payload.decode('utf-8').strip().upper()
@@ -119,12 +268,15 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                 elif payload == "STOPPED":
                     is_camera_moving = False
             elif msg.topic == "embedded/radar/data":
-                import json
                 try:
                     data = json.loads(msg.payload.decode('utf-8'))
                     raw_x = float(data.get("x", 0.0))
                     raw_y = float(data.get("y", 0.0))
                     current_radar_speed = float(data.get("speed", 0.0))
+                    if not all(math.isfinite(v) for v in (raw_x, raw_y, current_radar_speed)):
+                        raise ValueError("non-finite radar value")
+                    with ai_metrics_ref.get_lock():
+                        ai_metrics_ref[AI_LAST_RADAR_AT] = time.time()
                     
                     # Cập nhật cache Zones và Room mỗi 10 giây
                     if time.time() - last_zones_fetch > 10:
@@ -137,7 +289,6 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
 
                     # Lấy góc xoay (Yaw)
                     angle = float(cached_room_config.get("radar_angle", 0.0))
-                    import math
                     theta = math.radians(angle)
                     
                     # Phép xoay 2D
@@ -156,9 +307,10 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                             break
                     
                     if in_danger:
-                        if time.time() - last_radar_log > 5: # Tránh spam log
+                        if time.time() - last_danger_log > 5: # Tránh spam log
                             logger.warning(f"CẢNH BÁO XÂM NHẬP VÙNG NGUY HIỂM ({current_radar_x}, {current_radar_y})!")
                             # Có thể bắn Telegram luôn ở đây nếu muốn
+                            last_danger_log = time.time()
                     
                     # Logic Cảnh báo Đi lang thang ban đêm (Dementia/Wandering)
                     # Khung giờ: 23:00 đêm đến 05:00 sáng
@@ -199,20 +351,28 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                         from database import log_radar_data
                         log_radar_data(current_radar_x, current_radar_y, current_radar_speed)
                         last_radar_log = time.time()
-                except json.JSONDecodeError:
-                    pass
-        except Exception:
-            pass
+                except (ValueError, UnicodeDecodeError, TypeError) as e:
+                    with ai_metrics_ref.get_lock():
+                        ai_metrics_ref[AI_RADAR_ERRORS] += 1
+                    if time.monotonic() - last_mqtt_warning > 5.0:
+                        logger.warning("[RADAR-MQTT] Invalid payload: %s", e)
+                        last_mqtt_warning = time.monotonic()
+        except Exception as e:
+            with ai_metrics_ref.get_lock():
+                ai_metrics_ref[AI_RADAR_ERRORS] += 1
+            if time.monotonic() - last_mqtt_warning > 5.0:
+                logger.warning("[RADAR-MQTT] Processing error: %s", e)
+                last_mqtt_warning = time.monotonic()
 
+    mqtt_client.on_connect = on_mqtt_connect
+    mqtt_client.on_disconnect = on_mqtt_disconnect
     mqtt_client.on_message = on_mqtt_message
     
-    broker = os.getenv("MQTT_BROKER", "127.0.0.1")
+    broker = CONTROL_MQTT_BROKER
     try:
-        mqtt_client.connect(broker, 1883, 60)
-        mqtt_client.subscribe("embedded/servo/status")
-        mqtt_client.subscribe("embedded/radar/data")
+        mqtt_client.connect_async(broker, 1883, 60)
         mqtt_client.loop_start()
-        logger.info(f"Process 2: Connected to MQTT broker at {broker}")
+        logger.info("AI MQTT connecting to broker at %s", broker)
     except Exception as e:
         logger.warning(f"Process 2: MQTT Connection failed: {e}")
 
@@ -220,11 +380,16 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     import torch
     from ultralytics import YOLO
     
-    model_path = "yolov8m-pose.pt"
-    
-    if torch.cuda.is_available():
+    model_path = POSE_MODEL_PATH
+    logger.info("[VIDEO-AI] model=%s max_fps=%d initial_target_fps=%d",
+                model_path, AI_FPS_LIMIT, AI_INITIAL_FPS)
+
+    if not model_path.lower().endswith(".pt"):
+        # Explicit engine/OpenVINO models can be selected without exporting.
+        pose_estimator = YOLO(model_path, task='pose')
+    elif torch.cuda.is_available():
         logger.info("NVIDIA GPU Detected! Optimizing with TensorRT/CUDA...")
-        trt_path = "yolov8m-pose.engine"
+        trt_path = str(Path(model_path).with_suffix(".engine"))
         if not os.path.exists(trt_path):
             logger.info("Exporting YOLO model to TensorRT engine for max performance...")
             try:
@@ -241,7 +406,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
             pose_estimator = YOLO(model_path, task='pose')
     else:
         logger.info("No GPU detected. Optimizing for CPU with OpenVINO...")
-        ov_path = "yolov8m-pose_openvino_model"
+        ov_path = str(Path(model_path).with_suffix("")) + "_openvino_model"
         if not os.path.exists(ov_path):
             logger.info("Exporting YOLO model to OpenVINO...")
             try:
@@ -262,13 +427,73 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
     last_heartbeat = 0
     last_target_seen = time.time()
     target_lost_sent = False
+    processed_generation = -1
     
-    # Giới hạn FPS AI để giảm tải VPS (15 FPS)
-    target_fps = 15
-    frame_time = 1.0 / target_fps
+    # AI_FPS_LIMIT is a ceiling. Decode only as many frames as inference can
+    # process, leaving CPU/GPU headroom and retaining the newest queued frame.
+    ai_target_fps_ref.value = float(AI_INITIAL_FPS)
+    diag_started = time.monotonic()
+    ai_frames = output_drops = 0
+    inference_ms_sum = encode_ms_sum = pipeline_ms_sum = work_ms_sum = 0.0
+    last_encode_warning = 0.0
     
     while not shutdown_flag.value:
-        loop_start = time.time()
+        loop_start = time.monotonic()
+        diag_window = loop_start - diag_started
+        if diag_window >= VIDEO_DIAG_INTERVAL_SEC:
+            avg_work_ms = work_ms_sum / ai_frames if ai_frames else 0.0
+            if avg_work_ms > 0.0:
+                # Reserve ~20% of compute time for scheduling jitter and other
+                # tasks. Increase gradually, but lower the target promptly.
+                sustainable_fps = max(1.0, min(float(AI_FPS_LIMIT), 800.0 / avg_work_ms))
+                previous_target = ai_target_fps_ref.value
+                ai_target_fps_ref.value = min(sustainable_fps, previous_target + 5.0)
+            with ai_metrics_ref.get_lock():
+                ai_metrics_ref[AI_FPS] = ai_frames / diag_window
+                ai_metrics_ref[AI_WORK_MS] = avg_work_ms
+                ai_metrics_ref[AI_INFER_MS] = inference_ms_sum / ai_frames if ai_frames else 0.0
+                ai_metrics_ref[AI_ENCODE_MS] = encode_ms_sum / ai_frames if ai_frames else 0.0
+                ai_metrics_ref[AI_PIPELINE_MS] = pipeline_ms_sum / ai_frames if ai_frames else 0.0
+                ai_metrics_ref[AI_OUTPUT_DROPS] += output_drops
+            logger.info("[VIDEO-AI] fps=%.1f target=%.1f max=%d work_ms=%.0f inference_ms=%.0f encode_ms=%.0f pipeline_ms=%.0f output_drop=%d",
+                        ai_frames / diag_window, ai_target_fps_ref.value,
+                        AI_FPS_LIMIT, avg_work_ms,
+                        inference_ms_sum / ai_frames if ai_frames else 0.0,
+                        encode_ms_sum / ai_frames if ai_frames else 0.0,
+                        pipeline_ms_sum / ai_frames if ai_frames else 0.0,
+                        output_drops)
+            diag_started = loop_start
+            ai_frames = output_drops = 0
+            inference_ms_sum = encode_ms_sum = pipeline_ms_sum = work_ms_sum = 0.0
+
+        current_generation = camera_generation_ref.value
+        if current_generation != processed_generation:
+            fall_detector.reset()
+            previous_features.clear()
+            last_target_seen = time.time()
+            target_lost_sent = False
+            global_person_count = 0
+            wandering_start = 0.0
+            wandering_alert_sent = False
+            predictor = getattr(pose_estimator, "predictor", None)
+            tracker_reset_failed = False
+            for tracker in (getattr(predictor, "trackers", None) or ()):
+                try:
+                    tracker.reset()
+                except Exception as e:
+                    logger.warning("Could not reset camera tracker: %s", e)
+                    tracker_reset_failed = True
+            if tracker_reset_failed:
+                try:
+                    delattr(predictor, "trackers")
+                except (AttributeError, TypeError):
+                    pass
+            processed_generation = current_generation
+            ai_target_fps_ref.value = float(AI_INITIAL_FPS)
+            diag_started = time.monotonic()
+            ai_frames = output_drops = 0
+            inference_ms_sum = encode_ms_sum = pipeline_ms_sum = work_ms_sum = 0.0
+            logger.info("AI tracker reset for camera source generation %s", current_generation)
         
         # Heartbeat Ping cho ESP32 mỗi giây
         if time.time() - last_heartbeat > 1.0:
@@ -278,16 +503,36 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
             last_heartbeat = time.time()
             
         try:
-            frame = raw_q.get(timeout=0.5)
+            frame_generation, frame, ingested_at = raw_q.get(timeout=0.5)
         except queue.Empty:
             continue
 
+        # The producer may outrun CPU inference. Process only its newest frame.
+        while True:
+            try:
+                frame_generation, frame, ingested_at = raw_q.get_nowait()
+            except queue.Empty:
+                break
+        if frame_generation != camera_generation_ref.value:
+            continue
+        if frame_generation != processed_generation:
+            # Source changed after the loop-top reset check. Reset first.
+            continue
+
+        work_started = time.perf_counter()
+
         # Dùng tracker mạnh hơn (botsort), conf=0.5 lọc nhiễu
         try:
+            inference_started = time.perf_counter()
             results = pose_estimator.track(frame, persist=True, verbose=False, tracker="botsort.yaml", conf=0.5)
+            inference_ms = (time.perf_counter() - inference_started) * 1000.0
         except Exception as e:
             logger.error(f"Inference error: {e}")
             time.sleep(1)
+            continue
+        # A source switch can happen during the expensive inference call.
+        # Never publish detections, movement or alarms from that old image.
+        if frame_generation != camera_generation_ref.value:
             continue
         
         annotated_frame = results[0].plot()
@@ -295,7 +540,6 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
         current_active_persons = []
 
         # Khai báo biến toàn cục đếm người cho MQTT callback
-        global global_person_count
         global_person_count = 0
         
         if len(results) > 0 and results[0].boxes and results[0].boxes.id is not None:
@@ -313,6 +557,8 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
             keypoints = results[0].keypoints
 
             for i in range(len(boxes.id)):
+                if frame_generation != camera_generation_ref.value:
+                    break
                 obj_id = int(boxes.id[i].item())
                 x1, y1, x2, y2 = boxes.xyxy[i].tolist()
                 cv2.putText(annotated_frame, f"Person {obj_id}", (int(x1), max(0, int(y1)-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -329,8 +575,9 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     deadband_y = frame_h * 0.15
                     
                     # Chỉ gửi lệnh quay Servo nếu mục tiêu ra khỏi vùng an toàn
-                    if abs(target_x - center_x) > deadband_x or abs(target_y - center_y) > deadband_y:
-                        try: mqtt_client.publish("embedded/servo/tracking", f"{target_x},{target_y}")
+                    if (frame_generation == camera_generation_ref.value and
+                            (abs(target_x - center_x) > deadband_x or abs(target_y - center_y) > deadband_y)):
+                        try: mqtt_client.publish("embedded/servo/tracking", f"{target_x},{target_y},{frame_w},{frame_h}")
                         except Exception: pass
                 
                 width = max(1.0, x2 - x1)
@@ -411,7 +658,9 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                         track.confirmed_at = 0.0
                         track.cooldown_until = 0.0
                     cv2.putText(annotated_frame, "ALARM CANCELED", (int(x1), int(y1)-30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 3)
-                    try: mqtt_client.publish("embedded/servo/buzzer", "OFF")
+                    try:
+                        if frame_generation == camera_generation_ref.value:
+                            mqtt_client.publish("embedded/servo/buzzer", "OFF")
                     except Exception: pass
                     # Không xoá previous_features để giữ liền mạch tracking
                     continue
@@ -446,15 +695,18 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                     face_visible=face_visible,
                     is_camera_moving=is_camera_moving
                 ))
-                if decision.newly_confirmed and global_person_count == 1:
+                if (decision.newly_confirmed and global_person_count == 1 and
+                        frame_generation == camera_generation_ref.value):
                     logger.warning(f"CẢNH BÁO KHẨN CẤP: BỆNH NHÂN ĐƠN ĐỘC TÉ NGÃ (Track ID {obj_id})!")
                     fall_event = {
                         "person_type": "PATIENT",
                         "track_id": obj_id, 
+                        "camera_generation": frame_generation,
                         "reason": decision.reason, 
                         "timestamp": time.time(),
                         "pos_x": current_radar_x,
-                        "pos_y": current_radar_y
+                        "pos_y": current_radar_y,
+                        "speed": current_radar_speed,
                     }
                     try: mqtt_client.publish("embedded/servo/buzzer", "ON")
                     except Exception: pass
@@ -464,7 +716,8 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
                 cv2.putText(annotated_frame, label, (int(x1), max(20, int(y1)-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         else:
             # Không thấy người nào trong khung hình
-            if not target_lost_sent and (time.time() - last_target_seen > 3.0):
+            if (frame_generation == camera_generation_ref.value and not target_lost_sent and
+                    time.time() - last_target_seen > 3.0):
                 try: 
                     mqtt_client.publish("embedded/servo/tracking", "LOST")
                     target_lost_sent = True
@@ -484,25 +737,40 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
             cv2.putText(annotated_frame, hud_text, (text_x, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         # --------------------------------------------------------
 
-        # Gửi cảnh báo sang FastAPI
-        try:
-            if fall_event is not None:
-                if alert_q.full(): alert_q.get_nowait()
-                alert_q.put_nowait(fall_event)
-        except: pass
-
         # Tối ưu hóa nén luồng hình ảnh để giảm băng thông VPS (JPEG Quality 65%)
-        success, buffer = cv2.imencode('.jpg', annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
-        if success:
-            if mjpeg_q.full():
-                try: mjpeg_q.get_nowait()
-                except: pass
-            mjpeg_q.put_nowait(buffer.tobytes())
+        encode_started = time.perf_counter()
+        try:
+            success, buffer = cv2.imencode('.jpg', annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+            encoded_jpeg = buffer.tobytes() if success else None
+        except cv2.error as e:
+            if time.monotonic() - last_encode_warning > 5.0:
+                logger.warning("[VIDEO-AI] JPEG encode failed: %s", e)
+                last_encode_warning = time.monotonic()
+            success = False
+            encoded_jpeg = None
+        encode_ms = (time.perf_counter() - encode_started) * 1000.0
+        if success and frame_generation == camera_generation_ref.value:
+            output_drops += put_latest_frame(mjpeg_q, (frame_generation, encoded_jpeg))
+            ai_frames += 1
+            work_ms_sum += (time.perf_counter() - work_started) * 1000.0
+            inference_ms_sum += inference_ms
+            encode_ms_sum += encode_ms
+            pipeline_ms_sum += (time.monotonic() - ingested_at) * 1000.0
+
+        # Attach this exact annotated frame to its alert. The alert consumer
+        # must not depend on the video pump having updated its JPEG cache yet.
+        if fall_event is not None and frame_generation == camera_generation_ref.value:
+            if encoded_jpeg is not None:
+                fall_event["snapshot_jpeg"] = encoded_jpeg
+            if put_latest_frame(alert_q, fall_event):
+                logger.warning("[ALERT] Alert queue saturated; one fall event may have been dropped")
             
         
 
-        # Kiểm soát FPS
-        elapsed = time.time() - loop_start
+        # Match the adaptive producer ceiling. The one-slot queue discards old
+        # input on slower hosts, so this sleep never creates a growing backlog.
+        elapsed = time.monotonic() - loop_start
+        frame_time = 1.0 / max(1.0, ai_target_fps_ref.value)
         if elapsed < frame_time:
             time.sleep(frame_time - elapsed)
 
@@ -514,15 +782,112 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue, shutdown_f
 # TIẾN TRÌNH 3: FASTAPI WEBSERVER & WATCHDOG
 # ---------------------------------------------------------
 raw_q = None
+preview_q = None
 mjpeg_q = None
 alert_q = None
 shutdown_flag = None
+last_camera_frame_at = None
+camera_source_ref = None
+camera_generation_ref = None
+camera_metrics_ref = None
+ai_metrics_ref = None
+ai_target_fps_ref = None
 p_cam = None
 p_ai = None
 latest_mjpeg_bytes = b""
+latest_preview_bytes = b""
+ai_frame_version = 0
+preview_frame_version = 0
+last_ai_frame_at = 0.0
+active_live_viewers = 0
+active_ai_viewers = 0
 alert_active = False
 last_alert_signature = None
 last_telegram_sent = 0
+alert_websockets: dict[WebSocket, asyncio.Lock] = {}
+camera_mode = "MANUAL"
+hardware_mode = None
+hardware_online = False
+control_mqtt_client = None
+control_mqtt_connected = threading.Event()
+control_mqtt_lock = threading.Lock()
+manual_last_sequence = {}
+manual_command_epoch = time.time_ns()
+manual_command_sequence = 0
+camera_config_update_lock = threading.Lock()
+servo_diag_lock = threading.Lock()
+servo_diag_payload = None
+servo_diag_received_at = 0.0
+servo_config_state = None
+servo_config_result = None
+servo_config_result_at = 0.0
+servo_config_result_event = threading.Event()
+# Configuration ACKs have no request ID, so serialize only config calls.
+# Joystick/mode commands must not wait behind an ESP32 config response.
+servo_config_request_lock = threading.Lock()
+
+
+def on_control_mqtt_connect(client, userdata, flags, reason_code, properties):
+    if reason_code != 0:
+        control_mqtt_connected.clear()
+        logger.warning("Control MQTT connection refused: %s", reason_code)
+        return
+    client.subscribe("embedded/servo/state", qos=1)
+    client.subscribe("embedded/servo/online", qos=1)
+    client.subscribe("embedded/servo/diag", qos=0)
+    client.subscribe("embedded/servo/config/state", qos=1)
+    client.subscribe("embedded/servo/config/result", qos=1)
+    info = client.publish("embedded/servo/mode", camera_mode, qos=1, retain=True)
+    if info.rc == 0:
+        control_mqtt_connected.set()
+        logger.info("Control MQTT connected; requested servo mode: %s", camera_mode)
+    else:
+        control_mqtt_connected.clear()
+        logger.error("Control MQTT mode sync failed with code %s", info.rc)
+
+
+def on_control_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    global hardware_mode, hardware_online
+    control_mqtt_connected.clear()
+    hardware_mode = None
+    hardware_online = False
+    logger.warning("Control MQTT disconnected: %s", reason_code)
+
+
+def on_control_mqtt_message(client, userdata, message):
+    global hardware_mode, hardware_online, servo_diag_payload, servo_diag_received_at
+    global servo_config_state, servo_config_result, servo_config_result_at
+    if message.topic == "embedded/servo/state":
+        reported = message.payload.decode("utf-8", errors="replace").strip().upper()
+        if reported in ("AUTO", "MANUAL"):
+            hardware_mode = reported
+    elif message.topic == "embedded/servo/online":
+        hardware_online = message.payload.decode("utf-8", errors="replace").strip().upper() == "ONLINE"
+        if not hardware_online:
+            hardware_mode = None
+    elif message.topic == "embedded/servo/diag":
+        try:
+            parsed = json.loads(message.payload)
+            if isinstance(parsed, dict):
+                with servo_diag_lock:
+                    servo_diag_payload = parsed
+                    servo_diag_received_at = time.time()
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning("Invalid servo diagnostic JSON: %s", e)
+    elif message.topic == "embedded/servo/config/state":
+        try:
+            parsed = json.loads(message.payload)
+            if isinstance(parsed, dict):
+                with servo_diag_lock:
+                    servo_config_state = parsed
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning("Invalid servo config state JSON: %s", e)
+    elif message.topic == "embedded/servo/config/result":
+        result = message.payload.decode("utf-8", errors="replace").strip()
+        with servo_diag_lock:
+            servo_config_result = result
+            servo_config_result_at = time.time()
+            servo_config_result_event.set()
 
 def send_telegram_alert(image_bytes, message):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -543,6 +908,143 @@ def send_telegram_alert(image_bytes, message):
     except Exception as e:
         logger.error(f"Telegram API Error: {e}")
 
+async def send_alert_websocket_message(websocket: WebSocket, payload: dict) -> bool:
+    """Serialize status and alert writes to each dashboard connection."""
+    send_lock = alert_websockets.get(websocket)
+    if send_lock is None:
+        return False
+    try:
+        async with send_lock:
+            await asyncio.wait_for(websocket.send_json(payload), timeout=2.0)
+        return True
+    except Exception as e:
+        alert_websockets.pop(websocket, None)
+        logger.info("Dashboard WebSocket closed during send: %s", e)
+        return False
+
+
+async def broadcast_alert(payload: dict) -> None:
+    # A failed or slow browser must not prevent the other dashboards from
+    # receiving an alert or prevent the snapshot/Telegram side effects.
+    if alert_websockets:
+        await asyncio.gather(
+            *(send_alert_websocket_message(websocket, payload)
+              for websocket in tuple(alert_websockets))
+        )
+
+
+async def pump_alert_events() -> None:
+    """Consume AI alerts once even when no dashboard is open."""
+    global alert_active, last_alert_signature, last_telegram_sent
+
+    while not shutdown_flag.value:
+        try:
+            fall_event = alert_q.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.2)
+            continue
+        except Exception as e:
+            logger.error("Alert queue read failed: %s", e)
+            await asyncio.sleep(1.0)
+            continue
+
+        try:
+            if not isinstance(fall_event, dict):
+                continue
+            with camera_source_ref.get_lock():
+                if fall_event.get("camera_generation") != camera_generation_ref.value:
+                    continue
+                snapshot_jpeg = fall_event.get("snapshot_jpeg")
+                image_bytes = snapshot_jpeg if isinstance(snapshot_jpeg, bytes) else latest_mjpeg_bytes
+            event_signature = (fall_event.get("track_id"), fall_event.get("timestamp"))
+            if event_signature == last_alert_signature:
+                continue
+            alert_active = True
+            last_alert_signature = event_signature
+            alert_payload = {
+                "type": "CRITICAL_ALERT",
+                "event_code": "FALL_DETECTED",
+                "track_id": fall_event.get("track_id"),
+                "message": f"Cảnh báo: {fall_event.get('person_type', 'PATIENT')} vừa bị ngã!",
+                "timestamp": fall_event.get("timestamp", time.time()),
+            }
+            image_path = f"snapshots/fall_{int(time.time())}_{fall_event.get('track_id', 'unknown')}.jpg"
+            try:
+                with open(image_path, "wb") as f:
+                    f.write(image_bytes)
+                log_alert("FALL_DETECTED", f"Phát hiện ngã ở track {fall_event.get('track_id')}", image_path)
+            except Exception as e:
+                logger.error("File/Database Write Error: %s", e)
+
+            # Preserve the existing Telegram debounce across all dashboards.
+            if time.time() - last_telegram_sent > 60:
+                last_telegram_sent = time.time()
+                pos_x = fall_event.get("pos_x", 0.0)
+                pos_y = fall_event.get("pos_y", 0.0)
+                speed = fall_event.get("speed", 0.0)
+                dt_str = time.strftime("%H:%M - %d/%m/%Y")
+
+                if speed == 0.0:
+                    msg_text = (
+                        f"🚨 [BÁO ĐỘNG] PHÁT HIỆN TÉ NGÃ/GỤC BẤT THƯỜNG!\n"
+                        f"🕒 Thời gian: {dt_str}\n"
+                        f"🚹 Mục tiêu: Patient #{fall_event.get('track_id')}\n\n"
+                        f"📍 VỊ TRÍ (RADAR 2D):\n"
+                        f"🔸 Tọa độ X: {pos_x:.2f} m\n"
+                        f"🔸 Tọa độ Y: {pos_y:.2f} m\n"
+                        f"⚠️ Tốc độ: 0 m/s \n\n"
+                        f"🚑 Yêu cầu gọi người nhà kiểm tra ngay lập tức!"
+                    )
+                else:
+                    msg_text = (
+                        f"🚨 [BÁO ĐỘNG] PHÁT HIỆN TÉ NGÃ/GỤC BẤT THƯỜNG!\n"
+                        f"🕒 Thời gian: {dt_str}\n"
+                        f"🚹 Mục tiêu: Patient #{fall_event.get('track_id')}\n\n"
+                        f"📍 VỊ TRÍ (RADAR 2D):\n"
+                        f"🔸 Tọa độ X: {pos_x:.2f} m\n"
+                        f"🔸 Tọa độ Y: {pos_y:.2f} m\n"
+                        f"🔹 Tốc độ: {speed:.2f} m/s (CÒN CỬ ĐỘNG)\n\n"
+                        f"🛑 Vui lòng mở Camera trực tiếp để kiểm tra!"
+                    )
+
+                threading.Thread(
+                    target=send_telegram_alert,
+                    args=(image_bytes, msg_text),
+                    daemon=True,
+                ).start()
+            else:
+                logger.warning("Bỏ qua gửi Telegram do đang trong thời gian Cooldown (60s).")
+            await broadcast_alert(alert_payload)
+        except Exception as e:
+            logger.error("Alert processing failed: %s", e)
+
+
+async def pump_video_frames():
+    """One queue reader fans each fresh JPEG out to every browser client."""
+    global latest_mjpeg_bytes, latest_preview_bytes, ai_frame_version, preview_frame_version, last_ai_frame_at
+    while not shutdown_flag.value:
+        for frame_q, kind in ((preview_q, "preview"), (mjpeg_q, "ai")):
+            newest = None
+            while True:
+                try:
+                    newest = frame_q.get_nowait()
+                except queue.Empty:
+                    break
+            if newest is not None:
+                frame_generation, jpeg = newest
+                with camera_source_ref.get_lock():
+                    if frame_generation != camera_generation_ref.value:
+                        continue
+                    if kind == "preview":
+                        latest_preview_bytes = jpeg
+                        preview_frame_version += 1
+                    else:
+                        latest_mjpeg_bytes = jpeg
+                        ai_frame_version += 1
+                        last_ai_frame_at = time.time()
+        await asyncio.sleep(0.01)
+
+
 def watchdog_task():
     global p_cam, p_ai
     logger.info("System Watchdog Started. Monitoring processes...")
@@ -556,45 +1058,100 @@ def watchdog_task():
         # Tự phục hồi Camera
         if p_cam and not p_cam.is_alive():
             logger.error("WATCHDOG: Camera Process Died! Restarting...")
-            p_cam = mp.Process(target=camera_process, args=(raw_q, shutdown_flag))
+            p_cam = mp.Process(target=camera_process, args=(raw_q, preview_q, last_camera_frame_at,
+                                                            camera_source_ref, camera_generation_ref,
+                                                            camera_metrics_ref, ai_target_fps_ref,
+                                                            shutdown_flag))
             p_cam.daemon = True
             p_cam.start()
             
         # Tự phục hồi AI
         if p_ai and not p_ai.is_alive():
             logger.error("WATCHDOG: AI Process Died! Restarting...")
-            p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q, shutdown_flag))
+            p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q,
+                                                        camera_generation_ref, ai_metrics_ref,
+                                                        ai_target_fps_ref,
+                                                        shutdown_flag))
             p_ai.daemon = True
             p_ai.start()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global raw_q, mjpeg_q, alert_q, shutdown_flag, p_cam, p_ai
+    global raw_q, preview_q, mjpeg_q, alert_q, shutdown_flag, last_camera_frame_at
+    global camera_source_ref, camera_generation_ref, camera_metrics_ref, ai_metrics_ref, ai_target_fps_ref
+    global p_cam, p_ai, control_mqtt_client
     
     raw_q = mp.Queue(maxsize=1)
-
+    preview_q = mp.Queue(maxsize=1)
     mjpeg_q = mp.Queue(maxsize=1)
-    alert_q = mp.Queue(maxsize=1)
+    # Fall events are sparse but must not be discarded just because a second
+    # person triggers while a snapshot or a slow dashboard is being handled.
+    # Keep this queue bounded because each event can carry one JPEG snapshot.
+    alert_q = mp.Queue(maxsize=16)
     shutdown_flag = mp.Value('i', 0)
+    last_camera_frame_at = mp.Value('d', 0.0)
+    camera_source_ref = mp.Array('u', 1024)
+    camera_source_ref.get_obj().value = VIDEO_SOURCE
+    camera_generation_ref = mp.Value('L', 0)
+    camera_metrics_ref = mp.Array('d', 8)
+    ai_metrics_ref = mp.Array('d', 8)
+    ai_target_fps_ref = mp.Value('d', float(AI_INITIAL_FPS))
     
-    p_cam = mp.Process(target=camera_process, args=(raw_q, shutdown_flag))
+    p_cam = mp.Process(target=camera_process, args=(raw_q, preview_q, last_camera_frame_at,
+                                                    camera_source_ref, camera_generation_ref,
+                                                    camera_metrics_ref, ai_target_fps_ref,
+                                                    shutdown_flag))
     p_cam.daemon = True
-    p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q, shutdown_flag))
+    p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q,
+                                                camera_generation_ref, ai_metrics_ref,
+                                                ai_target_fps_ref,
+                                                shutdown_flag))
     p_ai.daemon = True
     p_cam.start()
     p_ai.start()
+    video_pump = asyncio.create_task(pump_video_frames())
+    alert_pump = asyncio.create_task(pump_alert_events())
     
     # Khởi động Watchdog ở luồng nền của FastAPI
     threading.Thread(target=watchdog_task, daemon=True).start()
+
+    # Maintain one MQTT connection for all web control commands.
+    try:
+        import paho.mqtt.client as mqtt
+        control_mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="FallGuard_Web_Control")
+        control_mqtt_client.on_connect = on_control_mqtt_connect
+        control_mqtt_client.on_disconnect = on_control_mqtt_disconnect
+        control_mqtt_client.on_message = on_control_mqtt_message
+        control_mqtt_client.connect_async(CONTROL_MQTT_BROKER, 1883, 30)
+        control_mqtt_client.loop_start()
+    except Exception as e:
+        control_mqtt_client = None
+        logger.warning("Control MQTT startup failed: %s", e)
     
     yield
     
     logger.info("Shutting down Distributed System...")
     shutdown_flag.value = 1
+    control_mqtt_connected.clear()
+    if control_mqtt_client is not None:
+        control_mqtt_client.disconnect()
+        control_mqtt_client.loop_stop()
+        control_mqtt_client = None
+    video_pump.cancel()
+    alert_pump.cancel()
+    try:
+        await video_pump
+    except asyncio.CancelledError:
+        pass
+    try:
+        await alert_pump
+    except asyncio.CancelledError:
+        pass
     p_cam.join(timeout=3)
     p_ai.join(timeout=3)
     if p_cam.is_alive(): p_cam.terminate()
     if p_ai.is_alive(): p_ai.terminate()
+
 
 app = FastAPI(title="Mission-Critical Vision Server", version="4.0.0", lifespan=lifespan)
 
@@ -606,22 +1163,187 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def video_frame_generator() -> AsyncGenerator[bytes, None]:
-    global latest_mjpeg_bytes
-    while True:
-        try:
-            latest_mjpeg_bytes = mjpeg_q.get_nowait()
-        except queue.Empty:
-            pass
-            
-        if latest_mjpeg_bytes:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + latest_mjpeg_bytes + b'\r\n')
-        await asyncio.sleep(0.033)
+async def video_frame_generator(preview: bool = False) -> AsyncGenerator[bytes, None]:
+    global active_live_viewers, active_ai_viewers
+    last_version = -1
+    if preview:
+        active_live_viewers += 1
+    else:
+        active_ai_viewers += 1
+    try:
+        while True:
+            if camera_source_ref is not None:
+                with camera_source_ref.get_lock():
+                    frame = latest_preview_bytes if preview else latest_mjpeg_bytes
+                    version = preview_frame_version if preview else ai_frame_version
+            else:
+                frame = latest_preview_bytes if preview else latest_mjpeg_bytes
+                version = preview_frame_version if preview else ai_frame_version
+            if frame and version != last_version:
+                last_version = version
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       + f'Content-Length: {len(frame)}\r\n\r\n'.encode()
+                       + frame + b'\r\n')
+            await asyncio.sleep(0.015)
+    finally:
+        if preview:
+            active_live_viewers -= 1
+        else:
+            active_ai_viewers -= 1
+
+
+VIDEO_STREAM_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
 
 @app.get("/api/v1/video/stream")
 async def video_feed() -> StreamingResponse:
-    return StreamingResponse(video_frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(video_frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame", headers=VIDEO_STREAM_HEADERS)
+
+
+@app.get("/api/v1/video/live")
+async def video_live() -> StreamingResponse:
+    return StreamingResponse(video_frame_generator(preview=True), media_type="multipart/x-mixed-replace; boundary=frame", headers=VIDEO_STREAM_HEADERS)
+
+
+@app.get("/api/v1/video/status")
+def video_status():
+    if camera_source_ref is not None:
+        with camera_source_ref.get_lock():
+            source = camera_source_ref.get_obj().value
+            generation = camera_generation_ref.value
+            last_frame = last_camera_frame_at.value
+            last_ai_frame = last_ai_frame_at
+    else:
+        source, generation = VIDEO_SOURCE, 0
+        last_frame, last_ai_frame = 0.0, 0.0
+    now = time.time()
+    age_seconds = max(0.0, now - last_frame) if last_frame else None
+    ai_age_seconds = max(0.0, now - last_ai_frame) if last_ai_frame else None
+    raw_online = age_seconds is not None and age_seconds < 3.0
+    ai_online = ai_age_seconds is not None and ai_age_seconds < 3.0
+    camera_metrics = [0.0] * 8
+    ai_metrics = [0.0] * 8
+    if camera_metrics_ref is not None:
+        with camera_metrics_ref.get_lock():
+            camera_metrics = list(camera_metrics_ref[:])
+    if ai_metrics_ref is not None:
+        with ai_metrics_ref.get_lock():
+            ai_metrics = list(ai_metrics_ref[:])
+    return {
+        "status": "success",
+        "online": raw_online,
+        "age_seconds": round(age_seconds, 2) if age_seconds is not None else None,
+        "ai_online": ai_online,
+        "ai_age_seconds": round(ai_age_seconds, 2) if ai_age_seconds is not None else None,
+        "camera_worker_alive": p_cam is not None and p_cam.is_alive(),
+        "ai_worker_alive": p_ai is not None and p_ai.is_alive(),
+        "raw_fps": round(camera_metrics[CAM_FPS], 1) if raw_online else 0.0,
+        "ai_decode_fps": round(camera_metrics[CAM_AI_DECODE_FPS], 1) if raw_online else 0.0,
+        "raw_kBps": round(camera_metrics[CAM_KBPS], 1) if raw_online else 0.0,
+        "jpeg_kB": round(camera_metrics[CAM_JPEG_KB], 1),
+        "decode_ms": round(camera_metrics[CAM_DECODE_MS], 1),
+        "preview_dropped": int(camera_metrics[CAM_PREVIEW_DROPS]),
+        "ai_input_dropped": int(camera_metrics[CAM_AI_INPUT_DROPS]),
+        "camera_reconnects": int(camera_metrics[CAM_RECONNECTS]),
+        "ai_fps": round(ai_metrics[AI_FPS], 1) if ai_online else 0.0,
+        "ai_target_fps": round(ai_target_fps_ref.value, 1) if ai_target_fps_ref is not None else float(AI_INITIAL_FPS),
+        "ai_limit_fps": AI_FPS_LIMIT,
+        "ai_work_ms": round(ai_metrics[AI_WORK_MS], 1),
+        "inference_ms": round(ai_metrics[AI_INFER_MS], 1),
+        "encode_ms": round(ai_metrics[AI_ENCODE_MS], 1),
+        "pipeline_ms": round(ai_metrics[AI_PIPELINE_MS], 1),
+        "ai_output_dropped": int(ai_metrics[AI_OUTPUT_DROPS]),
+        "radar_age_seconds": round(max(0.0, now - ai_metrics[AI_LAST_RADAR_AT]), 2) if ai_metrics[AI_LAST_RADAR_AT] else None,
+        "radar_parse_errors": int(ai_metrics[AI_RADAR_ERRORS]),
+        "preview_frame_version": preview_frame_version,
+        "ai_frame_version": ai_frame_version,
+        "live_viewers": active_live_viewers,
+        "ai_viewers": active_ai_viewers,
+        "source": source,
+        "generation": generation,
+    }
+
+
+class CameraIpRequest(BaseModel):
+    camera_ip: str
+
+
+@app.get("/api/v1/config/camera")
+def get_camera_config():
+    if camera_source_ref is not None:
+        with camera_source_ref.get_lock():
+            source = camera_source_ref.get_obj().value
+            generation = camera_generation_ref.value
+    else:
+        source, generation = VIDEO_SOURCE, 0
+    return {"status": "success", "camera_ip": urlsplit(source).hostname,
+            "source": source, "generation": generation}
+
+
+@app.post("/api/v1/config/camera")
+def update_camera_config(request: CameraIpRequest):
+    global VIDEO_SOURCE, latest_preview_bytes, latest_mjpeg_bytes
+    global preview_frame_version, ai_frame_version, last_ai_frame_at
+    try:
+        address = ipaddress.IPv4Address(request.camera_ip.strip())
+    except ipaddress.AddressValueError:
+        return {"status": "error", "message": "Camera IP must be an IPv4 address"}
+    local_networks = (
+        ipaddress.IPv4Network("10.0.0.0/8"),
+        ipaddress.IPv4Network("172.16.0.0/12"),
+        ipaddress.IPv4Network("192.168.0.0/16"),
+    )
+    if not any(address in network for network in local_networks):
+        return {"status": "error", "message": "Camera IP must be on a private LAN"}
+
+    source = f"http://{address}:81/stream"
+    with camera_config_update_lock:
+        try:
+            saved, _, _ = set_key(str(Path(__file__).with_name(".env")), "VIDEO_SOURCE", source, quote_mode="never")
+            if not saved:
+                raise OSError("dotenv.set_key failed")
+        except Exception as e:
+            logger.error("Could not save camera source: %s", e)
+            return {"status": "error", "message": "Could not save camera source"}
+
+        VIDEO_SOURCE = source
+        if camera_source_ref is not None:
+            with camera_source_ref.get_lock():
+                camera_source_ref.get_obj().value = source
+                with camera_generation_ref.get_lock():
+                    camera_generation_ref.value += 1
+                    generation = camera_generation_ref.value
+                # The pump and readers share this lock, so old JPEGs cannot
+                # repopulate the preview cache after a source switch.
+                latest_preview_bytes = b""
+                latest_mjpeg_bytes = b""
+                last_ai_frame_at = 0.0
+                preview_frame_version += 1
+                ai_frame_version += 1
+                if last_camera_frame_at is not None:
+                    with last_camera_frame_at.get_lock():
+                        last_camera_frame_at.value = 0.0
+                if camera_metrics_ref is not None:
+                    with camera_metrics_ref.get_lock():
+                        for metric in (CAM_FPS, CAM_KBPS, CAM_JPEG_KB, CAM_DECODE_MS):
+                            camera_metrics_ref[metric] = 0.0
+                if ai_metrics_ref is not None:
+                    with ai_metrics_ref.get_lock():
+                        for metric in (AI_FPS, AI_INFER_MS, AI_ENCODE_MS, AI_PIPELINE_MS):
+                            ai_metrics_ref[metric] = 0.0
+        else:
+            generation = 0
+        for frame_q in (preview_q, raw_q, mjpeg_q, alert_q):
+            if frame_q is None:
+                continue
+            while True:
+                try:
+                    frame_q.get_nowait()
+                except queue.Empty:
+                    break
+    logger.info("Camera source changed to %s (generation %s)", source, generation)
+    return {"status": "success", "camera_ip": str(address), "source": source,
+            "generation": generation}
 
 @app.get("/api/v1/radar/history")
 async def get_radar_history(limit: int = 50):
@@ -636,8 +1358,6 @@ async def get_radar_history(limit: int = 50):
         return {"status": "success", "data": data}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
-from fastapi import Request
 
 @app.get("/api/v1/config/zones")
 async def get_zones_api():
@@ -681,130 +1401,286 @@ async def update_room_config_api(request: Request):
 
 
 # --- CAMERA MANUAL CONTROL API ---
-camera_mode = "MANUAL"
-
-from pydantic import BaseModel
 class CameraMoveRequest(BaseModel):
-    direction: str  # UP, DOWN, LEFT, RIGHT, STOP
+    direction: str  # HOLD_* while pressed; STOP on release; legacy steps/RESET
+    session_id: str | None = None
+    seq: int | None = None
+
+
+class ServoConfigRequest(BaseModel):
+    key: str
+    value: str | int | float | None = None
+
+
+SERVO_CONFIG_ACTIONS = {"STATUS", "HELP", "TEST_PAN", "TEST_TILT", "CENTER", "DEFAULTS"}
+SERVO_CONFIG_INT_RANGES = {
+    "PAN_MIN": (0, 159), "PAN_MAX": (0, 159),
+    "TILT_MIN": (0, 159), "TILT_MAX": (0, 159),
+    "PAN_CENTER": (0, 159), "TILT_CENTER": (0, 159),
+    "PAN_DIR": (-1, 1), "TILT_DIR": (-1, 1),
+    "CAMERA_HEIGHT_MM": (0, 4000), "TARGET_HEIGHT_MM": (0, 4000),
+}
+SERVO_CONFIG_FLOAT_RANGES = {
+    "PAN_OFFSET": (-45.0, 45.0), "TILT_OFFSET": (-45.0, 45.0),
+    "SPEED_DPS": (30.0, 300.0), "RADAR_ALPHA": (0.05, 1.0),
+}
+
+
+@app.get("/api/v1/servo/diag")
+def get_servo_diagnostics():
+    with servo_diag_lock:
+        data = servo_diag_payload.copy() if servo_diag_payload is not None else None
+        received_at = servo_diag_received_at
+        config = servo_config_state.copy() if servo_config_state is not None else None
+        result = servo_config_result
+        result_at = servo_config_result_at
+    age = max(0.0, time.time() - received_at) if received_at else None
+    return {
+        "status": "success", "online": hardware_online,
+        "hardware_mode": hardware_mode if hardware_online else None,
+        "mqtt_connected": control_mqtt_connected.is_set(),
+        "fresh": hardware_online and age is not None and age < 5.0,
+        "age_seconds": round(age, 2) if age is not None else None,
+        "data": data,
+        "config": config,
+        "last_config_result": result,
+        "last_config_result_at": result_at if result_at else None,
+    }
+
+
+@app.post("/api/v1/servo/config")
+def set_servo_config(req: ServoConfigRequest):
+    global servo_config_result
+    key = req.key.strip().upper()
+    if key in SERVO_CONFIG_ACTIONS:
+        if req.value is not None:
+            return {"status": "error", "message": f"{key} takes no value"}
+        command = key
+    elif key == "LOST_ACTION":
+        value = str(req.value).strip().upper() if req.value is not None else ""
+        if value not in ("HOLD", "CENTER"):
+            return {"status": "error", "message": "LOST_ACTION must be HOLD or CENTER"}
+        command = f"{key}={value}"
+    elif key in SERVO_CONFIG_INT_RANGES or key in SERVO_CONFIG_FLOAT_RANGES:
+        try:
+            value = float(str(req.value).strip())
+        except (TypeError, ValueError):
+            return {"status": "error", "message": f"{key} needs a number"}
+        if not math.isfinite(value):
+            return {"status": "error", "message": f"{key} needs a finite number"}
+        if key in SERVO_CONFIG_INT_RANGES:
+            minimum, maximum = SERVO_CONFIG_INT_RANGES[key]
+            if not value.is_integer() or not minimum <= value <= maximum:
+                return {"status": "error", "message": f"{key} must be an integer from {minimum} to {maximum}"}
+            if key in ("PAN_DIR", "TILT_DIR") and value not in (-1, 1):
+                return {"status": "error", "message": f"{key} must be -1 or 1"}
+            rendered = str(int(value))
+        else:
+            minimum, maximum = SERVO_CONFIG_FLOAT_RANGES[key]
+            if not minimum <= value <= maximum:
+                return {"status": "error", "message": f"{key} must be from {minimum} to {maximum}"}
+            rendered = f"{value:.3f}".rstrip("0").rstrip(".")
+        command = f"{key}={rendered}"
+    else:
+        return {"status": "error", "message": "Unsupported servo config key"}
+
+    with servo_config_request_lock:
+        # Only this short section shares the control lock with joystick moves.
+        with control_mqtt_lock:
+            if key not in ("STATUS", "HELP") and (camera_mode != "MANUAL" or not hardware_online or hardware_mode != "MANUAL"):
+                return {"status": "error", "message": "Confirm ESP32 is online and in MANUAL mode first"}
+            if not control_mqtt_connected.is_set() or control_mqtt_client is None:
+                return {"status": "error", "message": "Control MQTT is disconnected"}
+            try:
+                with servo_diag_lock:
+                    servo_config_result = None
+                    servo_config_result_event.clear()
+                info = control_mqtt_client.publish("embedded/servo/config", command, qos=1)
+                if info.rc != 0:
+                    return {"status": "error", "message": f"MQTT publish failed ({info.rc})"}
+            except Exception as e:
+                logger.error("[SERVO-CONFIG] MQTT publish failed: %s", e)
+                return {"status": "error", "message": "MQTT publish failed"}
+        try:
+            info.wait_for_publish(timeout=1.5)
+            if not info.is_published():
+                return {"status": "error", "message": "MQTT broker did not acknowledge config command"}
+        except Exception as e:
+            logger.error("[SERVO-CONFIG] MQTT acknowledgement failed: %s", e)
+            return {"status": "error", "message": "MQTT acknowledgement failed"}
+        confirmed = servo_config_result_event.wait(timeout=2.0)
+        with servo_diag_lock:
+            result = servo_config_result if confirmed else None
+    logger.info("[SERVO-CONFIG] Queued %s", command)
+    if result is None:
+        return {"status": "pending", "command": command,
+                "broker_acknowledged": True, "message": "ESP32 confirmation timed out; check /api/v1/servo/diag"}
+    if result.startswith("ERR:"):
+        # The firmware's ERR payload has no command/request ID. It could be a
+        # late response to another MQTT client's command, so never claim that
+        # this particular request was rejected or applied based on ERR alone.
+        return {"status": "pending", "command": command, "broker_acknowledged": True,
+                "device_result": result,
+                "message": "ESP32 reported an error without a command ID; check /api/v1/servo/diag"}
+    expected = f"OK:{command}"
+    if "=" in command:
+        # Value commands must match the entire echo: PAN_DIR=1 and
+        # PAN_DIR=-1 are different requests even though they share a key.
+        matched = result.strip().upper() == expected.upper()
+    else:
+        confirmed_payload = result.partition(":")[2].strip().upper()
+        matched = result.startswith("OK:") and (
+            confirmed_payload == key or confirmed_payload.startswith(f"{key} ")
+        )
+    if not matched:
+        return {"status": "pending", "command": command,
+                "broker_acknowledged": True, "device_result": result,
+                "message": "Received a different config result; check /api/v1/servo/diag"}
+    return {"status": "success", "command": command,
+            "broker_acknowledged": True, "device_result": result,
+            "applied_by_esp32": True}
+
+
+@app.get("/api/v1/camera/mode")
+def get_camera_mode():
+    """Trả về chế độ hiện tại để Frontend đồng bộ khi tải trang."""
+    return {
+        "status": "success",
+        "mode": camera_mode,
+        "hardware_mode": hardware_mode if hardware_online else None,
+        "hardware_online": hardware_online,
+        "mqtt_connected": control_mqtt_connected.is_set(),
+    }
 
 
 @app.post("/api/v1/camera/mode")
 def set_camera_mode(mode: str):
     global camera_mode
-    if mode in ["AUTO", "MANUAL"]:
+    if mode not in ("AUTO", "MANUAL"):
+        return {"status": "error", "message": "Invalid mode. Use AUTO or MANUAL"}
+
+    with control_mqtt_lock:
+        if not control_mqtt_connected.is_set() or control_mqtt_client is None:
+            return {"status": "error", "message": "Control MQTT is disconnected"}
+        try:
+            info = control_mqtt_client.publish("embedded/servo/mode", mode, qos=1, retain=True)
+            if info.rc != 0:
+                return {"status": "error", "message": f"MQTT publish failed ({info.rc})"}
+            info.wait_for_publish(timeout=1.5)
+            if not info.is_published():
+                return {"status": "error", "message": "MQTT broker did not acknowledge the mode command"}
+        except Exception as e:
+            logger.error(f"[MODE] MQTT publish failed: {e}")
+            return {"status": "error", "message": f"MQTT publish failed: {e}"}
+
         camera_mode = mode
-        # Write to file for IPC
-        with open("camera_mode.txt", "w") as f:
-            f.write(mode)
-        return {"status": "success", "mode": camera_mode}
-    return {"status": "error"}
+        logger.info("[MODE] Sent MQTT servo mode: %s", mode)
+        try:
+            with open("camera_mode.txt", "w") as f:
+                f.write(mode)
+        except OSError as e:
+            logger.warning(f"[MODE] Could not persist camera_mode.txt: {e}")
+        return {"status": "success", "mode": camera_mode,
+                "hardware_mode": hardware_mode if hardware_online else None,
+                "hardware_online": hardware_online}
 
 
 @app.post("/api/v1/camera/move")
 def move_camera(req: CameraMoveRequest):
-    global camera_mode
-    if camera_mode == "MANUAL":
-        import paho.mqtt.publish as publish
-        import os
-        broker = os.getenv("MQTT_BROKER", "10.28.125.55")
+    global manual_command_sequence
+    request_started = time.perf_counter()
+    direction = req.direction.strip().upper()
+    if direction not in ("UP", "DOWN", "LEFT", "RIGHT", "RESET", "STOP",
+                         "HOLD_UP", "HOLD_DOWN", "HOLD_LEFT", "HOLD_RIGHT"):
+        return {"status": "error", "message": "Invalid direction"}
+    with control_mqtt_lock:
+        if camera_mode != "MANUAL":
+            return {"status": "error", "message": "Must be in MANUAL mode"}
+        sequenced_request = req.session_id is not None and req.seq is not None
+        if sequenced_request:
+            if not req.session_id or len(req.session_id) > 64 or req.seq < 0:
+                return {"status": "error", "message": "Invalid move sequence"}
+            if req.seq <= manual_last_sequence.get(req.session_id, -1):
+                return {"status": "success", "ignored": True}
+        if not control_mqtt_connected.is_set() or control_mqtt_client is None:
+            return {"status": "error", "message": "Control MQTT is disconnected"}
         try:
-            publish.single("embedded/servo/manual", req.direction, hostname=broker)
-            return {"status": "success"}
+            manual_command_sequence += 1
+            command = f"@{manual_command_epoch}:{manual_command_sequence}:{direction}"
+            # A release command must reach the broker even if Wi-Fi is busy.
+            info = control_mqtt_client.publish("embedded/servo/manual", command, qos=1 if direction == "STOP" else 0)
+            if info.rc != 0:
+                return {"status": "error", "message": f"MQTT publish failed ({info.rc})"}
+            if direction == "STOP":
+                info.wait_for_publish(timeout=1.0)
+                if not info.is_published():
+                    return {"status": "error", "message": "MQTT broker did not acknowledge STOP"}
+            # Accept the browser sequence only after the broker accepted the
+            # publish. A failed command can then be retried with the same seq.
+            if sequenced_request:
+                manual_last_sequence[req.session_id] = req.seq
+                if len(manual_last_sequence) > 128:
+                    manual_last_sequence.pop(next(iter(manual_last_sequence)))
         except Exception as e:
-            return {"status": "error", "message": str(e)}
-    return {"status": "error", "message": "Must be in MANUAL mode"}
+            logger.error("[MOVE] MQTT publish failed: %s", e)
+            return {"status": "error", "message": "MQTT publish failed"}
+        dispatch_ms = (time.perf_counter() - request_started) * 1000.0
+        if dispatch_ms >= 150.0:
+            logger.warning("[MOVE-LATENCY] command=%s HTTP-to-MQTT=%.0fms", direction, dispatch_ms)
+        return {"status": "success", "dispatch_ms": round(dispatch_ms, 1)}
 
 @app.websocket("/api/v1/ws/alerts")
-
-
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
+    alert_websockets[websocket] = asyncio.Lock()
     logger.info("Web Dashboard connected.")
-    
-    global alert_active, last_alert_signature
-    
+    reported_worker_fault = False
+    last_keepalive = time.monotonic()
+
     try:
         while True:
-            # Mô phỏng trạng thái phần cứng để UI hiển thị nếu chết Camera
+            # The connection sends status transitions and an occasional
+            # keepalive. The independent alert consumer broadcasts fall events.
+            if time.monotonic() - last_keepalive >= 30.0:
+                if not await send_alert_websocket_message(websocket, {"type": "SYSTEM_HEARTBEAT"}):
+                    break
+                last_keepalive = time.monotonic()
+
             if not p_cam.is_alive() or not p_ai.is_alive():
-                await websocket.send_json({"type": "SYSTEM_ERROR", "event_code": "SENSOR_DISCONNECTED", "message": "Hardware connection lost! Watchdog is attempting to reconnect."})
+                if not reported_worker_fault:
+                    sent = await send_alert_websocket_message(websocket, {
+                        "type": "SYSTEM_ERROR",
+                        "event_code": "SENSOR_DISCONNECTED",
+                        "message": "Camera or AI worker stopped; watchdog is restarting it.",
+                    })
+                    if not sent:
+                        break
+                    reported_worker_fault = True
                 await asyncio.sleep(2.0)
                 continue
 
-            try:
-                fall_event = alert_q.get_nowait()
-            except queue.Empty:
-                fall_event = None
-
-            # The AI process emits only a newly-confirmed, per-track event.
-            # This avoids duplicate alerts caused by multiple websocket clients.
-            event_signature = None if not fall_event else (
-                fall_event.get("track_id"), fall_event.get("timestamp")
-            )
-            if fall_event and event_signature != last_alert_signature:
-                alert_active = True
-                last_alert_signature = event_signature
-                alert_payload = {
-                    "type": "CRITICAL_ALERT",
-                    "event_code": "FALL_DETECTED",
-                    "track_id": fall_event.get("track_id"),
-                    "message": f"Cảnh báo: {fall_event.get('person_type', 'PATIENT')} vừa bị ngã!",
-                    "timestamp": fall_event.get("timestamp", time.time()),
-                }
-                await websocket.send_json(alert_payload)
-                image_path = f"snapshots/fall_{int(time.time())}_{fall_event.get('track_id', 'unknown')}.jpg"
-                try:
-                    with open(image_path, "wb") as f:
-                        f.write(latest_mjpeg_bytes)
-                    log_alert("FALL_DETECTED", f"Phát hiện ngã ở track {fall_event.get('track_id')}", image_path)
-                except Exception as e:
-                    logger.error(f"File/Database Write Error: {e}")
-                
-                # --- TELEGRAM DEBOUNCE (Rate limit: 1 tin nhắn mỗi 60 giây) ---
-                global last_telegram_sent
-                if time.time() - last_telegram_sent > 60:
-                    last_telegram_sent = time.time()
-                    
-                    pos_x = fall_event.get("pos_x", 0.0)
-                    pos_y = fall_event.get("pos_y", 0.0)
-                    speed = fall_event.get("speed", 0.0)
-                    dt_str = time.strftime("%H:%M - %d/%m/%Y")
-                    
-                    if speed == 0.0:
-                        msg_text = (
-                            f"🚨 [BÁO ĐỘNG] PHÁT HIỆN TÉ NGÃ/GỤC BẤT THƯỜNG!\n"
-                            f"🕒 Thời gian: {dt_str}\n"
-                            f"🚹 Mục tiêu: Patient #{fall_event.get('track_id')}\n\n"
-                            f"📍 VỊ TRÍ (RADAR 2D):\n"
-                            f"🔸 Tọa độ X: {pos_x:.2f} m\n"
-                            f"🔸 Tọa độ Y: {pos_y:.2f} m\n"
-                            f"⚠️ Tốc độ: 0 m/s \n\n"
-                            f"🚑 Yêu cầu gọi người nhà kiểm tra ngay lập tức!"
-                        )
-                    else:
-                        msg_text = (
-                            f"🚨 [BÁO ĐỘNG] PHÁT HIỆN TÉ NGÃ/GỤC BẤT THƯỜNG!\n"
-                            f"🕒 Thời gian: {dt_str}\n"
-                            f"🚹 Mục tiêu: Patient #{fall_event.get('track_id')}\n\n"
-                            f"📍 VỊ TRÍ (RADAR 2D):\n"
-                            f"🔸 Tọa độ X: {pos_x:.2f} m\n"
-                            f"🔸 Tọa độ Y: {pos_y:.2f} m\n"
-                            f"🔹 Tốc độ: {speed:.2f} m/s (CÒN CỬ ĐỘNG)\n\n"
-                            f"🛑 Vui lòng mở Camera trực tiếp để kiểm tra!"
-                        )
-
-                    threading.Thread(
-                        target=send_telegram_alert,
-                        args=(latest_mjpeg_bytes, msg_text),
-                        daemon=True,
-                    ).start()
-                else:
-                    logger.warning("Bỏ qua gửi Telegram do đang trong thời gian Cooldown (60s).")
-            
+            if reported_worker_fault:
+                if not await send_alert_websocket_message(websocket, {"type": "SYSTEM_OK"}):
+                    break
+                reported_worker_fault = False
             await asyncio.sleep(0.2)
     except WebSocketDisconnect:
         pass
+    finally:
+        alert_websockets.pop(websocket, None)
 
 if __name__ == "__main__":
     mp.freeze_support()
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, ws="websockets")
+    # Uvicorn binds after FastAPI startup; fail early so a second backend
+    # cannot start expensive camera/OpenVINO workers before discovering that
+    # the first backend already owns port 8000.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_probe:
+            port_probe.bind(("0.0.0.0", 8000))
+    except OSError as e:
+        logger.error("Port 8000 is already in use. Stop the existing backend before starting another: %s", e)
+        raise SystemExit(1) from e
+    # Holding the joystick produces about 10 requests/s. Routine access logs
+    # add avoidable console I/O on Windows; stage diagnostics remain enabled.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False,
+                ws="auto", access_log=False)
