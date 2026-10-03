@@ -87,7 +87,21 @@ ipconfig
 
 Ghi địa chỉ **IPv4 của card Wi-Fi/Ethernet đang nối cùng mạng**, ví dụ `192.168.1.10`. Đây là **IP PC**, dùng cho `MQTT_BROKER` và trang web ở máy khác. IP camera lấy từ **Serial Monitor camera**, ví dụ `192.168.1.50`. Hai IP phải khác nhau. Nếu IP đổi sau khi khởi động lại router/hotspot, cập nhật cấu hình hoặc đặt DHCP reservation cho PC/camera.
 
-Trong cả hai sketch, sửa `ssid` và `password` ở đầu file thành Wi-Fi thật. Trong sketch servo/radar, sửa `mqttHost` thành IP PC. Nếu ESP32 DevKit đã từng chạy firmware này, **NVS có thể giữ `MQTT_HOST` cũ và ghi đè giá trị biên dịch**; sau nạp, gửi `MQTT_HOST=<IP-PC>` qua Serial Monitor để lưu địa chỉ mới. Không đưa mật khẩu Wi-Fi hoặc token Telegram vào ảnh log chia sẻ công khai.
+### Danh sách địa chỉ cần kiểm tra khi đổi PC hoặc mạng
+
+| Địa chỉ | Cách lấy địa chỉ thật | Chỗ dùng/thay | Có cần nạp lại ESP32? |
+| --- | --- | --- | --- |
+| **IP LAN của PC chạy Mosquitto và backend** | Chạy `ipconfig` trên PC; chọn `IPv4 Address` của **Wi-Fi/Ethernet đang kết nối**, có `Default Gateway`, không lấy Tailscale, VMware, WSL hoặc `127.0.0.1` | `MQTT_BROKER=<IP-PC>` trong `backend/.env`; trên ESP32 DevKit gửi `MQTT_HOST=<IP-PC>` qua Serial Monitor; khi mở web từ máy khác dùng `http://<IP-PC>:3000` và đặt **Server URL** là `http://<IP-PC>:8000` trong Cài đặt dashboard | **Không** nếu chỉ đổi `MQTT_HOST` bằng Serial; nếu đổi SSID/mật khẩu Wi-Fi trong sketch thì **có** |
+| **IP ESP32-CAM** | Mở Serial Monitor của **bo camera** ở 115200, tìm `[CAM-WIFI] connected ip=...` hoặc sao chép nguyên URL `[CAM-URL] VIDEO_SOURCE=...` | `VIDEO_SOURCE=http://<IP-CAM>:81/stream` trong `backend/.env`, hoặc điền **Địa chỉ IP Camera ESP32** ở Cài đặt dashboard rồi Lưu; kiểm tra `http://<IP-CAM>:82/status` | Không khi IP camera đổi nhưng Wi-Fi giữ nguyên |
+| **IP ESP32 DevKit** | Mở Serial Monitor của **bo radar/servo**, tìm `[WiFi] Connected, IP=...` | Chỉ để nhận diện/chẩn đoán; backend giao tiếp qua IP **broker**, không nhập IP DevKit vào `MQTT_BROKER` | Không |
+
+Trong `hardware/esp32_servo_radar/esp32_servo_radar.ino`, biến `mqttHost` chỉ là **giá trị mặc định lúc chưa có cấu hình đã lưu**. Firmware đọc `mqtt_host` từ NVS khi khởi động; vì thế sửa IP trong sketch rồi nạp lại vẫn có thể tiếp tục dùng IP cũ. Đọc địa chỉ **đang có hiệu lực** bằng lệnh `STATUS` trong Serial Monitor (115200 baud, chọn **New Line**) và xem dòng `[CONFIG] broker=...`. Để đổi mà không nạp lại, gửi `MQTT_HOST=<IP-PC>`; chờ log reconnect MQTT. Nếu đang dùng bản sao `sketch_oct3a.ino` trong Arduino IDE, sửa đúng sketch sẽ nạp lên bo, không chỉ sửa file `.ino` trong dự án.
+
+`backend/.env` có thể chứa IP ví dụ của mạng cũ; sửa `MQTT_BROKER` và `VIDEO_SOURCE` theo mạng **hiện tại**, rồi **khởi động lại backend**. Nếu dùng nút Lưu cho IP camera trên dashboard, backend cập nhật `VIDEO_SOURCE` ngay và lưu vào `.env`; Server URL được lưu riêng trong trình duyệt, nên máy/trình duyệt khác phải đặt lại. Trong mã Python có IP mặc định khi thiếu `.env`; dùng `.env` để cấu hình thay vì sửa các giá trị mặc định đó. `frontend/next.config.ts` chứa `allowedDevOrigins` chỉ cần cập nhật khi chạy Next.js ở chế độ phát triển từ máy khác và Next.js báo chặn origin đó. `0.0.0.0` trong `mosquitto_local.conf` là địa chỉ **lắng nghe mọi card mạng**, không phải IP thiết bị cần thay.
+
+Sau khi đổi, kiểm tra `GET http://<IP-PC>:8000/api/v1/servo/diag`: `mqtt_broker` cho biết **địa chỉ backend thực sự dùng**, còn `mqtt_connected=true`, `online=true`, `fresh=true` và `age_seconds` nhỏ chứng minh backend nhận chẩn đoán mới của ESP32 qua broker. Chỉ thấy HTTP `200` hoặc ESP32 báo `mqtt=1` chưa chứng minh **hai bên cùng một broker**. API joystick sẽ trả lỗi khi ESP32 offline/diagnostics cũ, thay vì báo thành công chỉ vì broker nhận gói; lệnh dừng `STOP` vẫn được gửi. Nếu thử `TEST_PAN`/`TEST_TILT` trực tiếp trên Serial mà góc/xung trong log đổi nhưng servo vẫn đứng yên, sửa IP không chữa được phần nguồn/dây/PWM/cơ khí đó; kiểm tra riêng ngay tại servo.
+
+Nếu chuyển sang Wi-Fi khác, sửa `ssid` và `password` ở đầu **cả hai sketch** rồi nạp lại đúng từng bo; lệnh Serial `MQTT_HOST` chỉ đổi địa chỉ broker, không đổi Wi-Fi. Không đưa mật khẩu Wi-Fi hoặc token Telegram vào ảnh log chia sẻ công khai.
 
 ## 5. Nạp đúng firmware cho từng bo
 

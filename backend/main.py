@@ -1118,6 +1118,7 @@ async def lifespan(app: FastAPI):
     # Maintain one MQTT connection for all web control commands.
     try:
         import paho.mqtt.client as mqtt
+        logger.info("Control MQTT broker target: %s:1883", CONTROL_MQTT_BROKER)
         control_mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="FallGuard_Web_Control")
         control_mqtt_client.on_connect = on_control_mqtt_connect
         control_mqtt_client.on_disconnect = on_control_mqtt_disconnect
@@ -1439,6 +1440,7 @@ def get_servo_diagnostics():
         "status": "success", "online": hardware_online,
         "hardware_mode": hardware_mode if hardware_online else None,
         "mqtt_connected": control_mqtt_connected.is_set(),
+        "mqtt_broker": CONTROL_MQTT_BROKER,
         "fresh": hardware_online and age is not None and age < 5.0,
         "age_seconds": round(age, 2) if age is not None else None,
         "data": data,
@@ -1596,6 +1598,14 @@ def move_camera(req: CameraMoveRequest):
     with control_mqtt_lock:
         if camera_mode != "MANUAL":
             return {"status": "error", "message": "Must be in MANUAL mode"}
+        # A successful publish only confirms delivery to the broker. Do not
+        # report a movement as successful when the ESP32 has disappeared.
+        # Always allow STOP to be published as a safety command.
+        if direction != "STOP":
+            with servo_diag_lock:
+                last_servo_diag = servo_diag_received_at
+            if not hardware_online or not last_servo_diag or time.time() - last_servo_diag >= 5.0:
+                return {"status": "error", "message": "ESP32 servo is offline or diagnostics are stale; check /api/v1/servo/diag and MQTT broker"}
         sequenced_request = req.session_id is not None and req.seq is not None
         if sequenced_request:
             if not req.session_id or len(req.session_id) > 64 or req.seq < 0:
