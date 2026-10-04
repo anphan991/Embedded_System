@@ -21,10 +21,12 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv, set_key
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from database import init_db, log_alert, log_vitals
 from fall_detection import FallDetector, FallObservation
+from servo_protocol import (PROTOCOLS, STEP_COMMANDS, LEGACY_STEP_INTERVAL,
+                            LEGACY_TRACKING_INTERVAL, capabilities, tracking_payload)
 
 # Load environment variables (Telegram config)
 load_dotenv()
@@ -35,6 +37,9 @@ logger = logging.getLogger(__name__)
 # Constants
 VIDEO_SOURCE = os.getenv("VIDEO_SOURCE", "http://10.28.125.12:81/stream")
 CONTROL_MQTT_BROKER = os.getenv("MQTT_BROKER", "10.28.125.55")
+SERVO_PROTOCOL = os.getenv("SERVO_PROTOCOL", "sequenced_hold").strip().lower()
+if SERVO_PROTOCOL not in PROTOCOLS:
+    raise ValueError(f"SERVO_PROTOCOL must be one of {PROTOCOLS}; got {SERVO_PROTOCOL!r}")
 POSE_MODEL_PATH = os.getenv("POSE_MODEL_PATH", "yolov8m-pose.pt")
 try:
     AI_FPS_LIMIT = max(1, min(30, int(os.getenv("AI_FPS_LIMIT", "30"))))
@@ -244,6 +249,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
     wandering_start = 0.0
     wandering_alert_sent = False
     last_mqtt_warning = 0.0
+    tracking_auto_requested = False
 
     def on_mqtt_connect(client, userdata, flags, reason_code, properties):
         if reason_code != 0:
@@ -251,17 +257,23 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
             return
         client.subscribe("embedded/servo/status")
         client.subscribe("embedded/radar/data")
+        if SERVO_PROTOCOL == "legacy_step":
+            client.subscribe("embedded/servo/mode")
         logger.info("AI MQTT connected and subscribed to radar/servo status")
 
     def on_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+        nonlocal tracking_auto_requested
+        tracking_auto_requested = False
         logger.warning("AI MQTT disconnected: %s", reason_code)
 
     def on_mqtt_message(client, userdata, msg):
         nonlocal is_camera_moving, current_radar_x, current_radar_y, current_radar_speed, last_radar_log, last_danger_log
         nonlocal wandering_start, wandering_alert_sent, last_zones_fetch, cached_safe_zones, cached_danger_zones, cached_room_config
-        nonlocal last_mqtt_warning
+        nonlocal last_mqtt_warning, tracking_auto_requested
         try:
-            if msg.topic == "embedded/servo/status":
+            if msg.topic == "embedded/servo/mode":
+                tracking_auto_requested = msg.payload.decode("utf-8").strip().upper() == "AUTO"
+            elif msg.topic == "embedded/servo/status":
                 payload = msg.payload.decode('utf-8').strip().upper()
                 if payload == "MOVING":
                     is_camera_moving = True
@@ -428,6 +440,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
     last_target_seen = time.time()
     target_lost_sent = False
     processed_generation = -1
+    last_tracking_publish_at = 0.0
     
     # AI_FPS_LIMIT is a ceiling. Decode only as many frames as inference can
     # process, leaving CPU/GPU headroom and retaining the newest queued frame.
@@ -576,9 +589,17 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                     
                     # Chỉ gửi lệnh quay Servo nếu mục tiêu ra khỏi vùng an toàn
                     if (frame_generation == camera_generation_ref.value and
+                            (SERVO_PROTOCOL != "legacy_step" or tracking_auto_requested) and
                             (abs(target_x - center_x) > deadband_x or abs(target_y - center_y) > deadband_y)):
-                        try: mqtt_client.publish("embedded/servo/tracking", f"{target_x},{target_y},{frame_w},{frame_h}")
-                        except Exception: pass
+                        now_tracking = time.monotonic()
+                        if (SERVO_PROTOCOL != "legacy_step" or
+                                now_tracking - last_tracking_publish_at >= LEGACY_TRACKING_INTERVAL):
+                            last_tracking_publish_at = now_tracking
+                            try:
+                                mqtt_client.publish("embedded/servo/tracking", tracking_payload(
+                                    SERVO_PROTOCOL, target_x, target_y, frame_w, frame_h))
+                            except Exception:
+                                pass
                 
                 width = max(1.0, x2 - x1)
                 height = max(1.0, y2 - y1)
@@ -811,9 +832,11 @@ hardware_online = False
 control_mqtt_client = None
 control_mqtt_connected = threading.Event()
 control_mqtt_lock = threading.Lock()
+camera_mode_request_lock = threading.Lock()
 manual_last_sequence = {}
 manual_command_epoch = time.time_ns()
 manual_command_sequence = 0
+legacy_last_move_at = 0.0
 camera_config_update_lock = threading.Lock()
 servo_diag_lock = threading.Lock()
 servo_diag_payload = None
@@ -832,11 +855,12 @@ def on_control_mqtt_connect(client, userdata, flags, reason_code, properties):
         control_mqtt_connected.clear()
         logger.warning("Control MQTT connection refused: %s", reason_code)
         return
-    client.subscribe("embedded/servo/state", qos=1)
-    client.subscribe("embedded/servo/online", qos=1)
-    client.subscribe("embedded/servo/diag", qos=0)
-    client.subscribe("embedded/servo/config/state", qos=1)
-    client.subscribe("embedded/servo/config/result", qos=1)
+    if SERVO_PROTOCOL == "sequenced_hold":
+        client.subscribe("embedded/servo/state", qos=1)
+        client.subscribe("embedded/servo/online", qos=1)
+        client.subscribe("embedded/servo/diag", qos=0)
+        client.subscribe("embedded/servo/config/state", qos=1)
+        client.subscribe("embedded/servo/config/result", qos=1)
     info = client.publish("embedded/servo/mode", camera_mode, qos=1, retain=True)
     if info.rc == 0:
         control_mqtt_connected.set()
@@ -852,6 +876,11 @@ def on_control_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, 
     hardware_mode = None
     hardware_online = False
     logger.warning("Control MQTT disconnected: %s", reason_code)
+
+
+def on_control_socket_open(client, userdata, connection):
+    # Send small joystick packets immediately instead of coalescing TCP writes.
+    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
 def on_control_mqtt_message(client, userdata, message):
@@ -1118,8 +1147,14 @@ async def lifespan(app: FastAPI):
     # Maintain one MQTT connection for all web control commands.
     try:
         import paho.mqtt.client as mqtt
-        logger.info("Control MQTT broker target: %s:1883", CONTROL_MQTT_BROKER)
-        control_mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="FallGuard_Web_Control")
+        if not os.getenv("MQTT_BROKER"):
+            logger.warning("MQTT_BROKER is not configured; set it in backend/.env on this PC instead of relying on the legacy default")
+        logger.info("Control MQTT broker target: %s:1883; servo protocol=%s", CONTROL_MQTT_BROKER, SERVO_PROTOCOL)
+        control_id = f"FallGuard_Web_{socket.gethostname()[:16]}_{os.getpid()}"
+        control_mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=control_id)
+        control_mqtt_client.max_queued_messages_set(32)
+        control_mqtt_client.max_inflight_messages_set(8)
+        control_mqtt_client.on_socket_open = on_control_socket_open
         control_mqtt_client.on_connect = on_control_mqtt_connect
         control_mqtt_client.on_disconnect = on_control_mqtt_disconnect
         control_mqtt_client.on_message = on_control_mqtt_message
@@ -1403,9 +1438,9 @@ async def update_room_config_api(request: Request):
 
 # --- CAMERA MANUAL CONTROL API ---
 class CameraMoveRequest(BaseModel):
-    direction: str  # HOLD_* while pressed; STOP on release; legacy steps/RESET
-    session_id: str | None = None
-    seq: int | None = None
+    direction: str = Field(min_length=1, max_length=16)
+    session_id: str | None = Field(default=None, min_length=1, max_length=64)
+    seq: int | None = Field(default=None, ge=0, le=9007199254740991)
 
 
 class ServoConfigRequest(BaseModel):
@@ -1429,6 +1464,16 @@ SERVO_CONFIG_FLOAT_RANGES = {
 
 @app.get("/api/v1/servo/diag")
 def get_servo_diagnostics():
+    if SERVO_PROTOCOL == "legacy_step":
+        # Retained r3/r5 messages may still exist on this broker. They cannot
+        # prove the supplied firmware's current connection, mode or angles.
+        return {"status": "success", "control_protocol": SERVO_PROTOCOL,
+                "capabilities": capabilities(SERVO_PROTOCOL),
+                "online": None, "hardware_mode": None, "fresh": False,
+                "mqtt_connected": control_mqtt_connected.is_set(),
+                "mqtt_broker": CONTROL_MQTT_BROKER, "age_seconds": None,
+                "data": None, "config": None, "last_config_result": None,
+                "last_config_result_at": None, "device_health": {"state": "UNVERIFIED"}}
     with servo_diag_lock:
         data = servo_diag_payload.copy() if servo_diag_payload is not None else None
         received_at = servo_diag_received_at
@@ -1436,14 +1481,32 @@ def get_servo_diagnostics():
         result = servo_config_result
         result_at = servo_config_result_at
     age = max(0.0, time.time() - received_at) if received_at else None
+    fresh = hardware_online and age is not None and age < 5.0
+    device_health = {
+        "state": "LIVE" if fresh else ("STALE" if hardware_online else "OFFLINE"),
+        "boot_reset_reason": data.get("boot_reset_reason") if data else None,
+        "boot_reset_stage": data.get("boot_reset_stage") if data else None,
+        "task_wdt_count": data.get("task_wdt_count") if data else None,
+        "slow_loop_stage": data.get("slow_loop_stage") if data else None,
+        "slow_loop_stage_ms": data.get("slow_loop_stage_ms") if data else None,
+        "mqtt_connect_ms": data.get("mqtt_connect_ms") if data else None,
+        "mqtt_reconnect_failures": data.get("mqtt_reconnect_failures") if data else None,
+        **{key: data.get(key) if data else None for key in (
+            "uptime_ms", "free_heap", "min_free_heap", "largest_free_block",
+            "loop_stack_free", "network_stack_free", "rx_dropped", "tx_dropped",
+            "log_dropped", "boot_network_stage", "hold_timeout_ms",
+        )},
+    }
     return {
         "status": "success", "online": hardware_online,
+        "control_protocol": SERVO_PROTOCOL, "capabilities": capabilities(SERVO_PROTOCOL),
         "hardware_mode": hardware_mode if hardware_online else None,
         "mqtt_connected": control_mqtt_connected.is_set(),
         "mqtt_broker": CONTROL_MQTT_BROKER,
-        "fresh": hardware_online and age is not None and age < 5.0,
+        "fresh": fresh,
         "age_seconds": round(age, 2) if age is not None else None,
         "data": data,
+        "device_health": device_health,
         "config": config,
         "last_config_result": result,
         "last_config_result_at": result_at if result_at else None,
@@ -1453,6 +1516,9 @@ def get_servo_diagnostics():
 @app.post("/api/v1/servo/config")
 def set_servo_config(req: ServoConfigRequest):
     global servo_config_result
+    if SERVO_PROTOCOL == "legacy_step":
+        return {"status": "error", "error_code": "FIRMWARE_UNSUPPORTED",
+                "message": "Firmware legacy_step không hỗ trợ cấu hình qua MQTT; sửa trong sketch và nạp lại."}
     key = req.key.strip().upper()
     if key in SERVO_CONFIG_ACTIONS:
         if req.value is not None:
@@ -1549,8 +1615,9 @@ def get_camera_mode():
     return {
         "status": "success",
         "mode": camera_mode,
-        "hardware_mode": hardware_mode if hardware_online else None,
-        "hardware_online": hardware_online,
+        "control_protocol": SERVO_PROTOCOL, "capabilities": capabilities(SERVO_PROTOCOL),
+        "hardware_mode": hardware_mode if hardware_online and SERVO_PROTOCOL == "sequenced_hold" else None,
+        "hardware_online": hardware_online if SERVO_PROTOCOL == "sequenced_hold" else None,
         "mqtt_connected": control_mqtt_connected.is_set(),
     }
 
@@ -1561,72 +1628,99 @@ def set_camera_mode(mode: str):
     if mode not in ("AUTO", "MANUAL"):
         return {"status": "error", "message": "Invalid mode. Use AUTO or MANUAL"}
 
-    with control_mqtt_lock:
-        if not control_mqtt_connected.is_set() or control_mqtt_client is None:
-            return {"status": "error", "message": "Control MQTT is disconnected"}
+    # Mode changes serialize with one another, never with a slow STOP ACK.
+    with camera_mode_request_lock:
+        with control_mqtt_lock:
+            if not control_mqtt_connected.is_set() or control_mqtt_client is None:
+                return {"status": "error", "message": "Control MQTT is disconnected"}
+            try:
+                info = control_mqtt_client.publish("embedded/servo/mode", mode, qos=1, retain=True)
+                if info.rc != 0:
+                    return {"status": "error", "message": f"MQTT publish failed ({info.rc})"}
+                camera_mode = mode
+            except Exception as e:
+                logger.error("[MODE] MQTT publish failed: %s", e)
+                return {"status": "error", "message": "MQTT publish failed"}
         try:
-            info = control_mqtt_client.publish("embedded/servo/mode", mode, qos=1, retain=True)
-            if info.rc != 0:
-                return {"status": "error", "message": f"MQTT publish failed ({info.rc})"}
             info.wait_for_publish(timeout=1.5)
             if not info.is_published():
                 return {"status": "error", "message": "MQTT broker did not acknowledge the mode command"}
         except Exception as e:
-            logger.error(f"[MODE] MQTT publish failed: {e}")
-            return {"status": "error", "message": f"MQTT publish failed: {e}"}
-
-        camera_mode = mode
+            logger.error("[MODE] MQTT acknowledgement failed: %s", e)
+            return {"status": "error", "message": "MQTT acknowledgement failed"}
         logger.info("[MODE] Sent MQTT servo mode: %s", mode)
         try:
             with open("camera_mode.txt", "w") as f:
                 f.write(mode)
         except OSError as e:
-            logger.warning(f"[MODE] Could not persist camera_mode.txt: {e}")
-        return {"status": "success", "mode": camera_mode,
-                "hardware_mode": hardware_mode if hardware_online else None,
-                "hardware_online": hardware_online}
+            logger.warning("[MODE] Could not persist camera_mode.txt: %s", e)
+        return {"status": "success", "mode": mode,
+                "control_protocol": SERVO_PROTOCOL, "capabilities": capabilities(SERVO_PROTOCOL),
+                "broker_acknowledged": True,
+                "hardware_mode": hardware_mode if hardware_online and SERVO_PROTOCOL == "sequenced_hold" else None,
+                "hardware_online": hardware_online if SERVO_PROTOCOL == "sequenced_hold" else None}
 
 
 @app.post("/api/v1/camera/move")
 def move_camera(req: CameraMoveRequest):
-    global manual_command_sequence
+    global manual_command_sequence, legacy_last_move_at
     request_started = time.perf_counter()
     direction = req.direction.strip().upper()
     if direction not in ("UP", "DOWN", "LEFT", "RIGHT", "RESET", "STOP",
                          "HOLD_UP", "HOLD_DOWN", "HOLD_LEFT", "HOLD_RIGHT"):
         return {"status": "error", "message": "Invalid direction"}
+    if (req.session_id is None) != (req.seq is None):
+        return {"status": "error", "message": "session_id and seq must be supplied together"}
+    legacy = SERVO_PROTOCOL == "legacy_step"
+    if legacy and direction not in STEP_COMMANDS:
+        return {"status": "error", "error_code": "FIRMWARE_UNSUPPORTED",
+                "message": "Firmware legacy_step chỉ nhận LEFT/RIGHT/UP/DOWN/RESET. Tải lại dashboard để dùng nút từng bước."}
     with control_mqtt_lock:
-        if camera_mode != "MANUAL":
-            return {"status": "error", "message": "Must be in MANUAL mode"}
+        if camera_mode != "MANUAL" and direction != "STOP":
+            return {"status": "error", "error_code": "UI_MODE_MISMATCH",
+                    "message": "Must be in MANUAL mode"}
+        if not control_mqtt_connected.is_set() or control_mqtt_client is None:
+            return {"status": "error", "error_code": "MQTT_DISCONNECTED",
+                    "message": f"MQTT broker disconnected: {CONTROL_MQTT_BROKER}:1883"}
         # A successful publish only confirms delivery to the broker. Do not
         # report a movement as successful when the ESP32 has disappeared.
         # Always allow STOP to be published as a safety command.
-        if direction != "STOP":
+        if direction != "STOP" and not legacy:
             with servo_diag_lock:
                 last_servo_diag = servo_diag_received_at
-            if not hardware_online or not last_servo_diag or time.time() - last_servo_diag >= 5.0:
-                return {"status": "error", "message": "ESP32 servo is offline or diagnostics are stale; check /api/v1/servo/diag and MQTT broker"}
+            diag_age = max(0.0, time.time() - last_servo_diag) if last_servo_diag else None
+            if not hardware_online:
+                return {"status": "error", "error_code": "SERVO_OFFLINE",
+                        "message": "ESP32 servo is offline; check /api/v1/servo/diag",
+                        "mqtt_broker": CONTROL_MQTT_BROKER}
+            if diag_age is None or diag_age >= 5.0:
+                return {"status": "error", "error_code": "SERVO_DIAG_STALE",
+                        "message": "ESP32 servo diagnostics are stale; check /api/v1/servo/diag",
+                        "age_seconds": round(diag_age, 2) if diag_age is not None else None,
+                        "mqtt_broker": CONTROL_MQTT_BROKER}
+            if hardware_mode != "MANUAL":
+                return {"status": "error", "error_code": "SERVO_MODE_MISMATCH",
+                        "message": "ESP32 has not confirmed MANUAL mode"}
         sequenced_request = req.session_id is not None and req.seq is not None
         if sequenced_request:
             if not req.session_id or len(req.session_id) > 64 or req.seq < 0:
                 return {"status": "error", "message": "Invalid move sequence"}
             if req.seq <= manual_last_sequence.get(req.session_id, -1):
                 return {"status": "success", "ignored": True}
-        if not control_mqtt_connected.is_set() or control_mqtt_client is None:
-            return {"status": "error", "message": "Control MQTT is disconnected"}
+        if legacy and time.monotonic() - legacy_last_move_at < LEGACY_STEP_INTERVAL:
+            return {"status": "error", "error_code": "MOVE_RATE_LIMIT",
+                    "message": "Nhấn quá nhanh; lệnh này đã bị bỏ. Chờ một nhịp rồi nhấn lại."}
         try:
             manual_command_sequence += 1
-            command = f"@{manual_command_epoch}:{manual_command_sequence}:{direction}"
+            command = direction if legacy else f"@{manual_command_epoch}:{manual_command_sequence}:{direction}"
             # A release command must reach the broker even if Wi-Fi is busy.
             info = control_mqtt_client.publish("embedded/servo/manual", command, qos=1 if direction == "STOP" else 0)
             if info.rc != 0:
                 return {"status": "error", "message": f"MQTT publish failed ({info.rc})"}
-            if direction == "STOP":
-                info.wait_for_publish(timeout=1.0)
-                if not info.is_published():
-                    return {"status": "error", "message": "MQTT broker did not acknowledge STOP"}
-            # Accept the browser sequence only after the broker accepted the
-            # publish. A failed command can then be retried with the same seq.
+            if legacy:
+                legacy_last_move_at = time.monotonic()
+            # Commit the sequence once Paho accepted the packet. Do this before
+            # waiting for ACK so delayed HOLD packets cannot overtake STOP.
             if sequenced_request:
                 manual_last_sequence[req.session_id] = req.seq
                 if len(manual_last_sequence) > 128:
@@ -1634,10 +1728,23 @@ def move_camera(req: CameraMoveRequest):
         except Exception as e:
             logger.error("[MOVE] MQTT publish failed: %s", e)
             return {"status": "error", "message": "MQTT publish failed"}
-        dispatch_ms = (time.perf_counter() - request_started) * 1000.0
-        if dispatch_ms >= 150.0:
-            logger.warning("[MOVE-LATENCY] command=%s HTTP-to-MQTT=%.0fms", direction, dispatch_ms)
-        return {"status": "success", "dispatch_ms": round(dispatch_ms, 1)}
+    # ACK waiting must never own control_mqtt_lock: a slow STOP previously
+    # held up every later gesture, mode change and calibration command.
+    if direction == "STOP":
+        try:
+            info.wait_for_publish(timeout=1.0)
+            if not info.is_published():
+                return {"status": "error", "message": "MQTT broker did not acknowledge STOP"}
+        except Exception as e:
+            logger.warning("[MOVE] STOP acknowledgement failed: %s", e)
+            return {"status": "error", "message": "MQTT STOP acknowledgement failed"}
+    dispatch_ms = (time.perf_counter() - request_started) * 1000.0
+    if dispatch_ms >= 150.0:
+        logger.warning("[MOVE-LATENCY] command=%s HTTP-to-MQTT=%.0fms", direction, dispatch_ms)
+    if legacy:
+        logger.info("[MOVE-LEGACY] command=%s dispatched_ms=%.1f device_confirmation=unsupported", direction, dispatch_ms)
+    return {"status": "success", "dispatch_ms": round(dispatch_ms, 1),
+            "control_protocol": SERVO_PROTOCOL, "device_confirmed": False}
 
 @app.websocket("/api/v1/ws/alerts")
 async def websocket_endpoint(websocket: WebSocket) -> None:

@@ -48,6 +48,11 @@ const translations: Record<Language, Dictionary> = {
     "cam.backendUnavailable": "Cannot connect to the backend. Check that it is running at:",
     "cam.requestFailed": "The backend did not confirm this command. Check the backend and MQTT logs:",
     "cam.stopUnconfirmed": "STOP could not be confirmed. Check the connection and whether the servo is still moving.",
+    "cam.angleLimit": "has reached the configured angle limit. Move in the opposite direction or return to center.",
+    "cam.legacyHint": "Step control: each press changes PAN by 12° or TILT by 7°. Holding does not repeat; release cannot cancel a sent step.",
+    "cam.legacyAuto": "Requested mode: AUTO",
+    "cam.legacyUnverified": "This firmware does not report online status, angles or mode confirmation. Check movement and Serial Monitor on the ESP32.",
+    "servo.legacyUnsupported": "The supplied step firmware does not support remote calibration or TEST commands. Change limits, direction and geometry in the sketch, then flash the ESP32 DevKit.",
     "cam.retry": "Retry connection",
 
     // Radar Analytics
@@ -176,6 +181,11 @@ const translations: Record<Language, Dictionary> = {
     "cam.backendUnavailable": "Không kết nối được backend. Kiểm tra backend đang chạy tại:",
     "cam.requestFailed": "Backend chưa xác nhận lệnh. Kiểm tra log backend và MQTT:",
     "cam.stopUnconfirmed": "Chưa xác nhận được lệnh STOP. Hãy kiểm tra kết nối và servo có còn quay không.",
+    "cam.angleLimit": "đã tới giới hạn góc cấu hình. Nhấn hướng ngược lại hoặc đưa về giữa.",
+    "cam.legacyHint": "Điều khiển từng bước: mỗi lần nhấn đổi PAN 12° hoặc TILT 7°. Giữ nút không lặp; nhả nút không hủy bước đã gửi.",
+    "cam.legacyAuto": "Chế độ yêu cầu: AUTO",
+    "cam.legacyUnverified": "Firmware này không báo online, góc hay xác nhận chế độ. Kiểm tra chuyển động và Serial Monitor trên ESP32.",
+    "servo.legacyUnsupported": "Firmware từng bước bạn gửi không hỗ trợ hiệu chỉnh từ xa hay lệnh TEST. Sửa giới hạn, chiều quay và hình học trong sketch rồi nạp lại ESP32 DevKit.",
     "cam.retry": "Thử kết nối lại",
 
     // Radar Analytics

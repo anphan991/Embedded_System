@@ -1,5 +1,7 @@
 # Hướng dẫn cài đặt và vận hành hệ thống camera, radar, servo
 
+**Nếu dùng sketch đơn giản vừa gửi ngày 04/10 (LEFT/RIGHT/UP/DOWN/RESET), đọc [hướng dẫn firmware đơn giản](HUONG_DAN_SERVO_FIRMWARE_DON_GIAN.md) trước và đặt `SERVO_PROTOCOL=legacy_step`.** Các mục chẩn đoán, HOLD/STOP và hiệu chỉnh servo dưới đây áp dụng cho firmware chẩn đoán với `SERVO_PROTOCOL=sequenced_hold`, không áp dụng cho sketch đơn giản.
+
 Tài liệu này áp dụng cho bộ phần cứng **đang có trên tay người lắp** và mã nguồn trong thư mục này. `README.md` hiện tại được giữ nguyên. Làm lần lượt từ nguồn điện, từng bo, MQTT, backend rồi frontend; sau mỗi bước có cách kiểm tra để biết chính xác lỗi nằm ở đâu.
 
 ## 1. Xác định phần cứng và giới hạn đã kiểm chứng
@@ -117,6 +119,7 @@ Thứ tự thao tác mỗi bo: cắm **một bo** vào USB → **Tools → Port*
 ### Kết quả mong đợi ở Serial
 
 - ESP32 DevKit: log Wi-Fi/MQTT, `[SERVO-DIAG]` có `attached=1/1`, `[RADAR-DIAG]` có `bytes` và `frames` tăng. Khi có người trong vùng radar, thấy `[RADAR] X=... Y=...`.
+- Firmware servo `r4` in tên reset và bước loop gần nhất ở `[BOOT]`; API `/api/v1/servo/diag` chuyển các trường này thành `device_health`. `TASK_WDT` cùng `previous_loop_stage` giúp khoanh vùng tác vụ bị kẹt; `slow_loop_stage`/`slow_loop_stage_ms` và `mqtt_connect_ms` đo đoạn gây trễ. `task_wdt_count` tăng khi watchdog tiếp tục reset, không bị xóa bởi nút EN; mất nguồn sẽ đặt lại bộ đếm.
 - ESP32-CAM: log `[CAM-BOOT] profile=...`, `[CAM-PINS]`, `[CAM-SENSOR]`, IP, URL `:81/stream` và `:82/status`. Mở `http://<IP-CAMERA>:82/status`; `camera_ready=true`, `sensor=OV3660`, `sensor_match=true`, `psram_bytes>0` là các dấu hiệu đúng profile/cảm biến/PSRAM. Nếu PID khác, hãy gửi lại JSON status và log cảm biến; nhãn dây camera là bằng chứng mạnh nhưng không thay phép đọc PID.
 
 ## 6. Khởi chạy MQTT, backend, frontend
@@ -139,6 +142,8 @@ Nếu Windows Service Mosquitto đã chạy, lắng nghe trên IP LAN hoặc `0.
 Set-Location 'C:\Users\PC\Desktop\Embedded system\backend'
 & 'C:\Program Files\mosquitto\mosquitto.exe' -c '.\mosquitto_local.conf' -v
 ```
+
+Giữ cửa sổ Mosquitto **đang chạy** và mở backend trong **cửa sổ PowerShell thứ hai**. Nếu log in `mosquitto version ... terminating` rồi dấu nhắc `PS ...>` xuất hiện lại, broker đã dừng; mọi API sẽ báo `mqtt_connected=false` sau đó. Khi cả hai đang chạy, log broker nên có client `ESP32_AI_Tracking` và `FallGuard_Web_Control`. Dòng `Received PUBLISH from ESP32_AI_Tracking ... embedded/servo/diag` xác nhận **ESP32 đã gửi telemetry tới broker tại thời điểm đó**; dòng `disconnected: exceeded timeout` nghĩa là kết nối ESP32 bị mất sau một khoảng không có gói MQTT. Nếu timeout lặp lại, đối chiếu thời điểm với Serial `[BOOT]`, `[WiFi]`, `[NET-DIAG]` và đo nguồn 5 V tại ESP32/servo để phân biệt reset, Wi-Fi rớt và vòng xử lý bị chặn. Một ảnh API chụp sau khi broker đã tắt không phản ánh trạng thái khi broker còn chạy.
 
 `mosquitto_local.conf` của dự án hiện nghe cổng 1883 trên mọi địa chỉ và cho kết nối MQTT không mật khẩu. Chỉ dùng trên **mạng riêng đáng tin cậy**, không chuyển tiếp cổng 1883 ra Internet. Nếu vị trí cài Mosquitto khác, sửa đường dẫn `mosquitto.exe`. Nếu báo cổng 1883 bận, tìm đúng tiến trình/service đang nghe, không chạy broker thứ hai.
 
@@ -167,6 +172,8 @@ AI_FPS_LIMIT=30
 ```
 
 `MQTT_BROKER` là IP PC/broker; `VIDEO_SOURCE` là IP ESP32-CAM. Nếu không dùng Telegram, bỏ hai biến đó. Muốn nhận Telegram, điền token/chat ID **trong `.env` của backend**, không chỉ điền trong form frontend. File `.env` và mật khẩu không nên đưa vào Git hoặc ảnh chụp.
+
+**Khi chuyển dự án sang máy khác:** `.env` bị Git bỏ qua nên có thể chưa tồn tại trên máy mới. Nếu `/api/v1/servo/diag` báo `mqtt_broker=10.28.125.55`, đó là giá trị mặc định trong mã khi không có `MQTT_BROKER` (hoặc chính là giá trị máy đã đặt); `mqtt_connected=false` nghĩa backend chưa tới được broker đó. Trên **máy chạy backend của người lắp**, mở PowerShell trong thư mục `backend` rồi kiểm tra `Test-Path .env`, `Select-String -Path .env -Pattern '^MQTT_BROKER='` (chỉ khi file có), và `Get-ChildItem Env:MQTT_BROKER -ErrorAction SilentlyContinue`. Biến môi trường của tiến trình có thể ghi đè giá trị trong `.env`. Lấy IP máy thật đang chạy Mosquitto, cập nhật `MQTT_BROKER=<IP-BROKER>`, khởi động lại backend và kiểm tra `mqtt_broker`, `mqtt_connected`, `online`, `fresh` trong API. Nếu backend đã nối broker nhưng ESP32 chưa online, gửi `STATUS` trên Serial Monitor DevKit để đối chiếu `[CONFIG] broker=...` với cùng IP broker.
 
 Khởi động backend **từ thư mục `backend`**:
 
@@ -267,6 +274,8 @@ Camera trực tiếp: `http://<IP-CAMERA>:81/stream`; trạng thái/tuning: `htt
 | Radar `bytes=0`; hoặc bytes có mà frames=0 | Serial `[RADAR-DIAG]` | Dây TX→GPIO16/GND/nguồn; hoặc sai UART 256000 |
 | `[AUTO]` đổi nhưng servo đứng | Serial `[SERVO-DIAG]` và điện áp ở đầu servo | Chưa chứng minh PWM đến đầu cắm, nguồn đủ dòng hay cơ cấu không kẹt |
 | Joystick trễ | `dispatch_ms`, `[NET-DIAG]`, Wi-Fi RSSI, `hold_heartbeats` | Tách trễ HTTP/MQTT khỏi trễ PWM/cơ khí |
+
+Khi bấm joystick mà giao diện báo lỗi, mở **F12 → Network → yêu cầu `move` → Response** trên chính trình duyệt đang điều khiển. Đọc `error_code`: `MQTT_DISCONNECTED` nghĩa backend chưa nối broker; `SERVO_OFFLINE` hoặc `SERVO_DIAG_STALE` nghĩa chưa có telemetry ESP32 mới; `UI_MODE_MISMATCH` nghĩa dashboard chưa ở MANUAL; `SERVO_MODE_MISMATCH` nghĩa bo chưa xác nhận MANUAL. Đối chiếu `/api/v1/servo/diag` (`mqtt_broker`, `mqtt_connected`, `online`, `fresh`, `age_seconds`, `device_health`) và `/api/v1/camera/mode` (`mode`, `hardware_mode`). Nếu `move` báo `success`, xem `manual_count`, `target` và `pulse_us` trong chẩn đoán mới để xác nhận lệnh đã đến firmware, rồi kiểm tra chuyển động vật lý riêng. HTTP `200` nghĩa backend đã trả lời; vẫn cần đọc `status`/`error_code` trong JSON.
 
 Dashboard có hai đường video: **RAW/LIVE** từ khung camera mới nhất và **AI** có lớp phủ suy luận; bảng chẩn đoán trên dashboard hiện hiển thị FPS RAW, FPS giải mã/đầu ra AI, trần/đích AI và ms xử lý. `AI_FPS_LIMIT=30` hiện là **mức trần mặc định**, không phải FPS đảm bảo; backend bắt đầu AI ở 15 FPS rồi tự nâng/hạ `ai_target_fps` theo `ai_work_ms` để chừa khoảng 20% thời gian xử lý. Hàng đợi AI chỉ giữ khung mới nhất. `ai_decode_fps` là số khung giải mã/giây để đưa vào AI; `ai_fps` là số khung AI hoàn thành/giây; `raw_fps` là FPS camera đến backend và **không bị giới hạn bởi biến này**. Muốn AI đạt 30 FPS ổn định, camera RAW cũng phải có ít nhất 30 FPS và thời gian xử lý mỗi khung `ai_work_ms` nên ở khoảng **≤27 ms**; nếu `ai_work_ms` khoảng 40 ms, mức mục tiêu có dự phòng gần 20 FPS. Tăng mức trần không làm model suy luận nhanh hơn. Nếu CPU quá tải, có thể hạ trần xuống 20/15 trong `.env`, hoặc thử `POSE_MODEL_PATH=yolov8n-pose.pt` (model nhỏ hơn đã có trong `backend`) rồi đánh giá lại độ chính xác cảnh báo ngã. Sửa `.env` cần khởi động lại backend, không cần nạp lại ESP32.
 

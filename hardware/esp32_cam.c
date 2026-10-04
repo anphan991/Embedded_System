@@ -506,6 +506,10 @@ void setup() {
     if (sensor) {
       Serial.printf("[CAM-SENSOR] auto_exposure=%u auto_gain=%u (sensor settings, not measured shutter time)\n",
                     sensor->status.aec, sensor->status.agc);
+      // Xoay 180 độ ở mức phần cứng cảm biến OV2640 (0% CPU, giữ nguyên FPS tối đa):
+      sensor->set_vflip(sensor, 1);    // 1 = Lật dọc (Vertical flip)
+      sensor->set_hmirror(sensor, 1);  // 1 = Lật ngang (Horizontal mirror)
+      Serial.println("[CAM-SENSOR] Hardware 180-degree rotation enabled (vflip=1, hmirror=1).");
     }
     if (sensor_pid != CAMERA_EXPECTED_PID) Serial.println("[CAM-WARN] sensor PID differs from selected profile; verify actual board and camera module");
   } else {

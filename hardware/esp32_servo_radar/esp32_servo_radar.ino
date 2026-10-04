@@ -1,27 +1,184 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <ESP32Servo.h>
+#include <esp_arduino_version.h>
+#include <esp_heap_caps.h>
+#include <atomic>
+#include <stdarg.h>
 #include <Preferences.h>
 #include <esp_system.h>
+#include <esp_attr.h>
 #include <ctype.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 
+// Arduino generates prototypes before the first function in this .ino.
+enum LoopStage : uint8_t;
+struct ServoConfig;
+
 // ================= CẤU HÌNH HỆ THỐNG =================
-const char* FW_VERSION = "servo-radar-2026-10-03-r3";
+const char* FW_VERSION = "servo-radar-2026-10-04-r5";
 const char* ssid        = "No Internet";
 const char* password    = "10022006";
 String mqttHost = "10.28.125.55";
 const int   mqtt_port   = 1883;
 bool mqttHostChanged = false;
 
+// This sketch is for the separate ESP32 DevKit, with PAN=13 and TILT=27.
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+#error "Select ESP32 Dev Module for the servo/radar board, not ESP32-CAM or ESP32-S3."
+#endif
+
+// Fixed storage: no growing command/log queues, and no network calls in loop().
+template <typename T, size_t N> class FixedQueue {
+  StaticQueue_t state;
+  uint8_t storage[sizeof(T) * N];
+  QueueHandle_t queue = nullptr;
+public:
+  void begin() { queue = xQueueCreateStatic(N, sizeof(T), storage, &state); }
+  bool send(const T& value) { return xQueueSend(queue, &value, 0) == pdTRUE; }
+  bool receive(T& value) { return xQueueReceive(queue, &value, 0) == pdTRUE; }
+  void latest(const T& value) { static_assert(N == 1, "mailbox must have one slot"); xQueueOverwrite(queue, &value); }
+};
+
+struct LogRecord { char text[256]; };
+struct IncomingCommand { char topic[48]; char payload[128]; uint32_t receivedAt; };
+struct Publication { char topic[48]; char payload[1400]; bool retained; };
+struct BrokerSetting { char host[64]; };
+FixedQueue<LogRecord, 16> logQueue;
+FixedQueue<IncomingCommand, 8> commandQueue;
+FixedQueue<IncomingCommand, 1> manualMailbox, visionMailbox;
+FixedQueue<Publication, 8> publicationQueue;
+FixedQueue<Publication, 1> diagMailbox, radarMailbox;
+FixedQueue<BrokerSetting, 1> brokerMailbox;
+std::atomic<bool> mqttConnected{false}, mqttJustConnected{false};
+std::atomic<int> mqttState{-1};
+std::atomic<uint32_t> logDropped{0}, mqttRxDropped{0}, mqttTxDropped{0};
+TaskHandle_t networkTaskHandle = nullptr, loggerTaskHandle = nullptr;
+char networkBroker[64];
+char mqttClientId[40];
+RTC_DATA_ATTR uint8_t rtcNetworkStage = 0;
+uint8_t bootNetworkStage = 0;
+bool runtimeReady = false;
+
+void logPrintf(const char* format, ...) {
+  LogRecord record;
+  va_list args;
+  va_start(args, format);
+  const int count = vsnprintf(record.text, sizeof(record.text), format, args);
+  va_end(args);
+  if (count < 0) return;
+  if (count >= static_cast<int>(sizeof(record.text))) {
+    record.text[sizeof(record.text) - 2] = '\n';
+    record.text[sizeof(record.text) - 1] = '\0';
+  }
+  if (!logQueue.send(record)) logDropped++;
+}
+void logLine(const char* text) { logPrintf("%s\n", text); }
+void logLine(const String& text) { logLine(text.c_str()); }
+
+void serialLoggerTask(void*) {
+  LogRecord record;
+  for (;;) {
+    if (logQueue.receive(record)) {
+      const size_t length = strlen(record.text);
+      size_t offset = 0;
+      while (offset < length) {
+        const int available = Serial.availableForWrite();
+        if (available > 0) {
+          const size_t chunk = min(static_cast<size_t>(available), length - offset);
+          offset += Serial.write(reinterpret_cast<const uint8_t*>(record.text + offset), chunk);
+        }
+        vTaskDelay(1);
+      }
+    } else vTaskDelay(1);
+  }
+}
+
+class QueuedMqtt {
+public:
+  bool connected() const { return mqttConnected.load(); }
+  int state() const { return mqttState.load(); }
+  bool publish(const char* topic, const char* payload, bool retained = false) {
+    if (!connected()) return false;
+    Publication packet{};
+    if (strlen(topic) >= sizeof(packet.topic) || strlen(payload) >= sizeof(packet.payload)) {
+      mqttTxDropped++;
+      return false;
+    }
+    strcpy(packet.topic, topic);
+    strcpy(packet.payload, payload);
+    packet.retained = retained;
+    // Telemetry is a snapshot; a slow link must never create a stale backlog.
+    if (!strcmp(topic, "embedded/servo/diag")) { diagMailbox.latest(packet); return true; }
+    if (!strcmp(topic, "embedded/radar/data")) { radarMailbox.latest(packet); return true; }
+    if (publicationQueue.send(packet)) return true;
+    mqttTxDropped++;
+    return false;
+  }
+};
+
+// Fixed LEDC channels on separate timers. No attach/detach or timer allocation
+// while moving; PAN and TILT cannot change one another's PWM resolution.
+class ServoOutput {
+  int pin = -1, channel = -1, pulse = 1450;
+  bool ready = false;
+public:
+  bool attach(int gpio, int pwmChannel) {
+    pin = gpio; channel = pwmChannel;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ready = ledcAttachChannel(pin, 50, 16, channel);
+#else
+    ready = ledcSetup(channel, 50, 16) > 0;
+    if (ready) ledcAttachPin(pin, channel);
+#endif
+    return ready;
+  }
+  void write(int angle) {
+    pulse = 500 + constrain(angle, 0, 180) * 1900 / 180;
+    if (!ready) return;
+    const uint32_t duty = (static_cast<uint32_t>(pulse) * 65536UL + 10000UL) / 20000UL;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    if (!ledcWriteChannel(channel, duty)) ready = false;
+#else
+    ledcWrite(channel, duty);
+#endif
+  }
+  bool attached() const { return ready; }
+  int read() const { return (pulse - 500) * 180 / 1900; }
+  int readMicroseconds() const { return ready ? pulse : 0; }
+  int readTimerWidth() const { return 16; }
+};
+
+enum LoopStage : uint8_t {
+  LOOP_STAGE_IDLE = 0,
+  LOOP_STAGE_SERIAL = 1,
+  LOOP_STAGE_SENSOR_AND_SERVO = 2,
+  LOOP_STAGE_WIFI_RECONNECT = 3,
+  LOOP_STAGE_MQTT_CONNECT = 4,
+  LOOP_STAGE_MQTT_LOOP = 5,
+  LOOP_STAGE_TELEMETRY = 6,
+  LOOP_STAGE_MQTT_RECONFIGURE = 7,
+  LOOP_STAGE_COMMANDS = 8
+};
+
+// RTC memory keeps the last active loop stage across a watchdog reset.
+const uint32_t RTC_DIAGNOSTICS_MAGIC = 0x57445434UL;
+RTC_DATA_ATTR uint32_t rtcDiagnosticsMagic = 0;
+RTC_DATA_ATTR uint8_t rtcLastActiveLoopStage = LOOP_STAGE_IDLE;
+RTC_DATA_ATTR uint32_t rtcTaskWatchdogResetCount = 0;
+const char* bootResetReason = "UNKNOWN";
+const char* bootResetStage = "UNKNOWN";
+unsigned long loopStageStartedAt = 0;
+unsigned long slowestLoopStageMs = 0;
+LoopStage slowestLoopStage = LOOP_STAGE_IDLE;
+
 // Chân cắm Servo
 const int PAN_PIN  = 13;
 const int TILT_PIN = 27;
 
-// MG996R chính hãng chỉ quay khoảng 0..159 độ. Giới hạn 45..135 là vùng
-// khởi đầu thận trọng; đo hành trình cơ khí thực tế trước khi mở rộng.
+// Giữ giới hạn hiệu chuẩn hiện có: 45..135 là vùng khởi đầu.
+// Hành trình phụ thuộc servo và giá đỡ; đo cơ khí trước khi mở rộng.
 struct ServoConfig {
   uint32_t magic;
   float panMin, panMax, tiltMin, tiltMax;
@@ -40,9 +197,10 @@ bool preferencesReady = false;
 
 // Đối tượng hệ thống
 WiFiClient   espClient;
-PubSubClient client(espClient);
-Servo        servoPan;
-Servo        servoTilt;
+PubSubClient networkClient(espClient); // Only networkTask accesses this instance.
+QueuedMqtt   client;
+ServoOutput  servoPan;
+ServoOutput  servoTilt;
 
 // ---- Trạng thái Servo ----
 float currentPan  = 90.0f;
@@ -68,7 +226,7 @@ enum HoldDirection { HOLD_NONE, HOLD_LEFT, HOLD_RIGHT, HOLD_UP, HOLD_DOWN };
 HoldDirection holdDirection = HOLD_NONE;
 unsigned long lastHoldHeartbeat = 0;
 unsigned long lastHoldTick = 0;
-const unsigned long HOLD_TIMEOUT_MS = 300;
+const unsigned long HOLD_TIMEOUT_MS = 400;
 const float PAN_HOLD_DPS = 150.0f;
 const float TILT_HOLD_DPS = 100.0f;
 
@@ -95,8 +253,14 @@ int16_t radarXRaw = 0, radarYRaw = 0;
 unsigned long lastWifiAttempt = 0;
 unsigned long lastMqttAttempt = 0;
 bool wifiWasConnected = false;
+std::atomic<unsigned long> mqttConnectDurationMs{0};
+std::atomic<unsigned long> mqttReconnectFailures{0};
 unsigned long holdHeartbeats = 0;
-unsigned long lastHoldLog = 0;
+unsigned long manualLogWindowCount = 0;
+unsigned long manualStopWindowCount = 0;
+unsigned long lastManualLog = 0;
+bool hasLoggedManualSummary = false;
+char lastManualLogCommand[128] = "";
 
 // Buffer đọc Radar (Cơ chế chống trôi khung hình mới nhất)
 byte radarBuffer[30];
@@ -111,6 +275,52 @@ byte radarLastByte = 0;
 
 float clampPan(float angle) { return constrain(angle, config.panMin, config.panMax); }
 float clampTilt(float angle) { return constrain(angle, config.tiltMin, config.tiltMax); }
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN: return "UNKNOWN";
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXTERNAL";
+    case ESP_RST_SW: return "SOFTWARE";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "OTHER";
+  }
+}
+
+const char* loopStageName(uint8_t stage) {
+  switch (stage) {
+    case LOOP_STAGE_IDLE: return "IDLE";
+    case LOOP_STAGE_SERIAL: return "SERIAL";
+    case LOOP_STAGE_SENSOR_AND_SERVO: return "SENSOR_SERVO";
+    case LOOP_STAGE_WIFI_RECONNECT: return "WIFI_RECONNECT";
+    case LOOP_STAGE_MQTT_CONNECT: return "MQTT_CONNECT";
+    case LOOP_STAGE_MQTT_LOOP: return "MQTT_LOOP";
+    case LOOP_STAGE_TELEMETRY: return "TELEMETRY";
+    case LOOP_STAGE_MQTT_RECONFIGURE: return "MQTT_RECONFIGURE";
+    case LOOP_STAGE_COMMANDS: return "COMMANDS";
+    default: return "UNKNOWN";
+  }
+}
+
+void beginLoopStage(LoopStage stage) {
+  rtcLastActiveLoopStage = static_cast<uint8_t>(stage);
+  loopStageStartedAt = millis();
+}
+
+void endLoopStage(LoopStage stage) {
+  const unsigned long elapsed = millis() - loopStageStartedAt;
+  if (elapsed > slowestLoopStageMs) {
+    slowestLoopStageMs = elapsed;
+    slowestLoopStage = stage;
+  }
+  rtcLastActiveLoopStage = LOOP_STAGE_IDLE;
+}
 
 bool configIsValid(const ServoConfig& c) {
   return c.magic == DEFAULT_CONFIG.magic &&
@@ -151,17 +361,17 @@ bool validMqttHost(const String& host) {
 void loadConfig() {
   preferencesReady = preferences.begin("servo_cfg", false);
   if (!preferencesReady) {
-    Serial.println("[CONFIG] NVS unavailable; defaults in RAM");
+    logLine("[CONFIG] NVS unavailable; defaults in RAM");
   } else if (preferences.getBytesLength("cfg") == sizeof(ServoConfig)) {
     ServoConfig saved;
     if (preferences.getBytes("cfg", &saved, sizeof(saved)) == sizeof(saved) && configIsValid(saved)) {
       config = saved;
-      Serial.println("[CONFIG] Loaded saved calibration from NVS");
+      logLine("[CONFIG] Loaded saved calibration from NVS");
     } else {
-      Serial.println("[CONFIG] Invalid saved calibration; using safe defaults");
+      logLine("[CONFIG] Invalid saved calibration; using safe defaults");
     }
   } else {
-    Serial.println("[CONFIG] Using safe defaults");
+    logLine("[CONFIG] Using safe defaults");
   }
   if (preferencesReady) {
     const String savedHost = preferences.getString("mqtt_host", "");
@@ -172,11 +382,11 @@ void loadConfig() {
 }
 
 void printConfig() {
-  Serial.printf("[CONFIG] broker=%s:%d\n", mqttHost.c_str(), mqtt_port);
-  Serial.printf("[CONFIG] pan=%.1f..%.1f center=%.1f offset=%.1f dir=%d | tilt=%.1f..%.1f center=%.1f offset=%.1f dir=%d\n",
+  logPrintf("[CONFIG] broker=%s:%d\n", mqttHost.c_str(), mqtt_port);
+  logPrintf("[CONFIG] pan=%.1f..%.1f center=%.1f offset=%.1f dir=%d | tilt=%.1f..%.1f center=%.1f offset=%.1f dir=%d\n",
                 config.panMin, config.panMax, config.panCenter, config.panOffset, config.panDirection,
                 config.tiltMin, config.tiltMax, config.tiltCenter, config.tiltOffset, config.tiltDirection);
-  Serial.printf("[CONFIG] speed=%.0f deg/s radar_alpha=%.2f camera_height=%.0f target_height=%.0f mm lost=%s\n",
+  logPrintf("[CONFIG] speed=%.0f deg/s radar_alpha=%.2f camera_height=%.0f target_height=%.0f mm lost=%s\n",
                 config.speedDps, config.radarAlpha, config.cameraHeightMm, config.targetHeightMm,
                 config.returnOnLost ? "CENTER" : "HOLD");
 }
@@ -197,14 +407,14 @@ void publishConfigState() {
            config.returnOnLost ? "CENTER" : "HOLD", mqttHost.c_str());
   if (count <= 0 || count >= static_cast<int>(sizeof(payload)) ||
       !client.publish("embedded/servo/config/state", payload, true)) {
-    Serial.printf("[CONFIG] MQTT state publish failed, bytes=%d state=%d\n", count, client.state());
+    logPrintf("[CONFIG] MQTT state publish failed, bytes=%d state=%d\n", count, client.state());
   }
 }
 
 bool saveConfig() {
   const bool saved = preferencesReady &&
                      preferences.putBytes("cfg", &config, sizeof(config)) == sizeof(config);
-  if (!saved) Serial.println("[CONFIG] NVS save failed; values valid only until restart");
+  if (!saved) logLine("[CONFIG] NVS save failed; values valid only until restart");
   printConfig();
   publishConfigState();
   return saved;
@@ -232,7 +442,7 @@ void radarToServoAngles(float xMm, float yMm) {
 
   if (millis() - lastAutoLog >= RADAR_LOG_MS) {
     lastAutoLog = millis();
-    Serial.printf("[AUTO] targetPan=%.1f targetTilt=%.1f requested=%.1f/%.1f limit=%s%s (X=%.0f Y=%.0f)\n",
+    logPrintf("[AUTO] targetPan=%.1f targetTilt=%.1f requested=%.1f/%.1f limit=%s%s (X=%.0f Y=%.0f)\n",
                   targetPan, targetTilt, requestedPan, requestedTilt,
                   fabsf(nextPan - requestedPan) > 0.1f ? "PAN " : "",
                   fabsf(nextTilt - requestedTilt) > 0.1f ? "TILT" : "",
@@ -256,7 +466,7 @@ void publishModeState() {
 }
 
 void setup_wifi() {
-  Serial.print("\n[WiFi] Connecting to "); Serial.println(ssid);
+  logPrintf("[WiFi] Connecting to %s\n", ssid);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(ssid, password);
@@ -264,64 +474,157 @@ void setup_wifi() {
   lastMqttAttempt = millis() - 5000UL;
 }
 
-void reconnect() {
-  if (client.connected() || WiFi.status() != WL_CONNECTED) return;
+// Parse manual commands without Arduino String allocations on the hot path.
+bool parseDecimalToken(const char*& cursor, uint64_t& value) {
+  value = 0;
+  if (*cursor < '0' || *cursor > '9') return false;
+  while (*cursor >= '0' && *cursor <= '9') {
+    const unsigned int digit = *cursor++ - '0';
+    if (value > (UINT64_MAX - digit) / 10) return false;
+    value = value * 10 + digit;
+  }
+  if (*cursor != ':') return false;
+  ++cursor;
+  return true;
+}
 
-  lastMqttAttempt = millis();
-  Serial.print("Ket noi MQTT... ");
-  if (client.connect("ESP32_AI_Tracking", "embedded/servo/online", 1, true, "OFFLINE")) {
-    Serial.println("OK!");
-    if (!client.publish("embedded/servo/online", "ONLINE", true)) {
-      Serial.println("[MQTT] Khong gui duoc trang thai ONLINE");
+bool parseManualPacket(const char* payload, uint64_t& epoch, uint64_t& sequence, const char*& direction) {
+  direction = payload;
+  epoch = sequence = 0;
+  if (*direction == '@') {
+    ++direction;
+    if (!parseDecimalToken(direction, epoch) || !parseDecimalToken(direction, sequence)) return false;
+  }
+  return !strcmp(direction, "LEFT") || !strcmp(direction, "RIGHT") ||
+         !strcmp(direction, "UP") || !strcmp(direction, "DOWN") ||
+         !strcmp(direction, "RESET") || !strcmp(direction, "STOP") ||
+         !strcmp(direction, "HOLD_LEFT") || !strcmp(direction, "HOLD_RIGHT") ||
+         !strcmp(direction, "HOLD_UP") || !strcmp(direction, "HOLD_DOWN");
+}
+
+void captureMqttCommand(char* topic, byte* payload, unsigned int length) {
+  IncomingCommand command{};
+  if (length >= sizeof(command.payload) || strlen(topic) >= sizeof(command.topic) || memchr(payload, 0, length)) {
+    mqttRxDropped++;
+    return;
+  }
+  strcpy(command.topic, topic);
+  for (unsigned int i = 0; i < length; ++i) command.payload[i] = toupper(static_cast<unsigned char>(payload[i]));
+  command.receivedAt = millis();
+  if (!strcmp(topic, "embedded/servo/manual")) {
+    // Filter stale sequences BEFORE overwriting the one-slot mailbox, so an
+    // old HOLD can never replace a newer STOP that loop() has not read yet.
+    static uint64_t epochSeen = 0, sequenceSeen = 0;
+    static bool sequencedSeen = false;
+    uint64_t epoch, sequence;
+    const char* direction;
+    if (!parseManualPacket(command.payload, epoch, sequence, direction)) { mqttRxDropped++; return; }
+    if (command.payload[0] == '@') {
+      if (sequencedSeen && (epoch < epochSeen || (epoch == epochSeen && sequence <= sequenceSeen))) {
+        mqttRxDropped++;
+        return;
+      }
+      epochSeen = epoch; sequenceSeen = sequence; sequencedSeen = true;
     }
-    client.subscribe("embedded/servo/manual", 1);
-    client.subscribe("embedded/servo/tracking");
-    client.subscribe("embedded/servo/mode", 1);
-    client.subscribe("embedded/servo/buzzer");
-    client.subscribe("embedded/servo/config", 1);
-    publishModeState();
-    publishConfigState();
-  } else {
-    Serial.print("That bai, ma loi: ");
-    Serial.println(client.state());
+    manualMailbox.latest(command);
+  } else if (!strcmp(topic, "embedded/servo/tracking")) {
+    visionMailbox.latest(command);
+  } else if (!commandQueue.send(command)) mqttRxDropped++;
+}
+
+void networkTask(void*) {
+  // This is the ONLY task allowed to access networkClient/espClient.
+  networkClient.setServer(networkBroker, mqtt_port);
+  networkClient.setSocketTimeout(1);
+  networkClient.setKeepAlive(15);
+  if (!networkClient.setBufferSize(1536)) {
+    logLine("[FATAL] MQTT buffer allocation failed; network disabled");
+    for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  networkClient.setCallback(captureMqttCommand);
+  espClient.setConnectionTimeout(300);
+  Publication packet;
+  BrokerSetting setting;
+  bool previouslyConnected = false;
+  for (;;) {
+    if (brokerMailbox.receive(setting)) {
+      mqttConnected = false;
+      if (networkClient.connected()) networkClient.publish("embedded/servo/online", "OFFLINE", true);
+      networkClient.disconnect();
+      strcpy(networkBroker, setting.host);
+      networkClient.setServer(networkBroker, mqtt_port);
+      lastMqttAttempt = millis() - 5000UL;
+      logPrintf("[MQTT] Broker=%s; reconnect scheduled\n", networkBroker);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiWasConnected) {
+        wifiWasConnected = false;
+        mqttConnected = false;
+        networkClient.disconnect();
+        logLine("[WiFi] Disconnected; local servo/radar loop remains active");
+      }
+      if (millis() - lastWifiAttempt >= 10000) {
+        rtcNetworkStage = LOOP_STAGE_WIFI_RECONNECT;
+        lastWifiAttempt = millis();
+        WiFi.disconnect();
+        WiFi.begin(ssid, password);
+      }
+    } else {
+      if (!wifiWasConnected) {
+        wifiWasConnected = true;
+        logPrintf("[WiFi] Connected IP=%s\n", WiFi.localIP().toString().c_str());
+      }
+      if (!networkClient.connected() && millis() - lastMqttAttempt >= 5000) {
+        rtcNetworkStage = LOOP_STAGE_MQTT_CONNECT;
+        lastMqttAttempt = millis();
+        const uint32_t started = millis();
+        const bool connected = networkClient.connect(mqttClientId, "embedded/servo/online", 1, true, "OFFLINE");
+        mqttConnectDurationMs = millis() - started;
+        if (connected) {
+          espClient.setNoDelay(true);
+          networkClient.publish("embedded/servo/online", "ONLINE", true);
+          networkClient.subscribe("embedded/servo/manual", 1);
+          networkClient.subscribe("embedded/servo/tracking");
+          networkClient.subscribe("embedded/servo/mode", 1);
+          networkClient.subscribe("embedded/servo/buzzer");
+          networkClient.subscribe("embedded/servo/config", 1);
+          mqttConnected = true;
+          mqttJustConnected = true;
+        } else mqttReconnectFailures++;
+        logPrintf("[MQTT] id=%s broker=%s connected=%d state=%d connect_ms=%lu\n",
+                  mqttClientId, networkBroker, connected, networkClient.state(), mqttConnectDurationMs.load());
+      }
+      if (networkClient.connected()) {
+        rtcNetworkStage = LOOP_STAGE_MQTT_LOOP;
+        networkClient.loop();
+        // Bound work per turn and service inbound commands between publications.
+        for (int i = 0; i < 2 && publicationQueue.receive(packet); ++i) {
+          if (!networkClient.publish(packet.topic, packet.payload, packet.retained)) mqttTxDropped++;
+          networkClient.loop();
+        }
+        if (diagMailbox.receive(packet) && !networkClient.publish(packet.topic, packet.payload)) mqttTxDropped++;
+        if (radarMailbox.receive(packet) && !networkClient.publish(packet.topic, packet.payload)) mqttTxDropped++;
+      }
+    }
+    mqttConnected = networkClient.connected();
+    mqttState = networkClient.state();
+    if (!mqttConnected.load() && previouslyConnected) {
+      // Never replay an old configuration response/telemetry after reconnect.
+      while (publicationQueue.receive(packet)) {}
+      diagMailbox.receive(packet);
+      radarMailbox.receive(packet);
+    }
+    previouslyConnected = mqttConnected.load();
+    rtcNetworkStage = LOOP_STAGE_IDLE;
+    vTaskDelay(1);
   }
 }
 
 // ================= XỬ LÝ LỆNH MQTT =================
-bool parseUint64Decimal(const String& input, uint64_t& value) {
-  if (input.length() == 0) return false;
-  const uint64_t maxValue = static_cast<uint64_t>(-1);
-  value = 0;
-  for (unsigned int i = 0; i < input.length(); i++) {
-    const char digitChar = input[i];
-    if (digitChar < '0' || digitChar > '9') return false;
-    const uint8_t digit = static_cast<uint8_t>(digitChar - '0');
-    if (value > (maxValue - digit) / 10) return false;
-    value = value * 10 + digit;
-  }
-  return true;
-}
-
-bool parseSequencedManualCommand(const String& payload, uint64_t& epoch,
-                                 uint64_t& sequence, String& direction) {
-  if (!payload.startsWith("@")) return false;
-  const int epochEnd = payload.indexOf(':', 1);
-  const int sequenceEnd = epochEnd >= 0 ? payload.indexOf(':', epochEnd + 1) : -1;
-  if (epochEnd < 0 || sequenceEnd < 0 || payload.indexOf(':', sequenceEnd + 1) >= 0) {
-    return false;
-  }
-  if (!parseUint64Decimal(payload.substring(1, epochEnd), epoch) ||
-      !parseUint64Decimal(payload.substring(epochEnd + 1, sequenceEnd), sequence)) {
-    return false;
-  }
-  direction = payload.substring(sequenceEnd + 1);
-  return direction.length() > 0;
-}
-
 void printServoDiagnostics(bool force = false);
 
 void reportConfigResult(bool ok, const String& message) {
-  Serial.printf("[CONFIG] %s %s\n", ok ? "OK" : "ERR", message.c_str());
+  logPrintf("[CONFIG] %s %s\n", ok ? "OK" : "ERR", message.c_str());
   if (client.connected()) {
     String payload = String(ok ? "OK:" : "ERR:") + message;
     client.publish("embedded/servo/config/result", payload.c_str());
@@ -346,7 +649,7 @@ void processConfigCommand(String command) {
     return;
   }
   if (command == "HELP") {
-    Serial.println("[CONFIG] STATUS TEST_PAN TEST_TILT CENTER DEFAULTS; KEY=VALUE: PAN/TILT_MIN/MAX/CENTER/OFFSET/DIR, SPEED_DPS, RADAR_ALPHA, CAMERA_HEIGHT_MM, TARGET_HEIGHT_MM, LOST_ACTION, MQTT_HOST");
+    logLine("[CONFIG] STATUS TEST_PAN TEST_TILT CENTER DEFAULTS; KEY=VALUE: PAN/TILT_MIN/MAX/CENTER/OFFSET/DIR, SPEED_DPS, RADAR_ALPHA, CAMERA_HEIGHT_MM, TARGET_HEIGHT_MM, LOST_ACTION, MQTT_HOST");
     reportConfigResult(true, "HELP");
     return;
   }
@@ -356,7 +659,7 @@ void processConfigCommand(String command) {
   }
   if (command == "TEST_PAN" || command == "TEST_TILT") {
     const bool pan = command == "TEST_PAN";
-    Servo& servo = pan ? servoPan : servoTilt;
+    ServoOutput& servo = pan ? servoPan : servoTilt;
     const float position = pan ? currentPan : currentTilt;
     const float low = pan ? config.panMin : config.tiltMin;
     const float high = pan ? config.panMax : config.tiltMax;
@@ -418,7 +721,7 @@ void processConfigCommand(String command) {
     mqttHost = rawValue;
     const bool saved = preferencesReady &&
                        preferences.putString("mqtt_host", mqttHost) == mqttHost.length();
-    if (!saved) Serial.println("[CONFIG] MQTT host NVS save failed; value valid only until restart");
+    if (!saved) logLine("[CONFIG] MQTT host NVS save failed; value valid only until restart");
     printConfig();
     publishConfigState();
     printServoDiagnostics(true);
@@ -485,118 +788,89 @@ void readSerialCommands() {
     } else {
       serialCommandLength = 0;
       discardSerialLine = true;
-      Serial.println("[CONFIG] Serial command too long; discarded");
+      logLine("[CONFIG] Serial command too long; discarded");
     }
   }
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg = "";
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-  msg.toUpperCase();
-  String t = String(topic);
-
-  // A held joystick sends frequent heartbeats. Log entry and a periodic count,
-  // rather than printing every packet and stalling the command loop on UART.
-  const bool holdHeartbeat = t == "embedded/servo/manual" && msg.indexOf("HOLD_") >= 0;
-  if (!holdHeartbeat || millis() - lastHoldLog >= 2000) {
-    Serial.print("[MQTT] Kenh: "); Serial.print(t);
-    Serial.print(" | Lenh: "); Serial.println(msg);
-    if (holdHeartbeat) lastHoldLog = millis();
+void handleManualCommand(const IncomingCommand& packet) {
+  uint64_t epoch, sequence;
+  const char* direction;
+  if (!parseManualPacket(packet.payload, epoch, sequence, direction)) { mqttRxDropped++; return; }
+  const bool stop = !strcmp(direction, "STOP");
+  if ((!isManualMode && !stop) || (!stop && millis() - packet.receivedAt > HOLD_TIMEOUT_MS)) {
+    mqttRxDropped++;
+    return;
   }
-  if (holdHeartbeat) holdHeartbeats++;
+  if (packet.payload[0] == '@') {
+    if (hasSequencedManualCommand &&
+        (epoch < lastManualEpoch || (epoch == lastManualEpoch && sequence <= lastManualSequence))) {
+      mqttRxDropped++;
+      return;
+    }
+    lastManualEpoch = epoch; lastManualSequence = sequence; hasSequencedManualCommand = true;
+  }
+  manualLogWindowCount++;
+  if (stop) manualStopWindowCount++;
+  snprintf(lastManualLogCommand, sizeof(lastManualLogCommand), "%s", packet.payload);
+  lastManualCommandAt = millis();
+  manualCommandsAccepted++;
+  servoTestAxis = 0;
+  if (!strncmp(direction, "HOLD_", 5)) {
+    holdHeartbeats++;
+    const HoldDirection requested = !strcmp(direction, "HOLD_LEFT") ? HOLD_LEFT :
+                                    !strcmp(direction, "HOLD_RIGHT") ? HOLD_RIGHT :
+                                    !strcmp(direction, "HOLD_UP") ? HOLD_UP : HOLD_DOWN;
+    if (holdDirection != requested) {
+      targetPan = currentPan; targetTilt = currentTilt;
+      lastHoldTick = millis() - SERVO_UPDATE_MS;
+    }
+    holdDirection = requested;
+    lastHoldHeartbeat = packet.receivedAt;
+    return;
+  }
+  holdDirection = HOLD_NONE;
+  if      (!strcmp(direction, "LEFT"))  targetPan += 12;
+  else if (!strcmp(direction, "RIGHT")) targetPan -= 12;
+  else if (!strcmp(direction, "UP"))    targetTilt -= 7;
+  else if (!strcmp(direction, "DOWN"))  targetTilt += 7;
+  else if (stop) { targetPan = currentPan; targetTilt = currentTilt; }
+  else if (!strcmp(direction, "RESET")) {
+    targetPan = config.panCenter + config.panOffset;
+    targetTilt = config.tiltCenter + config.tiltOffset;
+  }
+  targetPan = clampPan(targetPan);
+  targetTilt = clampTilt(targetTilt);
+}
 
+void handleMqttCommand(const IncomingCommand& packet) {
+  if (!strcmp(packet.topic, "embedded/servo/manual")) {
+    handleManualCommand(packet);
+    return;
+  }
+  // Only low-rate configuration and vision parsing use temporary Strings.
+  // Both are bounded by the fixed 127-byte input limit.
+  String msg(packet.payload);
+  String t(packet.topic);
   if (t == "embedded/servo/config") {
     processConfigCommand(msg);
     return;
   }
-
   if (t == "embedded/servo/mode") {
-    if (msg == "MANUAL") {
-      isManualMode = true;
-      holdDirection = HOLD_NONE;
-      servoTestAxis = 0;
-      targetPan = currentPan;
-      targetTilt = currentTilt;
-      Serial.println("[MODE] >> THU CONG (Manual)");
-    } else if (msg == "AUTO") {
-      isManualMode = false;
-      holdDirection = HOLD_NONE;
-      servoTestAxis = 0;
-      Serial.println("[MODE] >> TU DONG (Radar Auto-Tracking)");
-      if (hasTarget && millis() - lastTargetTime < TARGET_LOST_TIMEOUT) {
-        radarToServoAngles(smoothX, smoothY);
-      }
+    if (msg != "MANUAL" && msg != "AUTO") return;
+    isManualMode = msg == "MANUAL";
+    holdDirection = HOLD_NONE;
+    servoTestAxis = 0;
+    targetPan = currentPan;
+    targetTilt = currentTilt;
+    if (!isManualMode && hasTarget && millis() - lastTargetTime < TARGET_LOST_TIMEOUT) {
+      radarToServoAngles(smoothX, smoothY);
     }
+    logPrintf("[MODE] %s\n", isManualMode ? "MANUAL" : "AUTO");
     publishModeState();
     return;
   }
-
-  if (t == "embedded/servo/manual") {
-    // A delayed joystick packet must not silently cancel an explicit AUTO command.
-    if (!isManualMode) {
-      Serial.println("[MANUAL] Ignored: mode is AUTO");
-      return;
-    }
-
-    String direction = msg;
-    const bool isSequenced = msg.startsWith("@");
-    uint64_t epoch = 0, sequence = 0;
-    if (isSequenced && !parseSequencedManualCommand(msg, epoch, sequence, direction)) {
-      Serial.println("[MANUAL] Ignored malformed sequence");
-      return;
-    }
-    if (direction != "LEFT" && direction != "RIGHT" && direction != "UP" &&
-        direction != "DOWN" && direction != "RESET" && direction != "STOP" &&
-        direction != "HOLD_LEFT" && direction != "HOLD_RIGHT" &&
-        direction != "HOLD_UP" && direction != "HOLD_DOWN") {
-      Serial.println("[MANUAL] Ignored unknown direction");
-      return;
-    }
-    if (isSequenced) {
-      if (hasSequencedManualCommand &&
-          (epoch < lastManualEpoch || (epoch == lastManualEpoch && sequence <= lastManualSequence))) {
-        Serial.println("[MANUAL] Ignored stale sequence");
-        return;
-      }
-      lastManualEpoch = epoch;
-      lastManualSequence = sequence;
-      hasSequencedManualCommand = true;
-    }
-
-    lastManualCommandAt = millis();
-    manualCommandsAccepted++;
-
-    servoTestAxis = 0;
-    if (direction.startsWith("HOLD_")) {
-      const HoldDirection requested = direction == "HOLD_LEFT" ? HOLD_LEFT :
-                                      direction == "HOLD_RIGHT" ? HOLD_RIGHT :
-                                      direction == "HOLD_UP" ? HOLD_UP : HOLD_DOWN;
-      if (holdDirection != requested) {
-        // A new held direction starts at the last commanded position.
-        targetPan = currentPan;
-        targetTilt = currentTilt;
-        lastHoldTick = millis();
-      }
-      holdDirection = requested;
-      lastHoldHeartbeat = millis();
-      return;
-    }
-    holdDirection = HOLD_NONE;
-    if      (direction == "LEFT")  targetPan  += 12;
-    else if (direction == "RIGHT") targetPan  -= 12;
-    else if (direction == "UP")    targetTilt -= 7;
-    else if (direction == "DOWN")  targetTilt += 7;
-    else if (direction == "STOP")  { targetPan = currentPan; targetTilt = currentTilt; }
-    else if (direction == "RESET") {
-      targetPan = config.panCenter + config.panOffset;
-      targetTilt = config.tiltCenter + config.tiltOffset;
-    }
-
-    targetPan = clampPan(targetPan);
-    targetTilt = clampTilt(targetTilt);
-    return;
-  }
+  if (millis() - packet.receivedAt > 500) return;
 
   if (t == "embedded/servo/tracking" && !isManualMode) {
     // Radar is the primary source while it is reporting a live target.
@@ -728,7 +1002,7 @@ void printRadarSample() {
   const unsigned long now = millis();
   if (now - lastRadarLog < RADAR_LOG_MS || lastTargetTime <= lastRadarLog) return;
   lastRadarLog = now;
-  Serial.printf("[RADAR] X=%d mm Y=%d mm speed=%.2f m/s\n",
+  logPrintf("[RADAR] X=%d mm Y=%d mm speed=%.2f m/s\n",
                 radarXRaw, radarYRaw, radarSpeedMs);
 }
 
@@ -740,7 +1014,7 @@ void printRadarDiagnostics() {
   lastRadarFps = frameRate;
   lastRadarFrameSnapshot = radarFramesReceived;
   lastRadarDiagnostics = millis();
-  Serial.printf(
+  logPrintf(
     "[RADAR-DIAG] bytes=%lu frames=%lu fps=%.1f bad_footer_candidates=%lu with_target=%lu age_ms=%lu active=%s uart_pending=%d last=0x%02X mode=%s\n",
     radarBytesReceived,
     radarFramesReceived,
@@ -754,9 +1028,9 @@ void printRadarDiagnostics() {
     isManualMode ? "MANUAL" : "AUTO"
   );
   if (millis() > 5000 && radarBytesReceived == 0) {
-    Serial.println("[RADAR-WARN] No UART bytes; check LD2450 5V/GND and TX -> ESP32 GPIO16");
+    logLine("[RADAR-WARN] No UART bytes; check LD2450 5V/GND and TX -> ESP32 GPIO16");
   } else if (radarBytesReceived > 0 && newFrames == 0) {
-    Serial.println("[RADAR-WARN] UART bytes but no valid frames; check 256000 baud and wiring");
+    logLine("[RADAR-WARN] UART bytes but no valid frames; check 256000 baud and wiring");
   }
 }
 
@@ -770,7 +1044,7 @@ void updateTargetTimeout() {
       targetPan = clampPan(config.panCenter + config.panOffset);
       targetTilt = clampTilt(config.tiltCenter + config.tiltOffset);
     }
-    Serial.printf("[AUTO] Radar target lost after %lu ms; action=%s; vision_age_ms=%lu\n",
+    logPrintf("[AUTO] Radar target lost after %lu ms; action=%s; vision_age_ms=%lu\n",
                   millis() - lastTargetTime,
                   visionIsFresh ? "VISION" : (config.returnOnLost ? "CENTER" : "HOLD"),
                   lastVisionTargetTime ? millis() - lastVisionTargetTime : 0UL);
@@ -781,11 +1055,11 @@ void updateTargetTimeout() {
 void updateManualHold() {
   if (holdDirection == HOLD_NONE) return;
   const unsigned long now = millis();
-  if (!isManualMode || now - lastHoldHeartbeat > HOLD_TIMEOUT_MS) {
+  if (!isManualMode || !client.connected() || now - lastHoldHeartbeat > HOLD_TIMEOUT_MS) {
     holdDirection = HOLD_NONE;
     targetPan = currentPan;
     targetTilt = currentTilt;
-    Serial.println("[MANUAL] HOLD timeout/exit -> STOP");
+    logLine("[MANUAL] HOLD timeout/exit -> STOP");
     return;
   }
   const unsigned long elapsed = min(now - lastHoldTick, 50UL);
@@ -802,7 +1076,7 @@ void updateServoTest() {
   if (servoTestAxis == 0 || static_cast<int32_t>(millis() - servoTestReturnAt) < 0) return;
   if (servoTestAxis == 'P') targetPan = clampPan(servoTestReturnAngle);
   else targetTilt = clampTilt(servoTestReturnAngle);
-  Serial.printf("[SERVO-TEST] %c return to %.1f deg\n", servoTestAxis, servoTestReturnAngle);
+  logPrintf("[SERVO-TEST] %c return to %.1f deg\n", servoTestAxis, servoTestReturnAngle);
   servoTestAxis = 0;
 }
 
@@ -835,7 +1109,7 @@ void printServoDiagnostics(bool force) {
   if (!force && millis() - lastServoDiagnostics < 2000) return;
   lastServoDiagnostics = millis();
   // cmd/pulse_us are values requested from the servo library, not shaft feedback.
-  Serial.printf(
+  logPrintf(
     "[SERVO-DIAG] mode=%s hold=%d test=%c target=%.1f/%.1f current=%.1f/%.1f cmd=%d/%d pulse_us=%d/%d attached=%d/%d\n",
     isManualMode ? "MANUAL" : "AUTO", holdDirection, servoTestAxis ? servoTestAxis : '-',
     targetPan, targetTilt, currentPan, currentTilt,
@@ -843,7 +1117,7 @@ void printServoDiagnostics(bool force) {
     servoPan.attached(), servoTilt.attached()
   );
   if (client.connected()) {
-    char payload[640];
+    static char payload[1400];
     const int count = snprintf(payload, sizeof(payload),
       "{\"fw\":\"%s\",\"mode\":\"%s\",\"target_pan\":%.1f,\"target_tilt\":%.1f,"
       "\"command_pan\":%.1f,\"command_tilt\":%.1f,"
@@ -852,7 +1126,14 @@ void printServoDiagnostics(bool force) {
       "\"radar_age_ms\":%ld,\"radar_fps\":%.1f,\"vision_age_ms\":%ld,"
       "\"wifi_rssi\":%d,\"loop_gap_ms\":%lu,\"free_heap\":%lu,"
       "\"manual_age_ms\":%ld,\"manual_count\":%lu,\"hold_heartbeats\":%lu,"
-      "\"pan_at_limit\":%s,\"tilt_at_limit\":%s}",
+      "\"pan_at_limit\":%s,\"tilt_at_limit\":%s,"
+      "\"boot_reset_reason\":\"%s\",\"boot_reset_stage\":\"%s\","
+      "\"task_wdt_count\":%lu,\"slow_loop_stage\":\"%s\",\"slow_loop_stage_ms\":%lu,"
+      "\"mqtt_connect_ms\":%lu,\"mqtt_reconnect_failures\":%lu,"
+      "\"uptime_ms\":%lu,\"min_free_heap\":%lu,\"largest_free_block\":%lu,"
+      "\"loop_stack_free\":%lu,\"network_stack_free\":%lu,"
+      "\"rx_dropped\":%lu,\"tx_dropped\":%lu,\"log_dropped\":%lu,"
+      "\"boot_network_stage\":\"%s\",\"hold_timeout_ms\":%lu}",
       FW_VERSION, isManualMode ? "MANUAL" : "AUTO", targetPan, targetTilt,
       currentPan, currentTilt, servoPan.readMicroseconds(), servoTilt.readMicroseconds(),
       servoPan.attached() ? "true" : "false", servoTilt.attached() ? "true" : "false",
@@ -865,10 +1146,20 @@ void printServoDiagnostics(bool force) {
       lastManualCommandAt ? static_cast<long>(millis() - lastManualCommandAt) : -1L,
       manualCommandsAccepted, holdHeartbeats,
       (targetPan <= config.panMin + 0.5f || targetPan >= config.panMax - 0.5f) ? "true" : "false",
-      (targetTilt <= config.tiltMin + 0.5f || targetTilt >= config.tiltMax - 0.5f) ? "true" : "false");
+      (targetTilt <= config.tiltMin + 0.5f || targetTilt >= config.tiltMax - 0.5f) ? "true" : "false",
+      bootResetReason, bootResetStage,
+      static_cast<unsigned long>(rtcTaskWatchdogResetCount),
+      loopStageName(static_cast<uint8_t>(slowestLoopStage)), slowestLoopStageMs,
+      mqttConnectDurationMs.load(), mqttReconnectFailures.load(), millis(),
+      static_cast<unsigned long>(ESP.getMinFreeHeap()),
+      static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+      static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)),
+      networkTaskHandle ? static_cast<unsigned long>(uxTaskGetStackHighWaterMark(networkTaskHandle)) : 0UL,
+      static_cast<unsigned long>(mqttRxDropped.load()), static_cast<unsigned long>(mqttTxDropped.load()),
+      static_cast<unsigned long>(logDropped.load()), loopStageName(bootNetworkStage), HOLD_TIMEOUT_MS);
     if (count <= 0 || count >= static_cast<int>(sizeof(payload)) ||
         !client.publish("embedded/servo/diag", payload)) {
-      Serial.printf("[MQTT] diag publish failed, state=%d bytes=%d\n", client.state(), count);
+      logPrintf("[MQTT] diag publish failed, state=%d bytes=%d\n", client.state(), count);
     }
   }
 }
@@ -876,39 +1167,100 @@ void printServoDiagnostics(bool force) {
 void printNetDiagnostics() {
   if (millis() - lastNetDiagnostics < 5000) return;
   lastNetDiagnostics = millis();
-  Serial.printf("[NET-DIAG] wifi=%d rssi=%d mqtt=%d mqtt_state=%d max_loop_gap_ms=%lu free_heap=%lu manual=%lu hold_rx=%lu\n",
+  logPrintf("[NET-DIAG] wifi=%d rssi=%d mqtt=%d mqtt_state=%d max_loop_gap_ms=%lu slow_stage=%s/%lums free_heap=%lu manual=%lu hold_rx=%lu\n",
                 WiFi.status() == WL_CONNECTED, WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -127,
                 client.connected(), client.state(), maxLoopGapMs,
+                loopStageName(static_cast<uint8_t>(slowestLoopStage)), slowestLoopStageMs,
                 static_cast<unsigned long>(ESP.getFreeHeap()),
                 manualCommandsAccepted, holdHeartbeats);
+  logPrintf("[MEM-DIAG] heap=%lu min=%lu largest=%lu loop_stack=%lu net_stack=%lu rx_drop=%lu tx_drop=%lu log_drop=%lu uptime_ms=%lu\n",
+            static_cast<unsigned long>(ESP.getFreeHeap()), static_cast<unsigned long>(ESP.getMinFreeHeap()),
+            static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+            static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)),
+            networkTaskHandle ? static_cast<unsigned long>(uxTaskGetStackHighWaterMark(networkTaskHandle)) : 0UL,
+            static_cast<unsigned long>(mqttRxDropped.load()), static_cast<unsigned long>(mqttTxDropped.load()),
+            static_cast<unsigned long>(logDropped.load()), millis());
   if (maxLoopGapMs > 100) {
-    Serial.println("[NET-DIAG] Loop was blocked; PWM stays active but new radar/MQTT commands waited");
+    logLine("[NET-DIAG] Loop was blocked; PWM stays active but new radar/MQTT commands waited");
   }
   if (WiFi.status() == WL_CONNECTED && WiFi.RSSI() < -75) {
-    Serial.println("[NET-WARN] Weak WiFi signal may delay joystick/MQTT messages");
+    logLine("[NET-WARN] Weak WiFi signal may delay joystick/MQTT messages");
   }
   maxLoopGapMs = 0;
+  slowestLoopStageMs = 0;
+  slowestLoopStage = LOOP_STAGE_IDLE;
+}
+
+void printManualMqttSummary() {
+  if (manualLogWindowCount == 0) return;
+  const unsigned long now = millis();
+  if (hasLoggedManualSummary && now - lastManualLog < 2000) return;
+
+  // Queue one summary for the logger task; loop() never waits for UART TX.
+  logPrintf("[MQTT-MANUAL] last=%s rx_since_log=%lu stop_since_log=%lu hold_total=%lu\n",
+                lastManualLogCommand, manualLogWindowCount,
+                manualStopWindowCount, holdHeartbeats);
+  manualLogWindowCount = 0;
+  manualStopWindowCount = 0;
+  lastManualLog = now;
+  hasLoggedManualSummary = true;
 }
 
 void applyMqttHostChange() {
   if (!mqttHostChanged) return;
-  if (client.connected()) client.publish("embedded/servo/online", "OFFLINE", true);
-  client.disconnect();
-  client.setServer(mqttHost.c_str(), mqtt_port);
-  lastMqttAttempt = millis() - 5000UL;
+  BrokerSetting setting{};
+  mqttHost.toCharArray(setting.host, sizeof(setting.host));
+  brokerMailbox.latest(setting);
   mqttHostChanged = false;
-  Serial.println("[MQTT] Broker updated; reconnecting to " + mqttHost);
+}
+
+void serviceIncomingCommands() {
+  if (mqttJustConnected.exchange(false)) {
+    publishModeState();
+    publishConfigState();
+    printServoDiagnostics(true);
+  }
+  IncomingCommand command;
+  for (int i = 0; i < 2 && commandQueue.receive(command); ++i) handleMqttCommand(command);
+  if (manualMailbox.receive(command)) handleManualCommand(command);
+  if (visionMailbox.receive(command)) handleMqttCommand(command);
 }
 
 // ================= SETUP =================
 void setup() {
+  Serial.setTxBufferSize(1024);
   Serial.begin(115200);
+  logQueue.begin(); commandQueue.begin(); manualMailbox.begin(); visionMailbox.begin();
+  publicationQueue.begin(); diagMailbox.begin(); radarMailbox.begin(); brokerMailbox.begin();
+  if (xTaskCreatePinnedToCore(serialLoggerTask, "servo-log", 3072, nullptr, 1, &loggerTaskHandle, 0) != pdPASS) {
+    Serial.println("[FATAL] Logger task allocation failed; setup stopped");
+    return;
+  }
+  bootNetworkStage = rtcNetworkStage;
+  rtcNetworkStage = LOOP_STAGE_IDLE;
   const esp_reset_reason_t resetReason = esp_reset_reason();
-  Serial.printf("[BOOT] fw=%s board=ESP32 DevKit reset_reason=%d free_heap=%lu\n",
-                FW_VERSION, static_cast<int>(resetReason),
+  if (rtcDiagnosticsMagic != RTC_DIAGNOSTICS_MAGIC || resetReason == ESP_RST_POWERON) {
+    rtcDiagnosticsMagic = RTC_DIAGNOSTICS_MAGIC;
+    rtcLastActiveLoopStage = LOOP_STAGE_IDLE;
+    rtcTaskWatchdogResetCount = 0;
+    bootNetworkStage = LOOP_STAGE_IDLE;
+  }
+  const uint8_t previousLoopStage = rtcLastActiveLoopStage;
+  bootResetReason = resetReasonName(resetReason);
+  bootResetStage = loopStageName(previousLoopStage);
+  if (resetReason == ESP_RST_TASK_WDT) {
+    rtcTaskWatchdogResetCount++;
+  } else if (resetReason == ESP_RST_POWERON) {
+    rtcTaskWatchdogResetCount = 0;
+  }
+  logPrintf("[BOOT] fw=%s board=ESP32 DevKit reset_reason=%d(%s) previous_loop_stage=%s task_wdt_count=%lu free_heap=%lu\n",
+                FW_VERSION, static_cast<int>(resetReason), bootResetReason, bootResetStage,
+                static_cast<unsigned long>(rtcTaskWatchdogResetCount),
                 static_cast<unsigned long>(ESP.getFreeHeap()));
+  rtcLastActiveLoopStage = LOOP_STAGE_IDLE;
+  logPrintf("[BOOT-NET] previous_network_stage=%s\n", loopStageName(bootNetworkStage));
   if (resetReason == ESP_RST_BROWNOUT) {
-    Serial.println("[POWER-WARN] Brownout reset; measure 5V rail at servo/ESP32 during motion");
+    logLine("[POWER-WARN] Brownout reset; measure 5V rail at servo/ESP32 during motion");
   }
   loadConfig();
   printConfig();
@@ -917,76 +1269,67 @@ void setup() {
   Serial2.setRxBufferSize(1024);
   Serial2.begin(256000, SERIAL_8N1, 16, 17);
 
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-  servoPan.setPeriodHertz(50);
-  servoTilt.setPeriodHertz(50);
-  servoPan.attach(PAN_PIN,  500, 2400);
-  servoTilt.attach(TILT_PIN, 500, 2400);
-  // Installed ESP32Servo defaults to 10-bit PWM (~19.5 us at 50 Hz).
-  // Raise to 16 bits after attach (attach resets the width) for <1 us steps.
-  servoPan.setTimerWidth(16);
-  servoTilt.setTimerWidth(16);
+  servoPan.attach(PAN_PIN, 0);
+  servoTilt.attach(TILT_PIN, 2);
 
   servoPan.write(static_cast<int>(roundf(currentPan)));
   servoTilt.write(static_cast<int>(roundf(currentTilt)));
-  Serial.printf("[SERVO-SETUP] PAN GPIO%d attached=%d, TILT GPIO%d attached=%d PWM=50Hz/%dbit/%dbit\n",
+  logPrintf("[SERVO-SETUP] PAN GPIO%d attached=%d, TILT GPIO%d attached=%d PWM=50Hz/%dbit/%dbit\n",
                 PAN_PIN, servoPan.attached(), TILT_PIN, servoTilt.attached(),
                 servoPan.readTimerWidth(), servoTilt.readTimerWidth());
-  Serial.println("[POWER] Servo rail voltage/current is NOT measured by ESP32; measure 5V at MG996R under load");
+  logLine("[POWER] Servo rail voltage/current is NOT measured by ESP32; measure 5V at MG996R under load");
 
+  mqttHost.toCharArray(networkBroker, sizeof(networkBroker));
+  const uint64_t chipId = ESP.getEfuseMac();
+  snprintf(mqttClientId, sizeof(mqttClientId), "servo-%04lx%08lx",
+           static_cast<unsigned long>(chipId >> 32), static_cast<unsigned long>(chipId));
   setup_wifi();
-  client.setServer(mqttHost.c_str(), mqtt_port);
-  espClient.setConnectionTimeout(750);
-  client.setSocketTimeout(1);
-  if (!client.setBufferSize(768)) Serial.println("[MQTT] Could not enlarge packet buffer");
-  client.setCallback(mqttCallback);
-
-  Serial.println("\n=== HE THONG SAN SANG (Version Chong-nhieu-Radar) ===");
+  if (xTaskCreatePinnedToCore(networkTask, "servo-network", 8192, nullptr, 1, &networkTaskHandle, 0) != pdPASS) {
+    networkTaskHandle = nullptr;
+    logLine("[FATAL] Network task allocation failed; Serial TEST_PAN/TEST_TILT still available");
+  }
+  runtimeReady = true;
+  logLine("[READY] r5: bounded queues, independent network and 50 Hz PAN/TILT PWM");
 }
 
 // ================= LOOP =================
 void loop() {
+  if (!runtimeReady) { delay(10); return; }
   const unsigned long loopAt = millis();
   if (lastLoopAt && loopAt - lastLoopAt > maxLoopGapMs) maxLoopGapMs = loopAt - lastLoopAt;
   lastLoopAt = loopAt;
-  // UART and PWM must run before any potentially blocking network operation.
+  // Network I/O runs on its own task. This loop never waits for TCP or Serial TX.
+  beginLoopStage(LOOP_STAGE_COMMANDS);
+  serviceIncomingCommands();
+  endLoopStage(LOOP_STAGE_COMMANDS);
+  beginLoopStage(LOOP_STAGE_SERIAL);
   readSerialCommands();
+  endLoopStage(LOOP_STAGE_SERIAL);
+
+  beginLoopStage(LOOP_STAGE_MQTT_RECONFIGURE);
   applyMqttHostChange();
+  endLoopStage(LOOP_STAGE_MQTT_RECONFIGURE);
+
+  beginLoopStage(LOOP_STAGE_SENSOR_AND_SERVO);
   readRadar();
   updateTargetTimeout();
   updateManualHold();
   updateServoTest();
   updateServoSmoothly();
+  endLoopStage(LOOP_STAGE_SENSOR_AND_SERVO);
 
-  if (WiFi.status() != WL_CONNECTED) {
-    if (wifiWasConnected) {
-      wifiWasConnected = false;
-      Serial.println("[WiFi] Disconnected; servo PWM and radar remain active");
-    }
-    if (millis() - lastWifiAttempt >= 10000) {
-      lastWifiAttempt = millis();
-      WiFi.disconnect();
-      WiFi.begin(ssid, password);
-      Serial.println("[WiFi] Dang thu ket noi lai...");
-    }
-  } else {
-    if (!wifiWasConnected) {
-      wifiWasConnected = true;
-      Serial.println("[WiFi] Connected, IP=" + WiFi.localIP().toString());
-    }
-    if (!client.connected() && millis() - lastMqttAttempt >= 5000) reconnect();
-    if (client.connected()) client.loop();
-  }
-
+  beginLoopStage(LOOP_STAGE_MQTT_RECONFIGURE);
   applyMqttHostChange();
+  endLoopStage(LOOP_STAGE_MQTT_RECONFIGURE);
 
+  beginLoopStage(LOOP_STAGE_TELEMETRY);
+  printManualMqttSummary();
   publishRadarTelemetry();
   printRadarSample();
   printRadarDiagnostics();
   printServoDiagnostics();
   printNetDiagnostics();
+  endLoopStage(LOOP_STAGE_TELEMETRY);
+  rtcLastActiveLoopStage = LOOP_STAGE_IDLE;
   delay(1);
 }

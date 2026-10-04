@@ -4,11 +4,32 @@ import { ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Settings2, Radio, RotateCcw,
 import { useTranslation } from "./context/LanguageContext";
 
 type ServoDiagnostics = {
-  online: boolean;
+  online: boolean | null;
   fresh: boolean;
   age_seconds: number | null;
   last_config_result: string | null;
+  device_health?: {
+    state?: string;
+    boot_reset_reason?: string | null;
+    boot_reset_stage?: string | null;
+    task_wdt_count?: number | null;
+    slow_loop_stage?: string | null;
+    slow_loop_stage_ms?: number | null;
+    mqtt_connect_ms?: number | null;
+    mqtt_reconnect_failures?: number | null;
+  };
   data: {
+    fw?: string;
+    uptime_ms?: number;
+    free_heap?: number;
+    min_free_heap?: number;
+    largest_free_block?: number;
+    loop_stack_free?: number;
+    network_stack_free?: number;
+    rx_dropped?: number;
+    tx_dropped?: number;
+    log_dropped?: number;
+    boot_network_stage?: string;
     mode?: string;
     target_pan?: number;
     target_tilt?: number;
@@ -26,8 +47,38 @@ type ServoDiagnostics = {
     loop_gap_ms?: number;
     manual_count?: number;
     hold_heartbeats?: number;
+    boot_reset_reason?: string;
+    boot_reset_stage?: string;
+    task_wdt_count?: number;
+    slow_loop_stage?: string;
+    slow_loop_stage_ms?: number;
+    mqtt_connect_ms?: number;
+    mqtt_reconnect_failures?: number;
   } | null;
 };
+
+type ApiError = {
+  kind: "backend" | "request";
+  source: "sync" | "command";
+  detail?: string;
+  httpStatus?: number;
+  apiStatus?: string;
+  errorCode?: string;
+};
+
+function requestError(response: Response, data: unknown, source: ApiError["source"]): ApiError {
+  const payload = data !== null && typeof data === "object" ? data as Record<string, unknown> : null;
+  const detail = typeof payload?.message === "string" ? payload.message
+    : typeof payload?.detail === "string" ? payload.detail : undefined;
+  return {
+    kind: "request",
+    source,
+    detail,
+    httpStatus: response.status,
+    apiStatus: typeof payload?.status === "string" && payload.status !== "success" ? payload.status : undefined,
+    errorCode: typeof payload?.error_code === "string" ? payload.error_code : undefined,
+  };
+}
 
 function getCameraApiBaseUrl() {
   const fallback = `http://${window.location.hostname}:8000/api/v1`;
@@ -53,7 +104,11 @@ export default function CameraControlPanel() {
   const [modeKnown, setModeKnown] = useState(false);
   const [hardwareMode, setHardwareMode] = useState<string | null>(null);
   const [modeLoading, setModeLoading] = useState(false);
-  const [apiError, setApiError] = useState<"backend" | "request" | null>(null);
+  const [controlProtocol, setControlProtocol] = useState("sequenced_hold");
+  const [stepBusy, setStepBusy] = useState(false);
+  const legacyStep = controlProtocol === "legacy_step";
+  const stepInFlightRef = useRef(false);
+  const [apiError, setApiError] = useState<ApiError | null>(null);
   const [stopUnconfirmed, setStopUnconfirmed] = useState(false);
   const [apiBaseUrl, setApiBaseUrl] = useState("");
   const [servoDiagnostics, setServoDiagnostics] = useState<ServoDiagnostics | null>(null);
@@ -65,6 +120,9 @@ export default function CameraControlPanel() {
   const queuedMoveRef = useRef<string | null>(null);
   const moveSessionRef = useRef("");
   const moveSequenceRef = useRef(0);
+  const moveGenerationRef = useRef(0);
+  const activePointerRef = useRef<number | null>(null);
+  const moveAbortRef = useRef<AbortController | null>(null);
   const stopGenerationRef = useRef(0);
   const modeGenerationRef = useRef(0);
   const modeRequestInFlightRef = useRef(false);
@@ -83,19 +141,20 @@ export default function CameraControlPanel() {
       const data = await response.json().catch(() => null);
       if (modeRequestInFlightRef.current || generation !== modeGenerationRef.current) return;
       if (!response.ok || data?.status !== "success" || !["AUTO", "MANUAL"].includes(data.mode)) {
-        setApiError("request");
+        setApiError((current) => current?.source === "command" ? current : requestError(response, data, "sync"));
         setModeKnown(false);
         return;
       }
       setAutoTracking(data.mode === "AUTO");
+      setControlProtocol(data.control_protocol ?? "sequenced_hold");
       setHardwareMode(["AUTO", "MANUAL"].includes(data.hardware_mode) ? data.hardware_mode : null);
       setModeKnown(true);
-      setApiError(null);
+      setApiError((current) => current?.source === "sync" ? null : current);
     } catch {
       if (modeRequestInFlightRef.current || generation !== modeGenerationRef.current) return;
       setModeKnown(false);
       setHardwareMode(null);
-      setApiError("backend");
+      setApiError((current) => current?.source === "command" ? current : { kind: "backend", source: "sync" });
     } finally {
       syncInFlightRef.current = false;
       window.clearTimeout(timeoutId);
@@ -109,6 +168,7 @@ export default function CameraControlPanel() {
   }, [syncMode]);
 
   useEffect(() => {
+    if (legacyStep) return;
     let active = true;
     let busy = false;
     const checkServo = async () => {
@@ -130,9 +190,12 @@ export default function CameraControlPanel() {
     void checkServo();
     const timer = window.setInterval(() => void checkServo(), 2000);
     return () => { active = false; window.clearInterval(timer); };
-  }, []);
+  }, [legacyStep]);
 
   const handleModeChange = async (isAuto: boolean) => {
+    if (modeRequestInFlightRef.current || stepInFlightRef.current) return;
+    stopMove();
+    moveGenerationRef.current += 1;
     stopGenerationRef.current += 1;
     setStopUnconfirmed(false);
     modeGenerationRef.current += 1;
@@ -155,17 +218,18 @@ export default function CameraControlPanel() {
       });
       const data = await response.json().catch(() => null);
       if (!response.ok || data?.status !== "success" || data.mode !== (isAuto ? "AUTO" : "MANUAL")) {
-        setApiError("request");
+        setApiError(requestError(response, data, "command"));
         return;
       }
       setAutoTracking(isAuto);
+      setControlProtocol(data.control_protocol ?? "sequenced_hold");
       setHardwareMode(["AUTO", "MANUAL"].includes(data.hardware_mode) ? data.hardware_mode : null);
       setModeKnown(true);
       setApiError(null);
     } catch {
       setModeKnown(false);
       setHardwareMode(null);
-      setApiError("backend");
+      setApiError({ kind: "backend", source: "command" });
     } finally {
       modeRequestInFlightRef.current = false;
       setModeLoading(false);
@@ -174,6 +238,7 @@ export default function CameraControlPanel() {
   };
 
   const sendMove = useCallback(async (dir: string): Promise<boolean> => {
+    const generation = moveGenerationRef.current;
     const baseUrl = getCameraApiBaseUrl();
     setApiBaseUrl(baseUrl);
     if (!moveSessionRef.current) {
@@ -181,6 +246,7 @@ export default function CameraControlPanel() {
     }
     const seq = ++moveSequenceRef.current;
     const controller = new AbortController();
+    if (dir !== "STOP") moveAbortRef.current = controller;
     const timeoutId = window.setTimeout(() => controller.abort(), 2000);
     try {
       const response = await fetch(`${baseUrl}/camera/move`, {
@@ -191,19 +257,40 @@ export default function CameraControlPanel() {
       });
       const data = await response.json().catch(() => null);
       if (!response.ok || data?.status !== "success") {
-        setApiError("request");
+        if (generation === moveGenerationRef.current) setApiError(requestError(response, data, "command"));
         return false;
       }
-      setApiError(null);
+      if (dir !== "STOP" && generation === moveGenerationRef.current) setApiError(null);
       return true;
     } catch {
-      setModeKnown(false);
-      setApiError("backend");
+      if (generation === moveGenerationRef.current) {
+        setModeKnown(false);
+        setApiError({ kind: "backend", source: "command" });
+      }
       return false;
     } finally {
       window.clearTimeout(timeoutId);
+      if (moveAbortRef.current === controller) moveAbortRef.current = null;
     }
   }, []);
+
+  // The supplied firmware has finite steps, no hold lease and no STOP.
+  // Never simulate a hold with repeated steps or retry an ambiguous timeout.
+  const sendStep = useCallback(async (direction: string) => {
+    if (stepInFlightRef.current || modeRequestInFlightRef.current || !modeKnown || autoTracking) return;
+    stepInFlightRef.current = true;
+    setStepBusy(true);
+    const startedAt = performance.now();
+    try {
+      await sendMove(direction);
+      // Also bound rapid clicks after a fast local HTTP response (server: 150 ms).
+      const remaining = 200 - (performance.now() - startedAt);
+      if (remaining > 0) await new Promise<void>((resolve) => window.setTimeout(resolve, remaining));
+    } finally {
+      stepInFlightRef.current = false;
+      setStepBusy(false);
+    }
+  }, [sendMove, modeKnown, autoTracking]);
 
   // Keep at most one HTTP request in flight. A new direction replaces an old
   // queued direction, so slow network responses cannot build up stale moves.
@@ -211,14 +298,22 @@ export default function CameraControlPanel() {
     if (moveInFlightRef.current || !queuedMoveRef.current) return;
 
     const direction = queuedMoveRef.current;
+    const generation = moveGenerationRef.current;
     queuedMoveRef.current = null;
     moveInFlightRef.current = true;
     const startedAt = performance.now();
     const sent = await sendMove(direction);
     moveInFlightRef.current = false;
 
+    // A late failure from a released gesture must not cancel the next press.
+    if (generation !== moveGenerationRef.current) {
+      if (queuedMoveRef.current) void flushMove();
+      return;
+    }
+
     if (!sent) {
       activeDirectionRef.current = null;
+      activePointerRef.current = null;
       queuedMoveRef.current = null;
       if (moveTimerRef.current) window.clearTimeout(moveTimerRef.current);
       moveTimerRef.current = null;
@@ -237,19 +332,28 @@ export default function CameraControlPanel() {
   }, [sendMove]);
 
   const startMove = useCallback((dir: string) => {
+    moveGenerationRef.current += 1;
     stopGenerationRef.current += 1;
     setStopUnconfirmed(false);
     if (moveTimerRef.current) window.clearTimeout(moveTimerRef.current);
     moveTimerRef.current = null;
     // The ESP32 drives the MG996R while these refreshes arrive and stops
-    // itself if the browser/network disappears for 300 ms.
+    // itself if the browser/network disappears (r5 lease: 400 ms).
     activeDirectionRef.current = `HOLD_${dir}`;
     queuedMoveRef.current = `HOLD_${dir}`;
     void dispatchMove();
   }, [dispatchMove]);
 
   const stopMove = useCallback(() => {
+    if (legacyStep) return;
     const wasMoving = activeDirectionRef.current !== null;
+    moveGenerationRef.current += 1;
+    // Free the HTTP slot immediately on release; an old two-second timeout
+    // must not delay the next press. Backend sequence checks still reject any
+    // old request that reached the server before abort took effect.
+    moveAbortRef.current?.abort();
+    moveAbortRef.current = null;
+    activePointerRef.current = null;
     if (moveTimerRef.current) window.clearTimeout(moveTimerRef.current);
     moveTimerRef.current = null;
     activeDirectionRef.current = null;
@@ -260,26 +364,66 @@ export default function CameraControlPanel() {
         if (stopGenerationRef.current === generation) setStopUnconfirmed(!sent);
       });
     }
-  }, [sendMove]);
+  }, [sendMove, legacyStep]);
 
   const resetMove = useCallback(() => {
+    if (legacyStep) { void sendStep("RESET"); return; }
     stopMove();
+    moveGenerationRef.current += 1;
     stopGenerationRef.current += 1;
     setStopUnconfirmed(false);
     queuedMoveRef.current = "RESET";
     void dispatchMove();
-  }, [dispatchMove, stopMove]);
+  }, [dispatchMove, stopMove, legacyStep, sendStep]);
 
-  const holdButtonProps = (direction: string) => ({
+  const holdButtonProps = (direction: string) => legacyStep ? ({
+    "aria-label": direction,
+    disabled: modeLoading || stepBusy,
+    onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (!event.isPrimary || (event.pointerType === "mouse" && event.button !== 0)) return;
+      event.preventDefault();
+      void sendStep(direction);
+    },
+    onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => {
+      if (event.key !== " " && event.key !== "Enter") return;
+      event.preventDefault();
+      if (!event.repeat) void sendStep(direction);
+    },
+    // Assistive technology can activate a button without a pointer event.
+    onClick: (event: React.MouseEvent<HTMLButtonElement>) => {
+      if (event.detail === 0) void sendStep(direction);
+    },
+  }) : ({
+    "aria-label": direction,
+    disabled: modeLoading,
     onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => {
       if (event.pointerType === "mouse" && event.button !== 0) return;
+      if (!event.isPrimary || activeDirectionRef.current !== null) return;
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
+      activePointerRef.current = event.pointerId;
       startMove(direction);
     },
-    onPointerUp: stopMove,
-    onPointerCancel: stopMove,
-    onLostPointerCapture: stopMove
+    onPointerUp: (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (activePointerRef.current === event.pointerId) stopMove();
+    },
+    onPointerCancel: (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (activePointerRef.current === event.pointerId) stopMove();
+    },
+    onLostPointerCapture: (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (activePointerRef.current === event.pointerId) stopMove();
+    },
+    onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => {
+      if (event.key !== " " && event.key !== "Enter") return;
+      event.preventDefault();
+      if (!event.repeat && activeDirectionRef.current === null) startMove(direction);
+    },
+    onKeyUp: (event: React.KeyboardEvent<HTMLButtonElement>) => {
+      if (event.key !== " " && event.key !== "Enter") return;
+      event.preventDefault();
+      if (activePointerRef.current === null) stopMove();
+    },
+    onBlur: () => { if (activePointerRef.current === null) stopMove(); }
   });
 
   useEffect(() => {
@@ -315,14 +459,14 @@ export default function CameraControlPanel() {
           <div className="flex gap-1.5 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
             <button
               onClick={() => handleModeChange(false)}
-              disabled={modeLoading}
+              disabled={modeLoading || stepBusy}
               className={`px-3 py-1.5 rounded-md transition-colors ${modeKnown && !autoTracking ? 'bg-white dark:bg-slate-600 shadow-sm text-slate-800 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}
             >
               {t("cam.manualMode")}
             </button>
             <button
               onClick={() => handleModeChange(true)}
-              disabled={modeLoading}
+              disabled={modeLoading || stepBusy}
               className={`px-3 py-1.5 rounded-md transition-colors flex items-center gap-1 ${modeKnown && autoTracking ? 'bg-green-50 dark:bg-green-900/40 text-green-700 dark:text-green-300 shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}
             >
               <Radio className="w-3 h-3" />
@@ -333,13 +477,22 @@ export default function CameraControlPanel() {
 
         {apiError && (
           <p role="alert" className="rounded-lg bg-red-50 dark:bg-red-900/20 px-3 py-2 text-xs text-red-700 dark:text-red-300 break-words">
-            {t(apiError === "backend" ? "cam.backendUnavailable" : "cam.requestFailed")} {apiBaseUrl}
+            {apiError.detail ?? t(apiError.kind === "backend" ? "cam.backendUnavailable" : "cam.requestFailed")}
+            {(apiError.errorCode || apiError.httpStatus !== undefined) && <span>{apiError.errorCode ? ` · ${apiError.errorCode}` : ""}{apiError.httpStatus !== undefined ? ` · HTTP ${apiError.httpStatus}` : ""}{apiError.apiStatus ? ` · API ${apiError.apiStatus}` : ""}</span>}
+            <span className="block mt-1 font-mono">{apiBaseUrl}</span>
           </p>
         )}
 
         {stopUnconfirmed && (
           <p role="alert" className="rounded-lg bg-amber-50 dark:bg-amber-900/20 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
             {t("cam.stopUnconfirmed")}
+          </p>
+        )}
+
+        {!legacyStep && servoDiagnostics?.fresh && (servoDiagnostics.data?.pan_at_limit || servoDiagnostics.data?.tilt_at_limit) && (
+          <p className="text-xs text-amber-700 dark:text-amber-300" role="status">
+            {servoDiagnostics.data.pan_at_limit ? "PAN " : ""}{servoDiagnostics.data.tilt_at_limit ? "TILT " : ""}
+            {t("cam.angleLimit")}
           </p>
         )}
 
@@ -359,11 +512,11 @@ export default function CameraControlPanel() {
               <Crosshair className="w-8 h-8 text-green-600 dark:text-green-400 relative z-10" />
             </div>
             <span className="text-sm font-bold text-green-700 dark:text-green-300">
-              {t(hardwareMode === "AUTO" ? "cam.autoActive" : "cam.autoPending")}
+              {t(legacyStep ? "cam.legacyAuto" : hardwareMode === "AUTO" ? "cam.autoActive" : "cam.autoPending")}
             </span>
-            <p className="text-[11px] text-slate-400 dark:text-slate-500 text-center px-4 leading-relaxed">
+            {!legacyStep && <p className="text-[11px] text-slate-400 dark:text-slate-500 text-center px-4 leading-relaxed">
               {t(hardwareMode === "AUTO" ? "cam.autoDesc" : "cam.autoPendingDesc")}
-            </p>
+            </p>}
             <button
               onClick={() => handleModeChange(false)}
               disabled={modeLoading}
@@ -388,6 +541,7 @@ export default function CameraControlPanel() {
               </button>
               <button
                 onClick={resetMove}
+                disabled={modeLoading || stepBusy}
                 className="p-3 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-300 dark:hover:bg-slate-600 rounded-xl transition-colors shadow-sm cursor-pointer select-none" title="Reset về giữa">
                 <RotateCcw className="w-5 h-5" />
               </button>
@@ -405,7 +559,7 @@ export default function CameraControlPanel() {
           </div>
         )}
 
-        <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 px-2.5 py-2 text-[10px] font-mono text-slate-600 dark:text-slate-300">
+        {!legacyStep && <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 px-2.5 py-2 text-[10px] font-mono text-slate-600 dark:text-slate-300">
           <button onClick={() => setShowServoDiagnostics((value) => !value)} className="flex w-full items-center justify-between text-left">
             <span>SERVO DIAG · {servoDiagnostics?.fresh ? "LIVE" : servoDiagnostics?.online ? "STALE" : "OFFLINE"}</span>
             <span>{showServoDiagnostics ? "−" : "+"}</span>
@@ -419,12 +573,17 @@ export default function CameraControlPanel() {
                   <div>pulse {servoDiagnostics.data.pulse_pan_us ?? "--"}/{servoDiagnostics.data.pulse_tilt_us ?? "--"} µs · Wi‑Fi {servoDiagnostics.data.wifi_rssi ?? "--"} dBm</div>
                   <div>radar {servoDiagnostics.data.radar_age_ms ?? "--"} ms · joystick {servoDiagnostics.data.manual_age_ms ?? "--"} ms · loop gap {servoDiagnostics.data.loop_gap_ms ?? "--"} ms</div>
                   <div>move count {servoDiagnostics.data.manual_count ?? "--"} · hold count {servoDiagnostics.data.hold_heartbeats ?? "--"} · age {servoDiagnostics.age_seconds ?? "--"} s</div>
+                  <div>boot {servoDiagnostics.device_health?.boot_reset_reason ?? servoDiagnostics.data.boot_reset_reason ?? "--"} @ {servoDiagnostics.device_health?.boot_reset_stage ?? servoDiagnostics.data.boot_reset_stage ?? "--"} · task WDT {servoDiagnostics.device_health?.task_wdt_count ?? servoDiagnostics.data.task_wdt_count ?? "--"}</div>
+                  <div>slow stage {servoDiagnostics.device_health?.slow_loop_stage ?? servoDiagnostics.data.slow_loop_stage ?? "--"} · {servoDiagnostics.device_health?.slow_loop_stage_ms ?? servoDiagnostics.data.slow_loop_stage_ms ?? "--"} ms · MQTT connect {servoDiagnostics.device_health?.mqtt_connect_ms ?? servoDiagnostics.data.mqtt_connect_ms ?? "--"} ms</div>
+                  <div>heap {servoDiagnostics.data.free_heap ?? "--"} · min {servoDiagnostics.data.min_free_heap ?? "--"} · largest {servoDiagnostics.data.largest_free_block ?? "--"} bytes</div>
+                  <div>stack loop/net {servoDiagnostics.data.loop_stack_free ?? "--"}/{servoDiagnostics.data.network_stack_free ?? "--"} bytes · drop RX/TX/log {servoDiagnostics.data.rx_dropped ?? "--"}/{servoDiagnostics.data.tx_dropped ?? "--"}/{servoDiagnostics.data.log_dropped ?? "--"}</div>
+                  <div>{servoDiagnostics.data.fw ?? "--"} · uptime {servoDiagnostics.data.uptime_ms === undefined ? "--" : Math.floor(servoDiagnostics.data.uptime_ms / 1000)} s · boot net {servoDiagnostics.data.boot_network_stage ?? "--"}</div>
                   {servoDiagnostics.last_config_result && <div>config: {servoDiagnostics.last_config_result}</div>}
                 </>
               ) : <div>ESP32 chưa gửi telemetry.</div>}
             </div>
           )}
-        </div>
+        </div>}
       </div>
     </div>
   );

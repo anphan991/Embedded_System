@@ -13,7 +13,8 @@ const CALIBRATION_KEYS = [
 type CalibrationKey = typeof CALIBRATION_KEYS[number];
 type ServoDiag = {
   status: string;
-  online: boolean;
+  online: boolean | null;
+  capabilities?: { config: boolean };
   fresh: boolean;
   hardware_mode: string | null;
   config: Record<string, string | number> | null;
@@ -104,6 +105,13 @@ export default function ServoCalibrationPanel({ serverUrl }: { serverUrl: string
   };
 
   const currentValue = diag?.config?.[keyName.toLowerCase()];
+
+  if (diag?.capabilities?.config === false) {
+    return <section className="rounded-xl border border-slate-200 dark:border-slate-800 p-6 space-y-2">
+      <h2 className="text-sm font-semibold">{t("servo.calibrationTitle")}</h2>
+      <p className="text-sm text-slate-500 dark:text-slate-400">{t("servo.legacyUnsupported")}</p>
+    </section>;
+  }
 
   return (
     <section className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 shadow-sm rounded-xl overflow-hidden transition-colors">

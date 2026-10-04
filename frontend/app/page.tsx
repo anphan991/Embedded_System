@@ -39,7 +39,6 @@ export default function SurveillanceDashboard() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [liveTime, setLiveTime] = useState("");
   const [backendBaseUrl, setBackendBaseUrl] = useState("");
-  const [streamKind, setStreamKind] = useState<"live" | "ai">("live");
   const [streamRetry, setStreamRetry] = useState(0);
   const [streamError, setStreamError] = useState(false);
   const [videoOnline, setVideoOnline] = useState<boolean | null>(null);
@@ -48,7 +47,7 @@ export default function SurveillanceDashboard() {
   const containerRef = useRef<HTMLDivElement>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamUrl = backendBaseUrl
-    ? `${backendBaseUrl}/api/v1/video/${streamKind === "live" ? "live" : "stream"}`
+    ? `${backendBaseUrl}/api/v1/video/stream`
     : "";
 
   useEffect(() => {
@@ -79,7 +78,7 @@ export default function SurveillanceDashboard() {
         const response = await fetch(`${backendBaseUrl}/api/v1/video/status`, { cache: "no-store", signal: controller.signal });
         const data = await response.json();
         const online = response.ok && data.status === "success" && data.online === true &&
-          (streamKind === "live" || data.ai_online === true);
+          data.ai_online === true;
         if (!active) return;
         setVideoDiagnostics(response.ok && data.status === "success" ? data : null);
         setVideoOnline(online);
@@ -97,7 +96,7 @@ export default function SurveillanceDashboard() {
     void checkVideo();
     const timer = setInterval(checkVideo, 2000);
     return () => { active = false; clearInterval(timer); };
-  }, [backendBaseUrl, streamKind]);
+  }, [backendBaseUrl]);
 
   // Some browsers/proxies can leave an MJPEG <img> open but frozen without an
   // error event. A periodic reconnect bounds that silent failure to one minute.
@@ -105,7 +104,7 @@ export default function SurveillanceDashboard() {
     if (!backendBaseUrl || videoOnline !== true) return;
     const timer = window.setInterval(() => setStreamRetry((value) => value + 1), 60000);
     return () => window.clearInterval(timer);
-  }, [backendBaseUrl, streamKind, videoOnline]);
+  }, [backendBaseUrl, videoOnline]);
 
   useEffect(() => () => {
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
@@ -173,11 +172,10 @@ export default function SurveillanceDashboard() {
             {/* Live MJPEG Stream */}
             {streamUrl && (
               <img 
-                key={`${streamKind}-${streamRetry}`}
+                key={streamRetry}
                 src={streamUrl} 
-                alt="Live Camera Feed"
+                alt="Camera feed with AI tracking"
                 className="relative z-10 w-full h-full object-contain"
-                style={streamKind === "live" ? { transform: "scaleX(-1)" } : undefined}
                 onLoad={() => setStreamError(false)}
                 onError={handleStreamError}
               />
@@ -189,20 +187,6 @@ export default function SurveillanceDashboard() {
               </div>
             )}
 
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex rounded-lg bg-black/65 p-1 text-xs text-white shadow-sm">
-              <button
-                onClick={() => { setStreamKind("live"); setStreamError(false); }}
-                className={`rounded-md px-2.5 py-1 ${streamKind === "live" ? "bg-white text-slate-900" : "text-white/80"}`}
-              >
-                {t("live.rawVideo")}
-              </button>
-              <button
-                onClick={() => { setStreamKind("ai"); setStreamError(false); }}
-                className={`rounded-md px-2.5 py-1 ${streamKind === "ai" ? "bg-white text-slate-900" : "text-white/80"}`}
-              >
-                {t("live.aiOverlay")}
-              </button>
-            </div>
             
             {/* OSD: Overlay Camera Info & Live Timestamp */}
             <div className="absolute top-4 right-4 z-20 flex flex-col items-end gap-1 pointer-events-none scale-90 lg:scale-100 origin-top-right">
