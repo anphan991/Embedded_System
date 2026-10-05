@@ -82,7 +82,8 @@ Embedded system/
 │   └── esp32_cam_radar.ino        # Flash this sketch to the ESP32 DevKit
 ├── snapshots/                     # Runtime snapshots, if enabled
 ├── yolov8m-pose.pt                # Pose-model weights, if included locally
-└── README.md                      # English entry point for GitHub       
+├── README-en.md                   # English project guide
+└── README.md                      # Vietnamese project guide / root readme
 ```
 
 Local `.env` files, virtual environments, model exports, logs, databases, and snapshots are machine/runtime data. Do not commit credentials or private monitoring data. If model weights are absent from a clone, provide the approved model file and set `POSE_MODEL_PATH` accordingly.
@@ -184,9 +185,42 @@ MQTT_BROKER=192.168.1.10
 VIDEO_SOURCE=http://192.168.1.50:81/stream
 AI_FPS_LIMIT=30
 POSE_MODEL_PATH=yolov8m-pose.pt
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
 `MQTT_BROKER` is the computer running Mosquitto. `VIDEO_SOURCE` is the ESP32-CAM address. Firmware Wi-Fi credentials are configured in the sketches. Keep `.env` private. The backend API is at `http://localhost:8000`; interactive API documentation is at `http://localhost:8000/docs`.
+
+Telegram alerts are optional. Leave the placeholder values if you do not want Telegram notifications. To enable them, configure **both** `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as described below.
+
+### Create a Telegram bot and obtain the two values
+
+1. Open Telegram and start a chat with the official **[@BotFather](https://t.me/BotFather)** account.
+2. Send `/newbot`. Follow the prompts to choose a display name and a unique username; the username normally ends in `bot` (for example, `FallGuardHomeBot`).
+3. BotFather returns an API token. Copy it into `TELEGRAM_BOT_TOKEN`. Treat it as a password: anyone with it can control the bot. Do not post it in chat, screenshots, GitHub, or support logs.
+4. Open the newly created bot using its `t.me/<bot_username>` link, press **Start**, and send `/start`. A bot cannot message a user until that user has started the conversation.
+5. In PowerShell, use the token to inspect the bot's pending updates and find the destination `chat.id`:
+
+   ```powershell
+   $secureToken = Read-Host 'Paste the bot token' -AsSecureString
+   $credential = [System.Net.NetworkCredential]::new('', $secureToken)
+   $token = $credential.Password
+   $updates = Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/getUpdates"
+   $updates.result | ConvertTo-Json -Depth 10
+   Remove-Variable token, credential, secureToken
+   ```
+
+   Find `message.chat.id` for the `/start` message you just sent. If `result` is empty, send `/start` to the bot again and rerun the command. For a group destination, add the bot to the group, send a message there, and use the group's `chat.id` (usually a negative number).
+6. Put the token and chat ID in `backend/.env`:
+
+   ```ini
+   TELEGRAM_BOT_TOKEN=<token-from-BotFather>
+   TELEGRAM_CHAT_ID=<destination-chat-id>
+   ```
+
+7. Save `.env` and restart the backend so it reloads the variables. Telegram delivery is attempted when the backend confirms a fall event; check the backend log for `Telegram Alert Sent Successfully!` or an API error. The current backend applies a 60-second Telegram cooldown.
+
+If the token is exposed, revoke/regenerate it through BotFather and update `.env` immediately. The token is embedded in Telegram Bot API request URLs by design; avoid copying those URLs into browser history, screenshots, or shared logs. The PowerShell example keeps the token out of the literal command history and does not print it.
 
 On later runs, after dependencies and `.env` are set up:
 
@@ -430,3 +464,5 @@ The sample Mosquitto config is intended for a trusted LAN and allows anonymous c
 - [Tailscale Grants](https://tailscale.com/docs/features/access-control/grants)
 - [Tailscale IP addresses and DNS](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
 - [Tailscale Serve and Funnel](https://tailscale.com/docs/features/tailscale-funnel)
+- [Telegram bot creation and BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
+- [Telegram Bot API — getUpdates](https://core.telegram.org/bots/api#getupdates)

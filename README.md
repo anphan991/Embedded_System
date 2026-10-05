@@ -121,7 +121,8 @@ Embedded system/
 │   └── esp32_cam_radar.ino            # Firmware nạp vào ESP32 DevKit
 ├── snapshots/                         # Ảnh sự kiện nếu được cấu hình lưu tại đây
 ├── yolov8m-pose.pt                    # Trọng số YOLOv8 pose nếu có trong bản cài
-└── README.md                          
+├── README-en.md                       # Bản tiếng Anh
+└── README.md                          # Bản tiếng Việt
 ```
 
 >`backend/.env`, virtual environment, model đã chuyển đổi và cơ sở dữ liệu là dữ liệu theo máy hoặc phát sinh khi chạy. Không đưa secrets vào Git. Nếu file trọng số không có trong bản clone, cần cung cấp/tải model theo chính sách của dự án và đặt đúng `POSE_MODEL_PATH`.
@@ -206,6 +207,8 @@ MQTT_BROKER=YOUR-IP
 VIDEO_SOURCE=http://YOUR-IP:PORT/stream
 AI_FPS_LIMIT=30
 POSE_MODEL_PATH=yolov8m-pose.pt
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
 - `MQTT_BROKER`: IPv4 của máy đang chạy Mosquitto.
@@ -213,6 +216,36 @@ POSE_MODEL_PATH=yolov8m-pose.pt
 - `SERVO_PROTOCOL`: phải khớp giao thức của firmware hiện hành. Sketch hiện tại nhận lệnh bước `LEFT`, `RIGHT`, `UP`, `DOWN`, `RESET`, do đó dùng `legacy_step`.
 - `AI_FPS_LIMIT`: trần xử lý AI, không phải cam kết FPS đầu ra.
 - `POSE_MODEL_PATH`: đường dẫn đến file model pose.
+- `TELEGRAM_BOT_TOKEN` và `TELEGRAM_CHAT_ID`: cấu hình tùy chọn để gửi cảnh báo té ngã qua Telegram; phải điền cả hai.
+
+### Tạo bot Telegram và lấy hai giá trị
+
+1. Mở Telegram, tìm tài khoản chính thức **[@BotFather](https://t.me/BotFather)** và bắt đầu cuộc trò chuyện.
+2. Gửi `/newbot`, làm theo hướng dẫn để đặt tên hiển thị và username duy nhất. Username thường kết thúc bằng `bot`, ví dụ `FallGuardHomeBot`.
+3. BotFather sẽ gửi **API token**. Sao chép token này vào `TELEGRAM_BOT_TOKEN`. Hãy giữ kín như mật khẩu: người có token có thể điều khiển bot. Không gửi token vào chat, ảnh chụp màn hình, GitHub hoặc log hỗ trợ.
+4. Mở bot mới bằng đường dẫn `t.me/<username_bot>`, nhấn **Start** và gửi `/start`. Bot không thể tự mở cuộc trò chuyện với người dùng trước khi người đó bắt đầu chat.
+5. Dùng PowerShell để lấy `chat.id` của cuộc trò chuyện vừa bắt đầu:
+
+   ```powershell
+   $secureToken = Read-Host 'Dán token bot' -AsSecureString
+   $credential = [System.Net.NetworkCredential]::new('', $secureToken)
+   $token = $credential.Password
+   $updates = Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/getUpdates"
+   $updates.result | ConvertTo-Json -Depth 10
+   Remove-Variable token, credential, secureToken
+   ```
+
+   Trong kết quả, lấy giá trị `message.chat.id` của tin `/start` vừa gửi. Nếu `result` rỗng, gửi `/start` cho bot lần nữa rồi chạy lại. Nếu muốn gửi vào nhóm, thêm bot vào nhóm, gửi một tin nhắn trong nhóm và lấy `chat.id` của nhóm (thường là số âm).
+6. Điền cả hai giá trị vào `backend/.env`:
+
+   ```ini
+   TELEGRAM_BOT_TOKEN=<token-tu-BotFather>
+   TELEGRAM_CHAT_ID=<chat-id-nhan-canh-bao>
+   ```
+
+7. Lưu `.env` rồi khởi động lại backend để nạp cấu hình mới. Telegram được gọi khi backend xác nhận sự kiện té ngã; xem log tìm `Telegram Alert Sent Successfully!` hoặc lỗi API. Backend hiện áp dụng thời gian chờ 60 giây giữa các lần gửi Telegram.
+
+Nếu token bị lộ, hãy thu hồi/tạo token mới qua BotFather và cập nhật `.env` ngay. Telegram Bot API dùng token trong URL của request; tránh dán URL có token vào lịch sử trình duyệt, ảnh chụp hoặc log chia sẻ. Đoạn PowerShell trên giữ token ngoài câu lệnh được lưu trong lịch sử và không in token ra màn hình.
 
 IP thường thay đổi khi đổi router/hotspot. Chạy `ipconfig` để lấy IP máy tính; lấy IP của ESP32 từ Serial Monitor hoặc router. Sau đó sửa `.env`, SSID/password/broker trong hai sketch nếu cần và khởi động lại tiến trình liên quan. Dashboard trên máy khác phải đặt Server URL về `http://<IP-máy-backend>:8000`, không dùng `localhost`.
 
@@ -487,3 +520,5 @@ Khuyến nghị bắt đầu ở chế độ dọc, dùng nút điều khiển c
 - [Tailscale — access control grants](https://tailscale.com/docs/features/access-control/grants)
 - [Tailscale — IP và DNS của thiết bị](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
 - [Tailscale Serve và Funnel](https://tailscale.com/docs/features/tailscale-funnel)
+- [Telegram — tạo bot và BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
+- [Telegram Bot API — getUpdates](https://core.telegram.org/bots/api#getupdates)
