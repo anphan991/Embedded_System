@@ -44,6 +44,14 @@ type RadarCoverageProps = {
 type RadarHistoryItem = { timestamp: number; pos_x: number; pos_y: number; speed: number };
 type RadarPoint = RadarHistoryItem & { time: string };
 type RadarHistoryResponse = { status: string; data?: RadarHistoryItem[] };
+type RadarDataStatus = "loading" | "live" | "stale" | "empty" | "error";
+
+function formatRadarAge(seconds: number) {
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${(seconds / 86400).toFixed(1)}d`;
+}
 
 const RadarCoverageShape = (props: RadarCoverageProps) => {
   const { x, y, width, height, radarX, radarY, radarAngle, rWidth, rLength, isDark } = props;
@@ -87,6 +95,8 @@ const RadarCoverageShape = (props: RadarCoverageProps) => {
 
 export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
   const [data, setData] = useState<RadarPoint[]>([]);
+  const [latestPoint, setLatestPoint] = useState<RadarPoint | null>(null);
+  const [radarStatus, setRadarStatus] = useState<RadarDataStatus>("loading");
   const [loading, setLoading] = useState(false);
   const { theme } = useTheme();
   const { t } = useTranslation();
@@ -101,48 +111,68 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
 
-  const fetchData = () => {
+  const fetchData = async () => {
     if (fetchInFlightRef.current) return;
     fetchInFlightRef.current = true;
     setLoading(true);
-    fetch(`${getBackendBaseUrl()}/api/v1/radar/history?limit=1`, { cache: "no-store" })
-      .then(res => res.ok ? res.json() : null)
-      .then((result: RadarHistoryResponse | null) => {
-        if (result?.status === "success" && result.data && result.data.length > 0) {
-          const latest = result.data[result.data.length - 1];
-          // The database keeps old points after radar disconnects. Do not
-          // present one of those points as a live target.
-          if (!Number.isFinite(Number(latest.timestamp)) ||
-              Date.now() / 1000 - Number(latest.timestamp) > 6) {
-            setData([]);
-            return;
-          }
-          const formattedData = result.data.map((item: RadarHistoryItem) => ({
-            ...item,
-            time: new Date(item.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-          }));
-          
-          const latestPoint = formattedData[formattedData.length - 1];
-          setData([latestPoint]);
+    try {
+      const response = await fetch(`${getBackendBaseUrl()}/api/v1/radar/history?limit=1`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Radar history request failed: HTTP ${response.status}`);
 
-          if (isRecordingRef.current) {
-            setTrail(prev => {
-              if (prev.length > 0) {
-                const last = prev[prev.length - 1];
-                if (last.pos_x === latestPoint.pos_x && last.pos_y === latestPoint.pos_y) {
-                  return prev;
-                }
-              }
-              return [...prev, latestPoint].slice(-200);
-            });
-          }
-        } else {
-          setData([]);
+      const result: RadarHistoryResponse = await response.json();
+      if (result.status !== "success") throw new Error("Radar history API returned an error");
+
+      const latest = result.data?.[result.data.length - 1];
+      if (!latest) {
+        setData([]);
+        setLatestPoint(null);
+        setRadarStatus("empty");
+        return;
+      }
+
+      const point = {
+        timestamp: Number(latest.timestamp),
+        pos_x: Number(latest.pos_x),
+        pos_y: Number(latest.pos_y),
+        speed: Number(latest.speed),
+        time: new Date(Number(latest.timestamp) * 1000).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }),
+      };
+      if (![point.timestamp, point.pos_x, point.pos_y, point.speed].every(Number.isFinite)) {
+        throw new Error("Radar history returned invalid coordinates");
+      }
+
+      setLatestPoint(point);
+      // Do not plot old DB records as if they were live. Keep the last values
+      // visible in the status readout so a disconnected radar is diagnosable.
+      const ageSeconds = Date.now() / 1000 - point.timestamp;
+      if (ageSeconds >= -1 && ageSeconds <= 6) {
+        setData([point]);
+        setRadarStatus("live");
+
+        if (isRecordingRef.current) {
+          setTrail(prev => {
+            if (prev.length > 0) {
+              const last = prev[prev.length - 1];
+              if (last.pos_x === point.pos_x && last.pos_y === point.pos_y) return prev;
+            }
+            return [...prev, point].slice(-200);
+          });
         }
-      }).catch(() => setData([])).finally(() => {
-        fetchInFlightRef.current = false;
-        setLoading(false);
-      });
+      } else {
+        setData([]);
+        setRadarStatus("stale");
+      }
+    } catch {
+      setData([]);
+      setRadarStatus("error");
+    } finally {
+      fetchInFlightRef.current = false;
+      setLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -156,6 +186,19 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
   const rRadarX = Number(roomConfig.radar_x) || 0;
   const rRadarY = Number(roomConfig.radar_y) || 0;
   const rRadarAngle = Number(roomConfig.radar_angle) || 0;
+  const latestAgeSeconds = latestPoint
+    ? Math.max(0, Date.now() / 1000 - latestPoint.timestamp)
+    : null;
+  const latestPointInRoom = latestPoint !== null &&
+    latestPoint.pos_x >= 0 && latestPoint.pos_x <= rWidth &&
+    latestPoint.pos_y >= 0 && latestPoint.pos_y <= rLength;
+  const statusLabel: Record<RadarDataStatus, string> = {
+    loading: "radar.waiting",
+    live: "radar.live",
+    stale: "radar.stale",
+    empty: "radar.noTelemetry",
+    error: "radar.backendError",
+  };
 
   const xTicks = [];
   for (let i = 0; i <= rWidth; i++) xTicks.push(i);
@@ -169,7 +212,22 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
           <Map className="w-4 h-4 text-blue-600 dark:text-blue-400" />
           {t("radar.liveMap")}
         </h2>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/60 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 dark:text-slate-300" role="status" aria-live="polite">
+            <span className={`h-2 w-2 rounded-full ${radarStatus === "live" ? "bg-emerald-500" : radarStatus === "error" ? "bg-red-500" : "bg-amber-500"}`} />
+            <span>{t(statusLabel[radarStatus])}</span>
+            {latestPoint && (
+              <>
+                <span className="font-mono">X {latestPoint.pos_x.toFixed(2)} m · Y {latestPoint.pos_y.toFixed(2)} m · V {latestPoint.speed.toFixed(2)} m/s</span>
+                {radarStatus === "stale" && latestAgeSeconds !== null && (
+                  <span className="text-amber-600 dark:text-amber-400">· {t("radar.lastSeen")} {formatRadarAge(latestAgeSeconds)}</span>
+                )}
+                {!latestPointInRoom && (
+                  <span className="text-red-600 dark:text-red-400">· {t("radar.outsideRoom")}</span>
+                )}
+              </>
+            )}
+          </div>
           {trail.length > 0 && (
             <button 
               onClick={() => setTrail([])}
@@ -206,7 +264,7 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
         </div>
       </div>
       
-      <div className="flex-1 w-full flex items-center justify-center transition-colors min-h-0">
+      <div className="flex-1 w-full flex items-center justify-center transition-colors min-h-0 relative">
         <ResponsiveContainer width="100%" height="100%">
           <ScatterChart margin={{ top: 20, right: 20, bottom: 40, left: 30 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={isDark ? "#334155" : "#cbd5e1"} />
@@ -256,6 +314,22 @@ export default function RadarMap({ zones, roomConfig }: RadarMapProps) {
             <Scatter name="Target" data={data} fill={isDark ? "#3b82f6" : "#2563eb"} shape="circle" />
           </ScatterChart>
         </ResponsiveContainer>
+        {radarStatus !== "live" && (
+          <div className="pointer-events-none absolute inset-4 flex items-center justify-center">
+            <div className="max-w-md rounded-lg border border-slate-300/80 dark:border-slate-600/80 bg-white/90 dark:bg-slate-950/85 px-4 py-3 text-center shadow-lg backdrop-blur-sm">
+              <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">{t(statusLabel[radarStatus])}</p>
+              {latestPoint ? (
+                <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                  {t("radar.lastKnown")}: X {latestPoint.pos_x.toFixed(2)} m · Y {latestPoint.pos_y.toFixed(2)} m
+                  {latestAgeSeconds !== null && ` · ${formatRadarAge(latestAgeSeconds)}`}
+                  {!latestPointInRoom && ` · ${t("radar.outsideRoom")}`}
+                </p>
+              ) : (
+                <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">{t("radar.checkRadarLink")}</p>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
