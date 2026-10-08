@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv, set_key
 from pydantic import BaseModel, Field
 
-from database import init_db, log_alert, log_vitals
+from database import DB_PATH, init_db, log_alert, log_vitals, point_in_zone
 from fall_detection import FallDetector, FallObservation
 from servo_protocol import (PROTOCOLS, STEP_COMMANDS, LEGACY_STEP_INTERVAL,
                             LEGACY_TRACKING_INTERVAL, capabilities, tracking_payload)
@@ -35,17 +35,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Constants
-VIDEO_SOURCE = os.getenv("VIDEO_SOURCE", "http://10.28.125.12:81/stream")
-CONTROL_MQTT_BROKER = os.getenv("MQTT_BROKER", "10.28.125.55")
+VIDEO_SOURCE = os.getenv("VIDEO_SOURCE", "http://10.214.79.12:81/stream")
+CONTROL_MQTT_BROKER = os.getenv("MQTT_BROKER", "10.214.79.55")
 SERVO_PROTOCOL = os.getenv("SERVO_PROTOCOL", "sequenced_hold").strip().lower()
 if SERVO_PROTOCOL not in PROTOCOLS:
     raise ValueError(f"SERVO_PROTOCOL must be one of {PROTOCOLS}; got {SERVO_PROTOCOL!r}")
 POSE_MODEL_PATH = os.getenv("POSE_MODEL_PATH", "yolov8m-pose.pt")
 try:
-    AI_FPS_LIMIT = max(1, min(30, int(os.getenv("AI_FPS_LIMIT", "30"))))
+    AI_FPS_LIMIT = max(1, min(30, int(os.getenv("AI_FPS_LIMIT", "15"))))
 except ValueError:
-    AI_FPS_LIMIT = 30
-    logger.warning("Invalid AI_FPS_LIMIT; using 30 FPS")
+    AI_FPS_LIMIT = 15
+    logger.warning("Invalid AI_FPS_LIMIT; using 15 FPS")
 
 # Begin conservatively; measured inference cost sets the later decode rate.
 AI_INITIAL_FPS = min(AI_FPS_LIMIT, 15)
@@ -54,6 +54,7 @@ AI_INITIAL_FPS = min(AI_FPS_LIMIT, 15)
 # frames completed by that stage, not the browser's rendered frame rate.
 CAM_FPS, CAM_KBPS, CAM_JPEG_KB, CAM_DECODE_MS, CAM_PREVIEW_DROPS, CAM_AI_INPUT_DROPS, CAM_RECONNECTS, CAM_AI_DECODE_FPS = range(8)
 AI_FPS, AI_INFER_MS, AI_ENCODE_MS, AI_PIPELINE_MS, AI_OUTPUT_DROPS, AI_LAST_RADAR_AT, AI_RADAR_ERRORS, AI_WORK_MS = range(8)
+AI_RADAR_X, AI_RADAR_Y, AI_RADAR_SPEED = range(8, 11)
 VIDEO_DIAG_INTERVAL_SEC = 5.0
 FALL_DURATION_THRESHOLD_SEC = 1.5
 
@@ -226,7 +227,7 @@ def camera_process(raw_q: mp.Queue, preview_q: mp.Queue, last_frame_at,
 # ---------------------------------------------------------
 def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                camera_generation_ref, ai_metrics_ref, ai_target_fps_ref,
-               shutdown_flag):
+               shutdown_flag, overlay_q: mp.Queue):
     logger.info("Process 2 (AI Core & MQTT): Started. Optimizing for Host/VPS...")
     global global_person_count
     
@@ -235,11 +236,15 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     
     is_camera_moving = False
+    camera_motion_epoch = 0
     current_radar_x = 0.0
     current_radar_y = 0.0
     current_radar_speed = 0.0
+    radar_safe_zone_state = (0.0, False)
     last_radar_log = 0
     last_danger_log = 0.0
+    last_zone_status_log = 0.0
+    active_danger_zone = None
     
     last_zones_fetch = 0
     cached_safe_zones = []
@@ -267,9 +272,29 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
         logger.warning("AI MQTT disconnected: %s", reason_code)
 
     def on_mqtt_message(client, userdata, msg):
-        nonlocal is_camera_moving, current_radar_x, current_radar_y, current_radar_speed, last_radar_log, last_danger_log
+        nonlocal is_camera_moving, camera_motion_epoch, current_radar_x, current_radar_y, current_radar_speed
+        nonlocal radar_safe_zone_state, last_radar_log, last_danger_log, last_zone_status_log
         nonlocal wandering_start, wandering_alert_sent, last_zones_fetch, cached_safe_zones, cached_danger_zones, cached_room_config
-        nonlocal last_mqtt_warning, tracking_auto_requested
+        nonlocal last_mqtt_warning, tracking_auto_requested, active_danger_zone
+
+        def enqueue_zone_alert(event_code, message, zone_name=""):
+            event = {
+                "kind": "zone",
+                "event_code": event_code,
+                "message": message,
+                "zone_name": zone_name,
+                "pos_x": current_radar_x,
+                "pos_y": current_radar_y,
+                "timestamp": time.time(),
+            }
+            try:
+                alert_q.put_nowait(event)
+                logger.warning("[ZONE-ALERT] %s: %s at (%.2f, %.2f)m",
+                               event_code, zone_name or message,
+                               current_radar_x, current_radar_y)
+            except queue.Full:
+                logger.error("[ZONE-ALERT] Alert queue is full; dropped %s", event_code)
+
         try:
             if msg.topic == "embedded/servo/mode":
                 tracking_auto_requested = msg.payload.decode("utf-8").strip().upper() == "AUTO"
@@ -277,6 +302,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                 payload = msg.payload.decode('utf-8').strip().upper()
                 if payload == "MOVING":
                     is_camera_moving = True
+                    camera_motion_epoch += 1
                 elif payload == "STOPPED":
                     is_camera_moving = False
             elif msg.topic == "embedded/radar/data":
@@ -287,17 +313,24 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                     current_radar_speed = float(data.get("speed", 0.0))
                     if not all(math.isfinite(v) for v in (raw_x, raw_y, current_radar_speed)):
                         raise ValueError("non-finite radar value")
-                    with ai_metrics_ref.get_lock():
-                        ai_metrics_ref[AI_LAST_RADAR_AT] = time.time()
-                    
-                    # Cập nhật cache Zones và Room mỗi 10 giây
-                    if time.time() - last_zones_fetch > 10:
+                    # Reload configuration quickly after a dashboard save.
+                    if time.time() - last_zones_fetch > 1:
                         from database import get_all_zones, get_room_config
                         all_zones = get_all_zones()
-                        cached_safe_zones = [z for z in all_zones if z["type"] == "SAFE"]
-                        cached_danger_zones = [z for z in all_zones if z["type"] == "DANGER"]
-                        cached_room_config = get_room_config()
+                        next_safe_zones = [z for z in all_zones if z["type"] == "SAFE"]
+                        next_danger_zones = [z for z in all_zones if z["type"] == "DANGER"]
+                        next_room_config = get_room_config()
+                        changed = (next_safe_zones != cached_safe_zones or
+                                   next_danger_zones != cached_danger_zones or
+                                   next_room_config != cached_room_config)
+                        cached_safe_zones = next_safe_zones
+                        cached_danger_zones = next_danger_zones
+                        cached_room_config = next_room_config
                         last_zones_fetch = time.time()
+                        if changed:
+                            logger.info("[ZONE-CONFIG] applied safe=%d danger=%d room=%.2fx%.2fm",
+                                        len(cached_safe_zones), len(cached_danger_zones),
+                                        cached_room_config["width"], cached_room_config["length"])
 
                     # Lấy góc xoay (Yaw)
                     angle = float(cached_room_config.get("radar_angle", 0.0))
@@ -311,32 +344,56 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                     current_radar_x = cached_room_config["radar_x"] + rot_x
                     current_radar_y = cached_room_config["radar_y"] + rot_y
 
+                    radar_received_at = time.time()
+                    with ai_metrics_ref.get_lock():
+                        ai_metrics_ref[AI_LAST_RADAR_AT] = radar_received_at
+                        ai_metrics_ref[AI_RADAR_X] = current_radar_x
+                        ai_metrics_ref[AI_RADAR_Y] = current_radar_y
+                        ai_metrics_ref[AI_RADAR_SPEED] = current_radar_speed
+
+                    safe_zone = next((sz for sz in cached_safe_zones
+                                      if point_in_zone(current_radar_x, current_radar_y, sz)), None)
+
                     # Kiểm tra Danger Zone (Cảnh báo NGAY LẬP TỨC nếu dẫm vào vùng cấm)
-                    in_danger = False
-                    for dz in cached_danger_zones:
-                        if dz["x_min"] <= current_radar_x <= dz["x_max"] and dz["y_min"] <= current_radar_y <= dz["y_max"]:
-                            in_danger = True
-                            break
-                    
-                    if in_danger:
-                        if time.time() - last_danger_log > 5: # Tránh spam log
-                            logger.warning(f"CẢNH BÁO XÂM NHẬP VÙNG NGUY HIỂM ({current_radar_x}, {current_radar_y})!")
-                            # Có thể bắn Telegram luôn ở đây nếu muốn
-                            last_danger_log = time.time()
+                    danger_zone = next((dz for dz in cached_danger_zones
+                                        if point_in_zone(current_radar_x, current_radar_y, dz)), None)
+                    radar_safe_zone_state = (radar_received_at, safe_zone is not None and danger_zone is None)
+                    danger_name = danger_zone.get("name", "Danger zone") if danger_zone else None
+                    danger_key = ((danger_name, danger_zone["x_min"], danger_zone["x_max"],
+                                   danger_zone["y_min"], danger_zone["y_max"])
+                                  if danger_zone else None)
+                    if danger_key != active_danger_zone:
+                        active_danger_zone = danger_key
+                        if danger_zone:
+                            enqueue_zone_alert(
+                                "DANGER_ZONE",
+                                f"Phát hiện mục tiêu đi vào vùng nguy hiểm: {danger_name}",
+                                danger_name,
+                            )
+                    if danger_zone and time.time() - last_danger_log > 30:
+                        logger.warning("[ZONE] Target remains in danger zone %s at (%.2f, %.2f)m",
+                                       danger_name, current_radar_x, current_radar_y)
+                        last_danger_log = time.time()
+
+                    # Report the evaluated point and effective zone at a low rate so
+                    # zone setup can be diagnosed without flooding the serial/log stream.
+                    if time.time() - last_zone_status_log >= 5.0:
+                        zone_state = (f"DANGER:{danger_name}" if danger_zone else
+                                      f"SAFE:{safe_zone.get('name', 'Safe zone')}" if safe_zone else
+                                      "OUTSIDE")
+                        logger.info("[ZONE-STATE] state=%s room=(%.2f,%.2f)m radar=(%.2f,%.2f)m speed=%.2fm/s safe_zones=%d danger_zones=%d",
+                                    zone_state, current_radar_x, current_radar_y,
+                                    raw_x, raw_y, current_radar_speed, len(cached_safe_zones),
+                                    len(cached_danger_zones))
+                        last_zone_status_log = time.time()
                     
                     # Logic Cảnh báo Đi lang thang ban đêm (Dementia/Wandering)
                     # Khung giờ: 23:00 đêm đến 05:00 sáng
                     current_hour = int(time.strftime("%H"))
                     if current_hour >= 23 or current_hour < 5:
                         # Kiểm tra xem có đang ở trong Safe Zone không
-                        in_safe = False
-                        if not cached_safe_zones:
-                            in_safe = current_radar_x < 0.0 # Fallback nếu chưa cấu hình
-                        else:
-                            for sz in cached_safe_zones:
-                                if sz["x_min"] <= current_radar_x <= sz["x_max"] and sz["y_min"] <= current_radar_y <= sz["y_max"]:
-                                    in_safe = True
-                                    break
+                        # An empty safe-zone list disables the wandering alert.
+                        in_safe = bool(safe_zone) if cached_safe_zones else True
                         
                         # Ra khỏi giường (NOT in_safe) và Đang di chuyển (speed > 0.1)
                         if not in_safe and current_radar_speed > 0.1:
@@ -349,7 +406,11 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                                 wandering_start = time.time()
                             elif time.time() - wandering_start > 300: # 5 phút liên tục
                                 if not wandering_alert_sent:
-                                    logger.warning("PHÁT HIỆN ĐI LANG THANG BAN ĐÊM!")
+                                    enqueue_zone_alert(
+                                        "NIGHT_WANDERING",
+                                        "Phát hiện di chuyển liên tục ngoài vùng an toàn trong khung giờ ban đêm",
+                                        "Safe zone",
+                                    )
                                     wandering_alert_sent = True
                         else:
                             wandering_start = 0.0
@@ -436,6 +497,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
 
     fall_detector = FallDetector()
     previous_features = {}
+    last_single_person = None
     last_heartbeat = 0
     last_target_seen = time.time()
     target_lost_sent = False
@@ -483,6 +545,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
         if current_generation != processed_generation:
             fall_detector.reset()
             previous_features.clear()
+            last_single_person = None
             last_target_seen = time.time()
             target_lost_sent = False
             global_person_count = 0
@@ -533,6 +596,7 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
             continue
 
         work_started = time.perf_counter()
+        frame_motion_epoch = camera_motion_epoch
 
         # Dùng tracker mạnh hơn (botsort), conf=0.5 lọc nhiễu
         try:
@@ -549,16 +613,73 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
             continue
         
         annotated_frame = results[0].plot()
+        # Publish compact detection coordinates separately from JPEG encoding.
+        # The dashboard can draw these over the high-rate raw stream instead
+        # of waiting for a full annotated frame after every inference.
+        frame_height, frame_width = frame.shape[:2]
+        overlay_boxes = []
+        detected_boxes = results[0].boxes if len(results) > 0 else None
+        if detected_boxes is not None:
+            box_coordinates = detected_boxes.xyxy.tolist()
+            track_ids = detected_boxes.id
+            confidences = detected_boxes.conf
+            for box_index, coordinates in enumerate(box_coordinates):
+                track_id = None
+                if track_ids is not None and box_index < len(track_ids):
+                    track_id = int(track_ids[box_index].item())
+                confidence = 0.0
+                if confidences is not None and box_index < len(confidences):
+                    confidence = float(confidences[box_index].item())
+                overlay_boxes.append({
+                    "x1": float(coordinates[0]), "y1": float(coordinates[1]),
+                    "x2": float(coordinates[2]), "y2": float(coordinates[3]),
+                    "track_id": track_id, "confidence": confidence,
+                    "fall_state": "TRACKING", "fall_confirmed": False,
+                })
+        pose_data = results[0].keypoints if len(results) > 0 else None
+        if pose_data is not None:
+            pose_coordinates = pose_data.xy.tolist()
+            pose_confidences = pose_data.conf.tolist() if pose_data.conf is not None else None
+            for person_index, points in enumerate(pose_coordinates):
+                if person_index >= len(overlay_boxes):
+                    break
+                confidences = pose_confidences[person_index] if pose_confidences is not None else None
+                overlay_boxes[person_index]["keypoints"] = [
+                    {
+                        "x": float(point[0]),
+                        "y": float(point[1]),
+                        "confidence": float(confidences[point_index]) if confidences is not None and point_index < len(confidences) else 1.0,
+                    }
+                    for point_index, point in enumerate(points)
+                ]
         fall_event = None
         current_active_persons = []
 
         # Khai báo biến toàn cục đếm người cho MQTT callback
         global_person_count = 0
+        safe_zone_timestamp, radar_target_in_safe_zone = radar_safe_zone_state
+        if radar_target_in_safe_zone and time.time() - safe_zone_timestamp <= 2.0:
+            last_single_person = None
         
         if len(results) > 0 and results[0].boxes and results[0].boxes.id is not None:
-            # Lọc đếm người có độ tự tin > 0.5
-            valid_boxes = [conf for conf in results[0].boxes.conf if conf > 0.5]
+            # Count people whose pose is usable by the fall detector. A stray
+            # high-confidence box without a torso must not mute a real fall.
+            valid_boxes = []
+            pose_confidences = (results[0].keypoints.conf
+                                if results[0].keypoints is not None else None)
+            if pose_confidences is not None:
+                for box_index, confidence in enumerate(results[0].boxes.conf):
+                    if (float(confidence.item()) < fall_detector.config.min_detection_confidence
+                            or box_index >= len(pose_confidences)):
+                        continue
+                    pose_confidence = pose_confidences[box_index]
+                    torso = [float(pose_confidence[j].item()) for j in (5, 6, 11, 12)
+                             if j < len(pose_confidence)]
+                    if (torso and sum(torso) / len(torso)
+                            >= fall_detector.config.min_keypoint_confidence):
+                        valid_boxes.append(box_index)
             global_person_count = len(valid_boxes)
+            overlay_message = "FALL ALERT MUTED · MULTIPLE PEOPLE" if global_person_count >= 2 else ""
             
             if global_person_count >= 2:
                 # Vẽ thông báo MUTED lên giữa màn hình
@@ -568,6 +689,11 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
             target_lost_sent = False
             boxes = results[0].boxes
             keypoints = results[0].keypoints
+            # A handoff is only meaningful while exactly one person is visible
+            # and the camera is stationary. Never carry a fall baseline through
+            # an ambiguous multi-person frame.
+            if global_person_count != 1 or len(boxes.id) != 1 or is_camera_moving:
+                last_single_person = None
 
             for i in range(len(boxes.id)):
                 if frame_generation != camera_generation_ref.value:
@@ -671,6 +797,8 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                 # intentionally insufficient: the track must have been upright,
                 # transition with normalized downward motion, then remain stable.
                 if is_x_gesture:
+                    last_single_person = None
+                    overlay_boxes[i]["fall_state"] = "ALARM CANCELED"
                     track = fall_detector.tracks.get(obj_id)
                     if track:
                         # Reset trạng thái báo động nhưng giữ lại lịch sử để không bị mù với lần ngã sau
@@ -686,7 +814,59 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                     # Không xoá previous_features để giữ liền mạch tracking
                     continue
 
+                safe_zone_timestamp, radar_target_in_safe_zone = radar_safe_zone_state
+                if radar_target_in_safe_zone and time.time() - safe_zone_timestamp <= 2.0:
+                    # A fresh radar point in a configured SAFE zone represents
+                    # intentional rest (for example, lying on the bed). Reset
+                    # the temporal fall track so that pose changes there cannot
+                    # become a fall alarm, or carry a candidate out of the zone.
+                    fall_detector.tracks.pop(obj_id, None)
+                    previous_features.pop(obj_id, None)
+                    last_single_person = None
+                    overlay_boxes[i]["fall_state"] = "SAFE ZONE"
+                    overlay_boxes[i]["fall_confirmed"] = False
+                    cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 200, 120), 2)
+                    cv2.putText(annotated_frame, "SAFE ZONE", (int(x1), max(20, int(y1)-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 120), 2)
+                    continue
+
                 current_t = time.monotonic()
+                detection_confidence = float(boxes.conf[i].item()) if boxes.conf is not None else 0.0
+                valid_pose = (detection_confidence >= fall_detector.config.min_detection_confidence
+                              and keypoint_confidence >= fall_detector.config.min_keypoint_confidence
+                              and height > 8.0
+                              and all(math.isfinite(value) for value in (com_y, head_y, hip_y)))
+                if (valid_pose and global_person_count == 1 and len(boxes.id) == 1
+                        and not is_camera_moving and frame_motion_epoch == camera_motion_epoch
+                        and obj_id not in fall_detector.tracks
+                        and last_single_person is not None):
+                    old_id, old_box, old_generation, old_motion_epoch = last_single_person
+                    eligible_ids = [
+                        track_id for track_id, track in fall_detector.tracks.items()
+                        if track_id != obj_id and track.state in ("upright", "candidate")
+                        and track.observations
+                        and 0.0 <= current_t - track.observations[-1].timestamp
+                        <= fall_detector.config.max_observation_gap
+                    ]
+                    if (old_generation == frame_generation and old_motion_epoch == camera_motion_epoch
+                            and old_id != obj_id
+                            and eligible_ids == [old_id]):
+                        overlap_w = max(0.0, min(old_box[2], x2) - max(old_box[0], x1))
+                        overlap_h = max(0.0, min(old_box[3], y2) - max(old_box[1], y1))
+                        overlap = overlap_w * overlap_h
+                        old_area = max(1.0, (old_box[2] - old_box[0]) * (old_box[3] - old_box[1]))
+                        new_area = max(1.0, (x2 - x1) * (y2 - y1))
+                        iou = overlap / max(1.0, old_area + new_area - overlap)
+                        center_distance = math.hypot(
+                            (x1 + x2 - old_box[0] - old_box[2]) / 2.0,
+                            (y1 + y2 - old_box[1] - old_box[3]) / 2.0,
+                        )
+                        box_scale = max(old_box[2] - old_box[0], old_box[3] - old_box[1])
+                        if iou >= 0.10 or (overlap > 0.0 and center_distance <= 0.45 * box_scale):
+                            fall_detector.tracks[obj_id] = fall_detector.tracks.pop(old_id)
+                            if old_id in previous_features:
+                                previous_features[obj_id] = previous_features.pop(old_id)
+                            logger.info("[FALL-TRACK] Continued single person from ID %s to ID %s", old_id, obj_id)
+
                 prior = previous_features.get(obj_id)
                 posture_motion = 0.0
                 if prior:
@@ -697,9 +877,9 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                     dt = max(1e-3, current_t - prior[0])
                     posture_motion = abs(spine_angle - prior[1]) / 90.0 / dt
                 previous_features[obj_id] = (current_t, spine_angle, com_y)
-                detection_confidence = float(boxes.conf[i].item()) if boxes.conf is not None else 0.0
                 # Chỉ chạy Fall Detector nếu có đúng 1 người trong phòng (tiết kiệm CPU)
                 if global_person_count >= 2:
+                    overlay_boxes[i]["fall_state"] = "MUTED"
                     continue
                 decision = fall_detector.update(obj_id, FallObservation(
                     timestamp=current_t,
@@ -716,6 +896,17 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                     face_visible=face_visible,
                     is_camera_moving=is_camera_moving
                 ))
+                if (valid_pose and global_person_count == 1 and len(boxes.id) == 1
+                        and not is_camera_moving and frame_motion_epoch == camera_motion_epoch
+                        and decision.state in ("upright", "candidate")
+                        and fall_detector.tracks[obj_id].observations
+                        and fall_detector.tracks[obj_id].observations[-1].timestamp == current_t):
+                    last_single_person = (obj_id, (x1, y1, x2, y2), frame_generation,
+                                          frame_motion_epoch)
+                else:
+                    last_single_person = None
+                overlay_boxes[i]["fall_state"] = str(decision.state).upper()
+                overlay_boxes[i]["fall_confirmed"] = bool(decision.confirmed)
                 if (decision.newly_confirmed and global_person_count == 1 and
                         frame_generation == camera_generation_ref.value):
                     logger.warning(f"CẢNH BÁO KHẨN CẤP: BỆNH NHÂN ĐƠN ĐỘC TÉ NGÃ (Track ID {obj_id})!")
@@ -737,6 +928,8 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
                 cv2.putText(annotated_frame, label, (int(x1), max(20, int(y1)-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         else:
             # Không thấy người nào trong khung hình
+            if is_camera_moving:
+                last_single_person = None
             if (frame_generation == camera_generation_ref.value and not target_lost_sent and
                     time.time() - last_target_seen > 3.0):
                 try: 
@@ -746,17 +939,35 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
 
         fall_detector.prune(time.monotonic())
         
-        # --- Vẽ HUD Radar 2D lên góc phải màn hình ---
-        if current_radar_x != 0.0 or current_radar_y != 0.0:
-            hud_text = f"X: {current_radar_x:.1f}m | Y: {current_radar_y:.1f}m | V: {current_radar_speed:.2f}m/s"
+        # Only show a position while the radar is sending fresh readings.
+        with ai_metrics_ref.get_lock():
+            last_radar_at = ai_metrics_ref[AI_LAST_RADAR_AT]
+        radar_online = last_radar_at > 0.0 and 0.0 <= time.time() - last_radar_at <= 5.0
+        if radar_online or last_radar_at > 0.0:
+            hud_text = (f"X: {current_radar_x:.1f}m | Y: {current_radar_y:.1f}m | V: {current_radar_speed:.2f}m/s"
+                        if radar_online else "RADAR: STALE")
             frame_h, frame_w = annotated_frame.shape[:2]
             text_size = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
             text_x = frame_w - text_size[0] - 20
-            
-            # Cảnh báo màu đỏ nếu tốc độ bằng 0 trong thời gian dài (có thể đang bất tỉnh) hoặc ở vùng rìa
-            color = (0, 255, 255)
+            color = (0, 255, 255) if radar_online else (0, 165, 255)
             cv2.putText(annotated_frame, hud_text, (text_x, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         # --------------------------------------------------------
+
+        # Publish the pose/fall overlay after per-person state is known. The
+        # payload stays small compared with another full-resolution JPEG.
+        if overlay_q is not None and frame_generation == camera_generation_ref.value:
+            put_latest_frame(overlay_q, (frame_generation, {
+                "timestamp": time.time(),
+                "width": int(frame_width),
+                "height": int(frame_height),
+                "message": overlay_message if global_person_count >= 2 else "",
+                "radar": {
+                    "x": float(current_radar_x),
+                    "y": float(current_radar_y),
+                    "speed": float(current_radar_speed),
+                } if radar_online else None,
+                "detections": overlay_boxes,
+            }))
 
         # Tối ưu hóa nén luồng hình ảnh để giảm băng thông VPS (JPEG Quality 65%)
         encode_started = time.perf_counter()
@@ -783,8 +994,10 @@ def ai_process(raw_q: mp.Queue, mjpeg_q: mp.Queue, alert_q: mp.Queue,
         if fall_event is not None and frame_generation == camera_generation_ref.value:
             if encoded_jpeg is not None:
                 fall_event["snapshot_jpeg"] = encoded_jpeg
-            if put_latest_frame(alert_q, fall_event):
-                logger.warning("[ALERT] Alert queue saturated; one fall event may have been dropped")
+            try:
+                alert_q.put_nowait(fall_event)
+            except queue.Full:
+                logger.error("[ALERT] Alert queue is full; fall event could not be queued")
             
         
 
@@ -815,8 +1028,18 @@ ai_metrics_ref = None
 ai_target_fps_ref = None
 p_cam = None
 p_ai = None
+ai_overlay_q = None
 latest_mjpeg_bytes = b""
 latest_preview_bytes = b""
+latest_ai_overlay = {
+    "timestamp": 0.0,
+    "width": 0,
+    "height": 0,
+    "message": "",
+    "radar": {"x": 0.0, "y": 0.0, "speed": 0.0},
+    "detections": [],
+    "generation": -1,
+}
 ai_frame_version = 0
 preview_frame_version = 0
 last_ai_frame_at = 0.0
@@ -980,6 +1203,21 @@ async def pump_alert_events() -> None:
         try:
             if not isinstance(fall_event, dict):
                 continue
+            if fall_event.get("kind") == "zone":
+                event_code = str(fall_event.get("event_code", "ZONE_ALERT"))
+                message = str(fall_event.get("message", "Zone boundary event"))
+                event_timestamp = float(fall_event.get("timestamp", time.time()))
+                log_alert(event_code, message, "")
+                await broadcast_alert({
+                    "type": "CRITICAL_ALERT",
+                    "event_code": event_code,
+                    "message": message,
+                    "zone_name": fall_event.get("zone_name", ""),
+                    "pos_x": fall_event.get("pos_x"),
+                    "pos_y": fall_event.get("pos_y"),
+                    "timestamp": event_timestamp,
+                })
+                continue
             with camera_source_ref.get_lock():
                 if fall_event.get("camera_generation") != camera_generation_ref.value:
                     continue
@@ -1050,7 +1288,8 @@ async def pump_alert_events() -> None:
 
 async def pump_video_frames():
     """One queue reader fans each fresh JPEG out to every browser client."""
-    global latest_mjpeg_bytes, latest_preview_bytes, ai_frame_version, preview_frame_version, last_ai_frame_at
+    global latest_mjpeg_bytes, latest_preview_bytes, latest_ai_overlay
+    global ai_frame_version, preview_frame_version, last_ai_frame_at
     while not shutdown_flag.value:
         for frame_q, kind in ((preview_q, "preview"), (mjpeg_q, "ai")):
             newest = None
@@ -1071,6 +1310,18 @@ async def pump_video_frames():
                         latest_mjpeg_bytes = jpeg
                         ai_frame_version += 1
                         last_ai_frame_at = time.time()
+
+        newest_overlay = None
+        while True:
+            try:
+                newest_overlay = ai_overlay_q.get_nowait()
+            except queue.Empty:
+                break
+        if newest_overlay is not None:
+            frame_generation, overlay = newest_overlay
+            with camera_source_ref.get_lock():
+                if frame_generation == camera_generation_ref.value:
+                    latest_ai_overlay = {**overlay, "generation": frame_generation}
         await asyncio.sleep(0.01)
 
 
@@ -1100,7 +1351,7 @@ def watchdog_task():
             p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q,
                                                         camera_generation_ref, ai_metrics_ref,
                                                         ai_target_fps_ref,
-                                                        shutdown_flag))
+                                                        shutdown_flag, ai_overlay_q))
             p_ai.daemon = True
             p_ai.start()
 
@@ -1108,11 +1359,21 @@ def watchdog_task():
 async def lifespan(app: FastAPI):
     global raw_q, preview_q, mjpeg_q, alert_q, shutdown_flag, last_camera_frame_at
     global camera_source_ref, camera_generation_ref, camera_metrics_ref, ai_metrics_ref, ai_target_fps_ref
-    global p_cam, p_ai, control_mqtt_client
+    global p_cam, p_ai, ai_overlay_q, latest_ai_overlay, control_mqtt_client
     
     raw_q = mp.Queue(maxsize=1)
     preview_q = mp.Queue(maxsize=1)
     mjpeg_q = mp.Queue(maxsize=1)
+    ai_overlay_q = mp.Queue(maxsize=1)
+    latest_ai_overlay = {
+        "timestamp": 0.0,
+        "width": 0,
+        "height": 0,
+        "message": "",
+        "radar": {"x": 0.0, "y": 0.0, "speed": 0.0},
+        "detections": [],
+        "generation": -1,
+    }
     # Fall events are sparse but must not be discarded just because a second
     # person triggers while a snapshot or a slow dashboard is being handled.
     # Keep this queue bounded because each event can carry one JPEG snapshot.
@@ -1123,7 +1384,7 @@ async def lifespan(app: FastAPI):
     camera_source_ref.get_obj().value = VIDEO_SOURCE
     camera_generation_ref = mp.Value('L', 0)
     camera_metrics_ref = mp.Array('d', 8)
-    ai_metrics_ref = mp.Array('d', 8)
+    ai_metrics_ref = mp.Array('d', 11)
     ai_target_fps_ref = mp.Value('d', float(AI_INITIAL_FPS))
     
     p_cam = mp.Process(target=camera_process, args=(raw_q, preview_q, last_camera_frame_at,
@@ -1134,7 +1395,7 @@ async def lifespan(app: FastAPI):
     p_ai = mp.Process(target=ai_process, args=(raw_q, mjpeg_q, alert_q,
                                                 camera_generation_ref, ai_metrics_ref,
                                                 ai_target_fps_ref,
-                                                shutdown_flag))
+                                                shutdown_flag, ai_overlay_q))
     p_ai.daemon = True
     p_cam.start()
     p_ai.start()
@@ -1241,6 +1502,39 @@ async def video_live() -> StreamingResponse:
     return StreamingResponse(video_frame_generator(preview=True), media_type="multipart/x-mixed-replace; boundary=frame", headers=VIDEO_STREAM_HEADERS)
 
 
+@app.get("/api/v1/video/detections")
+def video_detections():
+    """Return only the latest lightweight AI boxes for the raw dashboard video."""
+    snapshot = latest_ai_overlay
+    now = time.time()
+    timestamp = float(snapshot.get("timestamp", 0.0))
+    age_ms = max(0.0, (now - timestamp) * 1000.0) if timestamp else None
+    if camera_source_ref is not None:
+        with camera_source_ref.get_lock():
+            current_generation = camera_generation_ref.value
+    else:
+        current_generation = 0
+    fresh = (
+        timestamp > 0.0
+        and snapshot.get("generation") == current_generation
+        and age_ms is not None
+        and age_ms <= 1500.0
+        and p_ai is not None
+        and p_ai.is_alive()
+    )
+    return {
+        "status": "success",
+        "fresh": fresh,
+        "timestamp": timestamp if fresh else None,
+        "age_ms": round(age_ms, 1) if age_ms is not None else None,
+        "width": int(snapshot.get("width", 0)) if fresh else 0,
+        "height": int(snapshot.get("height", 0)) if fresh else 0,
+        "message": snapshot.get("message", "") if fresh else "",
+        "radar": snapshot.get("radar", {"x": 0.0, "y": 0.0, "speed": 0.0}) if fresh else None,
+        "detections": snapshot.get("detections", []) if fresh else [],
+    }
+
+
 @app.get("/api/v1/video/status")
 def video_status():
     if camera_source_ref is not None:
@@ -1257,8 +1551,20 @@ def video_status():
     ai_age_seconds = max(0.0, now - last_ai_frame) if last_ai_frame else None
     raw_online = age_seconds is not None and age_seconds < 3.0
     ai_online = ai_age_seconds is not None and ai_age_seconds < 3.0
+    overlay_snapshot = latest_ai_overlay
+    overlay_timestamp = float(overlay_snapshot.get("timestamp", 0.0))
+    overlay_age_ms = max(0.0, (now - overlay_timestamp) * 1000.0) if overlay_timestamp else None
+    overlay_fresh = (
+        overlay_timestamp > 0.0
+        and overlay_snapshot.get("generation") == generation
+        and overlay_age_ms is not None
+        and overlay_age_ms <= 1500.0
+        and p_ai is not None
+        and p_ai.is_alive()
+    )
+    overlay_detections = overlay_snapshot.get("detections", []) if overlay_fresh else []
     camera_metrics = [0.0] * 8
-    ai_metrics = [0.0] * 8
+    ai_metrics = [0.0] * 11
     if camera_metrics_ref is not None:
         with camera_metrics_ref.get_lock():
             camera_metrics = list(camera_metrics_ref[:])
@@ -1273,6 +1579,11 @@ def video_status():
         "ai_age_seconds": round(ai_age_seconds, 2) if ai_age_seconds is not None else None,
         "camera_worker_alive": p_cam is not None and p_cam.is_alive(),
         "ai_worker_alive": p_ai is not None and p_ai.is_alive(),
+        "ai_model": Path(POSE_MODEL_PATH).name,
+        "ai_overlay_fresh": overlay_fresh,
+        "ai_overlay_age_ms": round(overlay_age_ms, 1) if overlay_age_ms is not None else None,
+        "ai_detection_count": len(overlay_detections),
+        "ai_fall_states": [item.get("fall_state", "TRACKING") for item in overlay_detections],
         "raw_fps": round(camera_metrics[CAM_FPS], 1) if raw_online else 0.0,
         "ai_decode_fps": round(camera_metrics[CAM_AI_DECODE_FPS], 1) if raw_online else 0.0,
         "raw_kBps": round(camera_metrics[CAM_KBPS], 1) if raw_online else 0.0,
@@ -1381,11 +1692,77 @@ def update_camera_config(request: CameraIpRequest):
     return {"status": "success", "camera_ip": str(address), "source": source,
             "generation": generation}
 
+@app.get("/api/v1/radar/status")
+def get_radar_status_api():
+    """Return the newest radar point and the zone classification used by the backend."""
+    now = time.time()
+    if ai_metrics_ref is None:
+        return {
+            "status": "success", "online": False, "age_seconds": None,
+            "zone_state": "WAITING", "zone_name": None, "data": None,
+            "safe_zone_count": 0, "danger_zone_count": 0,
+        }
+
+    with ai_metrics_ref.get_lock():
+        metrics = list(ai_metrics_ref[:])
+    timestamp = metrics[AI_LAST_RADAR_AT]
+    age = max(0.0, now - timestamp) if timestamp else None
+    online = age is not None and age <= 5.0
+    data = None
+    zone_state = "WAITING" if timestamp == 0.0 else "STALE"
+    zone_name = None
+    safe_zones = []
+    danger_zones = []
+
+    try:
+        from database import get_all_zones
+        all_zones = get_all_zones()
+        safe_zones = [zone for zone in all_zones if zone["type"] == "SAFE"]
+        danger_zones = [zone for zone in all_zones if zone["type"] == "DANGER"]
+    except Exception as exc:
+        logger.warning("Could not load radar zones for live status: %s", exc)
+
+    if timestamp:
+        point_x = metrics[AI_RADAR_X]
+        point_y = metrics[AI_RADAR_Y]
+        point_speed = metrics[AI_RADAR_SPEED]
+        data = {
+            "timestamp": timestamp,
+            "pos_x": point_x,
+            "pos_y": point_y,
+            "speed": point_speed,
+        }
+        if online:
+            danger_zone = next((zone for zone in danger_zones
+                                if point_in_zone(point_x, point_y, zone)), None)
+            safe_zone = next((zone for zone in safe_zones
+                              if point_in_zone(point_x, point_y, zone)), None)
+            if danger_zone:
+                zone_state = "DANGER"
+                zone_name = danger_zone.get("name") or "Danger zone"
+            elif safe_zone:
+                zone_state = "SAFE"
+                zone_name = safe_zone.get("name") or "Safe zone"
+            else:
+                zone_state = "OUTSIDE"
+
+    return {
+        "status": "success",
+        "online": online,
+        "age_seconds": round(age, 2) if age is not None else None,
+        "zone_state": zone_state,
+        "zone_name": zone_name,
+        "safe_zone_count": len(safe_zones),
+        "danger_zone_count": len(danger_zones),
+        "data": data,
+    }
+
+
 @app.get("/api/v1/radar/history")
 async def get_radar_history(limit: int = 50):
     import sqlite3
     try:
-        conn = sqlite3.connect("local_alerts.db")
+        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('SELECT timestamp, pos_x, pos_y, speed FROM radar_logs ORDER BY timestamp DESC LIMIT ?', (limit,))
         rows = c.fetchall()

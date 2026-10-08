@@ -84,6 +84,22 @@ const translations: Record<Language, Dictionary> = {
     "radar.recordTrail": "Record Trail",
     "radar.recording": "Recording...",
     "radar.refresh": "Refresh",
+    "radar.mapLiveStatus": "Live radar",
+    "radar.mapStatus.loading": "Connecting to radar data...",
+    "radar.mapStatus.live": "Radar is tracking a target",
+    "radar.mapStatus.waiting": "No radar coordinates received. Check whether new_bytes, frames, and published increase in the ESP32 Serial Monitor.",
+    "radar.mapStatus.stale": "Radar target updates stopped. Check the sensor and MQTT connection.",
+    "radar.mapStatus.offline": "Cannot reach the radar status API.",
+    "radar.pointInSafeZone": "INSIDE SAFE ZONE — {zone}",
+    "radar.pointInDangerZone": "INSIDE DANGER ZONE — {zone}",
+    "radar.pointOutsideZones": "OUTSIDE SAFE AND DANGER ZONES",
+    "radar.backendZoneState": "Backend evaluation",
+    "radar.zoneOutsideRoom": "{count} zone(s) extend outside the room. Use the numeric fields to bring them inside.",
+    "radar.invalidZone": "Check each zone: min must be below max, and the zone must stay inside the room.",
+    "radar.mapAccessibleLabel": "Radar room map with editable safe and danger zones",
+    "radar.mapEditHint": "Drag a colored zone to reposition it; use the fields on the left to resize it. Save the configuration when finished.",
+    "radar.mapStatusHint": "The target dot appears only while radar data is fresh.",
+    "radar.targetMarker": "Patient position",
 
     // Incident Logs
     "logs.title": "Incident Logs",
@@ -139,6 +155,8 @@ const translations: Record<Language, Dictionary> = {
     
     // Alerts (Backend overrides)
     "alert.FALL_DETECTED": "Alert: Patient fall detected!",
+    "alert.DANGER_ZONE": "Warning: A target entered a danger zone.",
+    "alert.NIGHT_WANDERING": "Warning: Movement continued outside the safe zone at night.",
     "alert.SYSTEM_ERROR": "System error occurred.",
   },
   vi: {
@@ -217,6 +235,22 @@ const translations: Record<Language, Dictionary> = {
     "radar.recordTrail": "Lưu quỹ đạo",
     "radar.recording": "Đang ghi hình...",
     "radar.refresh": "Làm mới",
+    "radar.mapLiveStatus": "Radar đang hoạt động",
+    "radar.mapStatus.loading": "Đang kết nối dữ liệu radar...",
+    "radar.mapStatus.live": "Radar đang theo dõi mục tiêu",
+    "radar.mapStatus.waiting": "Chưa nhận được tọa độ radar. Trên Serial Monitor ESP32, kiểm tra new_bytes, frames và published có tăng không.",
+    "radar.mapStatus.stale": "Tọa độ radar đã ngừng cập nhật. Kiểm tra cảm biến và kết nối MQTT.",
+    "radar.mapStatus.offline": "Không kết nối được API trạng thái radar.",
+    "radar.pointInSafeZone": "TRONG VÙNG AN TOÀN — {zone}",
+    "radar.pointInDangerZone": "TRONG VÙNG NGUY HIỂM — {zone}",
+    "radar.pointOutsideZones": "NGOÀI VÙNG AN TOÀN VÀ NGUY HIỂM",
+    "radar.backendZoneState": "Backend đang đánh giá",
+    "radar.zoneOutsideRoom": "Có {count} vùng vượt ra ngoài kích thước phòng. Hãy dùng các ô số để đưa vùng vào trong phòng.",
+    "radar.invalidZone": "Kiểm tra từng vùng: giá trị MIN phải nhỏ hơn MAX và vùng phải nằm trong phòng.",
+    "radar.mapAccessibleLabel": "Bản đồ phòng radar có thể chỉnh sửa vùng an toàn và nguy hiểm",
+    "radar.mapEditHint": "Kéo vùng màu để đổi vị trí; dùng các ô số bên trái để đổi kích thước. Nhấn Lưu cấu hình khi hoàn tất.",
+    "radar.mapStatusHint": "Chấm mục tiêu chỉ hiện khi dữ liệu radar còn mới.",
+    "radar.targetMarker": "Vị trí bệnh nhân",
 
     // Incident Logs
     "logs.title": "Nhật ký sự cố",
@@ -272,6 +306,8 @@ const translations: Record<Language, Dictionary> = {
 
     // Alerts (Backend overrides)
     "alert.FALL_DETECTED": "Cảnh báo: Phát hiện bệnh nhân bị ngã!",
+    "alert.DANGER_ZONE": "Cảnh báo: Có mục tiêu đi vào vùng nguy hiểm.",
+    "alert.NIGHT_WANDERING": "Cảnh báo: Phát hiện di chuyển liên tục ngoài vùng an toàn ban đêm.",
     "alert.SYSTEM_ERROR": "Đã xảy ra lỗi hệ thống.",
   }
 };

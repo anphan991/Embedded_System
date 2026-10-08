@@ -1,8 +1,9 @@
 import sqlite3
 import time
-import os
+import math
+from pathlib import Path
 
-DB_PATH = "local_alerts.db"
+DB_PATH = str(Path(__file__).resolve().parent / "local_alerts.db")
 
 def init_db():
     """Khởi tạo CSDL SQLite nếu chưa có"""
@@ -127,17 +128,61 @@ def get_all_zones():
         print(f"Database error: {e}")
         return []
 
+def point_in_zone(x: float, y: float, zone: dict) -> bool:
+    """Return whether a finite room-coordinate point is inside a zone, inclusive of its edges."""
+    try:
+        values = (float(x), float(y), float(zone["x_min"]), float(zone["x_max"]),
+                  float(zone["y_min"]), float(zone["y_max"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in values):
+        return False
+    point_x, point_y, x_min, x_max, y_min, y_max = values
+    return x_min <= point_x <= x_max and y_min <= point_y <= y_max
+
 def update_zones(zones: list):
-    """Xóa các vùng cũ và lưu cấu hình vùng mới"""
+    """Validate and atomically replace the configured radar zones."""
+    if not isinstance(zones, list):
+        raise ValueError("zones must be a list")
+    if len(zones) > 32:
+        raise ValueError("at most 32 zones are supported")
+
+    normalized = []
+    room = get_room_config()
+    room_width = float(room["width"])
+    room_length = float(room["length"])
+    for index, zone in enumerate(zones):
+        if not isinstance(zone, dict):
+            raise ValueError(f"zone {index + 1} must be an object")
+        zone_type = str(zone.get("type", "")).strip().upper()
+        if zone_type not in {"SAFE", "DANGER"}:
+            raise ValueError(f"zone {index + 1} type must be SAFE or DANGER")
+
+        try:
+            x_min, x_max, y_min, y_max = (
+                float(zone[key]) for key in ("x_min", "x_max", "y_min", "y_max")
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"zone {index + 1} coordinates must be numbers") from exc
+        if not all(math.isfinite(value) for value in (x_min, x_max, y_min, y_max)):
+            raise ValueError(f"zone {index + 1} coordinates must be finite")
+        if x_min >= x_max or y_min >= y_max:
+            raise ValueError(f"zone {index + 1} minimums must be smaller than maximums")
+        if (x_min < 0 or y_min < 0 or
+                x_max > room_width or y_max > room_length):
+            raise ValueError(f"zone {index + 1} must stay inside the configured room")
+
+        name = str(zone.get("name", "")).strip()[:80] or f"{zone_type.title()} zone"
+        normalized.append((zone_type, name, x_min, x_max, y_min, y_max))
+
     conn = sqlite3.connect(DB_PATH)
     try:
         c = conn.cursor()
         c.execute('DELETE FROM zones_config')
-        for z in zones:
-            c.execute('''
-                INSERT INTO zones_config (zone_type, name, x_min, x_max, y_min, y_max)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (z["type"], z["name"], z["x_min"], z["x_max"], z["y_min"], z["y_max"]))
+        c.executemany('''
+            INSERT INTO zones_config (zone_type, name, x_min, x_max, y_min, y_max)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', normalized)
         conn.commit()
     except Exception:
         conn.rollback()

@@ -18,7 +18,7 @@ export type ZoneConfig = {
 export default function AnalyticsPage() {
   const { t } = useTranslation();
   const [config, setConfig] = useState({
-    roomWidth: 4000,
+    roomWidth: 5000,
     roomLength: 5000,
     radarPosX: 2000,
     radarPosY: 0,
@@ -81,55 +81,83 @@ export default function AnalyticsPage() {
   }, []);
 
   const handleSave = async () => {
-    setSaving(true);
     setSaveStatus("");
+    const invalidZone = zones.some((zone) => {
+      const raw = [zone.x_min, zone.x_max, zone.y_min, zone.y_max];
+      if (raw.some((value) => String(value).trim() === "")) return true;
+      const [xMin, xMax, yMin, yMax] = raw.map(Number);
+      return ![xMin, xMax, yMin, yMax].every(Number.isFinite) ||
+        xMin < 0 || yMin < 0 || xMax > config.roomWidth || yMax > config.roomLength ||
+        xMin >= xMax || yMin >= yMax;
+    });
+    if (invalidZone) {
+      setSaveStatus(t("radar.invalidZone"));
+      return;
+    }
+
+    setSaving(true);
     try {
       const baseUrl = getBackendBaseUrl();
-      const [roomResponse, zonesResponse] = await Promise.all([
-        fetch(`${baseUrl}/api/v1/config/room`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            width: config.roomWidth / 1000,
-            length: config.roomLength / 1000,
-            radar_x: config.radarPosX / 1000,
-            radar_y: config.radarPosY / 1000,
-            radar_angle: config.radarYaw,
-          }),
+      const roomResponse = await fetch(`${baseUrl}/api/v1/config/room`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          width: config.roomWidth / 1000,
+          length: config.roomLength / 1000,
+          radar_x: config.radarPosX / 1000,
+          radar_y: config.radarPosY / 1000,
+          radar_angle: config.radarYaw,
         }),
-        fetch(`${baseUrl}/api/v1/config/zones`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            zones: zones.map((zone) => ({
-              ...zone,
-              x_min: Number(zone.x_min) / 1000,
-              x_max: Number(zone.x_max) / 1000,
-              y_min: Number(zone.y_min) / 1000,
-              y_max: Number(zone.y_max) / 1000,
-            })),
-          }),
+      });
+      const roomResult = await roomResponse.json();
+      if (!roomResponse.ok || roomResult.status !== "success") {
+        throw new Error(roomResult.message || "Room configuration could not be saved");
+      }
+
+      const zonesResponse = await fetch(`${baseUrl}/api/v1/config/zones`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          zones: zones.map((zone) => ({
+            ...zone,
+            x_min: Number(zone.x_min) / 1000,
+            x_max: Number(zone.x_max) / 1000,
+            y_min: Number(zone.y_min) / 1000,
+            y_max: Number(zone.y_max) / 1000,
+          })),
         }),
-      ]);
-      const [roomResult, zonesResult] = await Promise.all([
-        roomResponse.json(),
-        zonesResponse.json(),
-      ]);
-      if (!roomResponse.ok || !zonesResponse.ok || roomResult.status !== "success" || zonesResult.status !== "success") {
-        throw new Error("Radar configuration could not be saved");
+      });
+      const zonesResult = await zonesResponse.json();
+      if (!zonesResponse.ok || zonesResult.status !== "success") {
+        throw new Error(zonesResult.message || "Zone configuration could not be saved");
       }
       setSaveStatus(t("radar.saved"));
-    } catch {
-      setSaveStatus(t("radar.saveFailed"));
+    } catch (error) {
+      setSaveStatus(error instanceof Error && error.message
+        ? error.message
+        : t("radar.saveFailed"));
     } finally {
       setSaving(false);
     }
   };
 
   const handleZoneChange = (index: number, field: keyof ZoneConfig, value: string) => {
-    const newZones = [...zones];
-    newZones[index] = { ...newZones[index], [field]: field === 'name' ? value : Number(value) };
-    setZones(newZones);
+    setSaveStatus("");
+    setZones((previous) => previous.map((zone, zoneIndex) =>
+      zoneIndex === index ? { ...zone, [field]: value } : zone));
+  };
+
+  const handleZoneMove = (index: number, bounds: { x_min: number; x_max: number; y_min: number; y_max: number }) => {
+    setSaveStatus("");
+    setZones((previous) => previous.map((zone, zoneIndex) => zoneIndex === index
+      ? {
+          ...zone,
+          x_min: Math.round(bounds.x_min * 1000),
+          x_max: Math.round(bounds.x_max * 1000),
+          y_min: Math.round(bounds.y_min * 1000),
+          y_max: Math.round(bounds.y_max * 1000),
+        }
+      : zone));
   };
 
   return (
@@ -150,19 +178,21 @@ export default function AnalyticsPage() {
           </div>
         </div>
         
-        <button 
-          onClick={handleSave}
-          disabled={saving}
-          className={`flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-lg transition-colors shadow-sm ${
-            saving 
-              ? 'bg-indigo-400 text-white cursor-not-allowed' 
-              : 'bg-indigo-600 hover:bg-indigo-700 text-white'
-          }`}
-        >
-          <Save className="w-4 h-4" />
-          {saving ? t("radar.saving") : t("radar.saveConfig")}
-        </button>
-        {saveStatus && <span role="status" className="text-xs font-medium text-slate-500">{saveStatus}</span>}
+        <div className="flex flex-col items-end gap-1.5">
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className={`flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-lg transition-colors shadow-sm ${
+              saving
+                ? 'bg-indigo-400 text-white cursor-not-allowed'
+                : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+            }`}
+          >
+            <Save className="w-4 h-4" />
+            {saving ? t("radar.saving") : t("radar.saveConfig")}
+          </button>
+          {saveStatus && <span role="status" className="text-xs font-medium text-slate-500">{saveStatus}</span>}
+        </div>
       </header>
 
       {/* Main Content - Full Height Flex */}
@@ -242,7 +272,7 @@ export default function AnalyticsPage() {
                   <div>
                     <div className="flex justify-between text-xs mb-1.5">
                       <label className="font-medium text-slate-700 dark:text-slate-300">{t("radar.radarYaw")} (Â°)</label>
-                      <span className="text-slate-500">{config.radarYaw}Â°</span>
+                      <span className="text-slate-500">{config.radarYaw}°</span>
                     </div>
                     <input 
                       type="range" min="-180" max="180" step="5"
@@ -275,19 +305,19 @@ export default function AnalyticsPage() {
                       <div className="grid grid-cols-2 gap-3">
                         <div className="flex flex-col gap-1">
                           <label className="text-[10px] text-slate-500">X MIN (mm)</label>
-                          <input type="number" step="100" value={zone.x_min} onChange={e => handleZoneChange(idx, 'x_min', e.target.value)} className="bg-white dark:bg-[#0b0f19] p-1.5 text-xs rounded border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200" />
+                          <input type="number" min="0" max={config.roomWidth} step="100" value={zone.x_min} onChange={e => handleZoneChange(idx, 'x_min', e.target.value)} className="bg-white dark:bg-[#0b0f19] p-1.5 text-xs rounded border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200" />
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="text-[10px] text-slate-500">X MAX (mm)</label>
-                          <input type="number" step="100" value={zone.x_max} onChange={e => handleZoneChange(idx, 'x_max', e.target.value)} className="bg-white dark:bg-[#0b0f19] p-1.5 text-xs rounded border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200" />
+                          <input type="number" min="0" max={config.roomWidth} step="100" value={zone.x_max} onChange={e => handleZoneChange(idx, 'x_max', e.target.value)} className="bg-white dark:bg-[#0b0f19] p-1.5 text-xs rounded border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200" />
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="text-[10px] text-slate-500">Y MIN (mm)</label>
-                          <input type="number" step="100" value={zone.y_min} onChange={e => handleZoneChange(idx, 'y_min', e.target.value)} className="bg-white dark:bg-[#0b0f19] p-1.5 text-xs rounded border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200" />
+                          <input type="number" min="0" max={config.roomLength} step="100" value={zone.y_min} onChange={e => handleZoneChange(idx, 'y_min', e.target.value)} className="bg-white dark:bg-[#0b0f19] p-1.5 text-xs rounded border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200" />
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="text-[10px] text-slate-500">Y MAX (mm)</label>
-                          <input type="number" step="100" value={zone.y_max} onChange={e => handleZoneChange(idx, 'y_max', e.target.value)} className="bg-white dark:bg-[#0b0f19] p-1.5 text-xs rounded border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200" />
+                          <input type="number" min="0" max={config.roomLength} step="100" value={zone.y_max} onChange={e => handleZoneChange(idx, 'y_max', e.target.value)} className="bg-white dark:bg-[#0b0f19] p-1.5 text-xs rounded border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200" />
                         </div>
                       </div>
                     </div>
@@ -339,7 +369,8 @@ export default function AnalyticsPage() {
               radar_x: config.radarPosX / 1000,
               radar_y: config.radarPosY / 1000,
               radar_angle: config.radarYaw
-            }} 
+            }}
+            onZoneChange={handleZoneMove}
           />
         </div>
 

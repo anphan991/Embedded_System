@@ -61,9 +61,11 @@ Embedded system/
 │   ├── database.py                # SQLite event metadata
 │   ├── requirements.txt           # Python dependencies
 │   ├── .env.example               # Environment template
+│   ├── yolov8m-pose.pt            # Accuracy-priority pose model, if included
 │   ├── mosquitto_local.conf       # LAN broker example
 │   ├── mock_hardware.py            # MQTT hardware simulator
 │   ├── test_fall_detection.py
+│   ├── test_zone_config.py
 │   └── test_servo_control.py
 ├── frontend/
 │   ├── app/
@@ -81,7 +83,6 @@ Embedded system/
 │   ├── esp32_cam_stream.ino       # Flash this sketch to the ESP32-CAM
 │   └── esp32_cam_radar.ino        # Flash this sketch to the ESP32 DevKit
 ├── snapshots/                     # Runtime snapshots, if enabled
-├── yolov8m-pose.pt                # Pose-model weights, if included locally
 ├── README-en.md                   # English project guide
 └── README.md                      # Vietnamese project guide / root readme
 ```
@@ -99,13 +100,15 @@ Local `.env` files, virtual environments, model exports, logs, databases, and sn
 
 The camera board shown in the project setup uses an ESP-32S module and an OV3660 flex. The camera firmware currently selects the AI Thinker ESP32 pin profile based on the board configuration that has previously worked. The carrier-board pinout and camera sensor are separate facts; check the serial boot log after flashing. Do not flash the servo/radar sketch to the camera board or vice versa.
 
+If Arduino IDE has a temporary copy open (such as `sketch_oct8a.ino`), editing `hardware/esp32_cam_radar.ino` will not update that copy. Open the project firmware, restore your local Wi-Fi/MQTT settings, flash it, and check the `fw=` value in the `[BOOT]` line.
+
 ### Pin map and power
 
 | Signal | ESP32 DevKit pin |
 |---|---:|
 | Servo PAN | GPIO13 |
 | Servo TILT | GPIO27 |
-| LD2450 UART RX2 | GPIO16 |
+| LD2450 UART RX2 | GPIO32 |
 | LD2450 UART TX2 | GPIO17 |
 
 `esp32_cam_radar.ino` uses PAN GPIO13 and TILT GPIO27. If the physical TILT signal is connected to GPIO12, the wiring and sketch do not match: move the wire to GPIO27 or change `TILT_PIN` and reflash. GPIO12 is a boot-strapping pin on classic ESP32 boards, so verify its boot-level requirements before choosing it.
@@ -183,7 +186,7 @@ Edit `.env` before the final command. At minimum, set the broker and camera addr
 SERVO_PROTOCOL=legacy_step
 MQTT_BROKER=192.168.1.10
 VIDEO_SOURCE=http://192.168.1.50:81/stream
-AI_FPS_LIMIT=30
+AI_FPS_LIMIT=15
 POSE_MODEL_PATH=yolov8m-pose.pt
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
@@ -306,7 +309,7 @@ Portrait orientation is a practical starting point; landscape can provide a larg
 
 ### Pose model
 
-The backend loads **YOLOv8m-pose** from `POSE_MODEL_PATH` (default `yolov8m-pose.pt`). The medium model provides human boxes and body keypoints; it is a general pretrained pose model, not a fall-specific classifier. **BoT-SORT** maintains person IDs across frames using Ultralytics tracking with `persist=True`.
+The backend defaults to **YOLOv8m-pose** (`yolov8m-pose.pt`) to favor person and keypoint recognition in distant or partially occluded scenes. **YOLOv8n-pose INT8** (`yolov8n-pose_int8.onnx`) remains available through `POSE_MODEL_PATH` when CPU throughput is the priority; it may miss more difficult poses. The larger model can lower AI inference FPS, while the separate RAW camera stream remains unaffected. Validate both detection and fall-event behavior at the installed camera angle and lighting. The pose model is pretrained for people/keypoints, not specifically for falls. **BoT-SORT** maintains person IDs across frames using `persist=True`.
 
 At startup the backend selects an available acceleration path (TensorRT/OpenVINO where supported) and falls back to PyTorch when an optimized runtime is unavailable. First startup can take longer while weights or runtime artifacts are loaded/exported. Actual throughput depends on CPU/GPU, frame size, number of people, and software versions. References: [YOLOv8](https://docs.ultralytics.com/models/yolov8), [COCO Pose](https://docs.ultralytics.com/datasets/pose/coco), and [tracking mode](https://docs.ultralytics.com/modes/track).
 
@@ -314,7 +317,7 @@ At startup the backend selects an available acceleration path (TensorRT/OpenVINO
 
 ESP32-CAM captures JPEG frames and serves multipart MJPEG on port 81. The backend reads the HTTP stream, decodes JPEG with OpenCV, passes recent frames to the AI worker, adds overlays/events, then serves an MJPEG stream to the dashboard. Small latest-frame queues prioritize freshness and may drop old frames when inference cannot keep up.
 
-The camera firmware uses JPEG and a 20 MHz XCLK. It selects VGA when PSRAM is available and falls back to a smaller mode when it is not. The camera exposes stream `:81/stream` and status/tuning endpoints on port 82. Camera input FPS (`RAW FPS`) and AI overlay FPS are separate. `AI_FPS_LIMIT=30` is a ceiling, not a guarantee of 30 FPS.
+The camera firmware uses JPEG and a 20 MHz XCLK. It selects VGA when PSRAM is available and falls back to a smaller mode when it is not. The camera exposes stream `:81/stream` and status/tuning endpoints on port 82. Camera input FPS (`RAW FPS`) and AI overlay FPS are separate. `AI_FPS_LIMIT=15` is only an AI ceiling; a recent measurement on this setup showed about 10 raw FPS, so AI output cannot exceed the camera input rate. Compare `/api/v1/video/status`, `[VIDEO-INGEST]`, and `[VIDEO-AI]` to find the bottleneck. Switching the backend model does not require reflashing the firmware.
 
 ### Fall-evaluation logic
 
@@ -368,12 +371,14 @@ Radar is preferred while fresh; vision can be used as a fallback according to th
 
 ## Radar setup and room calibration
 
-1. Connect LD2450 TX to ESP32 RX GPIO16 and radar RX to ESP32 TX GPIO17; share ground and use the sensor's specified supply.
+1. Connect LD2450 TX to ESP32 RX GPIO32 and radar RX to ESP32 TX GPIO17 if commands are needed; share ground and use the sensor's specified supply.
 2. Open the DevKit Serial Monitor at 115200 baud. The firmware's UART2 link to the radar runs at 256000 baud.
-3. Check `[RADAR-DIAG]`: valid frame counts should increase. If bytes arrive but frame count remains zero, verify baud, crossed RX/TX, ground, power, and radar output mode.
+3. Check `[RADAR-DIAG]`: `new_bytes` and valid frame counts should increase continuously. `health=NO_UART_DATA` means no new bytes on GPIO32; `health=INVALID_FRAME` means received bytes do not form LD2450 frames. Verify TX/RX, baud, ground, power, and radar output mode.
 4. Move a target through the radar field and confirm X/Y signs and distance.
 5. Configure room dimensions, radar position/rotation, and safety zones in the dashboard analytics page.
 6. Test MANUAL servo movement first. Enable AUTO and check left/right, near/far, and vertical behavior before fine-tuning gains.
+
+On the map, drag a colored zone to reposition it and edit its numeric MIN/MAX fields to resize it. Press **Save Config** to persist the room and zones; radar processing reloads the saved values within about one second. Zones must stay within the room and each minimum must be lower than its maximum. A `DANGER_ZONE` event is emitted when a target enters a danger area. The safe zone is used for the existing night-wandering rule: a moving target must remain outside it for more than five minutes between 23:00 and 05:00.
 
 The room map applies a rotation and translation to local radar coordinates:
 
@@ -382,7 +387,7 @@ X_room = radar_x + x*cos(theta) + y*sin(theta)
 Y_room = radar_y - x*sin(theta) + y*cos(theta)
 ```
 
-Keep the map origin, units (millimeters), axis directions, and sensor mounting angle consistent.
+Keep the map origin, axis directions, and sensor mounting angle consistent. Dashboard zone fields use millimeters; the backend stores radar/room coordinates in meters.
 
 ## Communication and API
 
@@ -433,7 +438,7 @@ Python packages are listed in `backend/requirements.txt`; exact frontend depende
 | Servo appears offline, but MQTT is connected | Check protocol selection. The legacy firmware does not publish the same online/position telemetry as the diagnostic firmware; inspect the DevKit serial log and physical motion. |
 | Joystick command does not move the servos | Check MANUAL mode, API response, broker address, MQTT topic/payload, board serial log, GPIO wiring, and the loaded firmware. |
 | Servo jitters or ESP32 resets | Measure 5 V at the servo under load; inspect XL4015 current/temperature, common ground, wiring, and mechanical binding. |
-| Radar bytes arrive but valid frames do not | Verify 256000-baud UART, GPIO16/17 crossed wiring, power/ground, and LD2450 output mode. |
+| Radar bytes arrive but valid frames do not | Verify 256000-baud UART, LD2450 TX → ESP32 GPIO32, common ground, power, and LD2450 output mode. |
 | Camera stream is slow | Compare raw and AI FPS, reduce viewer count, try QVGA, check PSRAM/Wi-Fi/inference time. Raising the FPS ceiling cannot make the host process faster. |
 | Camera does not connect to backend | Open `http://<CAMERA-IP>:81/stream` on the same LAN and update `VIDEO_SOURCE` if its IP changed. |
 | Radar map is mirrored or offset | Check millimeter units, X/Y sign convention, map origin, and room rotation. |

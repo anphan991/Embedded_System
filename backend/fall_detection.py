@@ -26,7 +26,9 @@ class FallConfig:
     post_impact_stability: float = 0.30
     cooldown: float = 4.0
     history_seconds: float = 5.0
-    max_observation_gap: float = 0.55
+    # AI can run near 2 FPS on the target PC; allow normal frame jitter
+    # without joining tracks across a prolonged occlusion.
+    max_observation_gap: float = 0.90
     horizontal_aspect_ratio: float = 1.18
     horizontal_spine_angle: float = 48.0
     min_drop_body_heights: float = 0.30
@@ -119,7 +121,10 @@ class FallDetector:
         if upright:
             if track.upright_since is None:
                 track.upright_since = obs.timestamp
-            if obs.timestamp - track.upright_since >= cfg.min_upright_time and track.state != "confirmed":
+            # An upright-looking collapse can still be a fall. Do not erase
+            # its candidate timer on every subsequent frame.
+            if (obs.timestamp - track.upright_since >= cfg.min_upright_time
+                    and track.state not in ("candidate", "confirmed")):
                 track.state = "upright"
                 track.candidate_since = None
                 track.last_positive = 0.0
@@ -189,10 +194,20 @@ class FallDetector:
                 f.write(f"[{obs.timestamp:.1f}] hs_dist: {hs_dist:.2f} | desk_slump: {desk_slump} | p_change: {posture_change:.1f} | hs_drop: {head_shoulder_drop:.3f} | hs_exp: {head_shoulder_expansion:.3f} | chair_slump: {chair_slump}\n")
         # ---------------------
         
+        # A missing face/shoulder can make chair_slump true even while the
+        # person is motionless. Require an observed change before arming it.
+        slump_change = (
+            posture_change >= 10.0
+            or head_hip_drop >= 0.08
+            or head_shoulder_drop >= 0.08
+            or head_shoulder_expansion >= 0.05
+            or drop >= 0.20
+        )
         gradual_collapse = (
             prior_upright
             and not horizontal
             and chair_slump
+            and slump_change
         )
         
         # Ngã ngồi: Rơi tự do xuống nhưng tư thế vẫn thẳng (không horizontal)
@@ -210,7 +225,7 @@ class FallDetector:
         )
         
         transition = horizontal_transition or gradual_collapse or vertical_collapse or failed_recovery
-        collapsed_posture = horizontal or chair_slump or drop >= 0.35
+        collapsed_posture = horizontal or (chair_slump and slump_change) or drop >= 0.35
 
         if obs.is_camera_moving:
             transition = False
@@ -252,7 +267,9 @@ class FallDetector:
                 else:
                     return FallDecision("confirmed", 1.0, True, False, "cooldown_blocked")
 
-        if track.state == "confirmed" and (not horizontal or obs.spine_angle >= 20.0 or obs.posture_motion >= 1.0):
+        # A prone person's spine can still measure above 20 degrees. Wait for
+        # an upright, stable posture whose recent center-of-mass drop has cleared.
+        if track.state == "confirmed" and upright and drop < 0.20 and stable:
             track.state = "recovery"
             track.cooldown_until = 0.0 # Xoá cooldown ngay khi nạn nhân cố gắng bò dậy
 

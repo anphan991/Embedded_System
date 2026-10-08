@@ -100,9 +100,11 @@ Embedded system/
 │   ├── database.py                    # Lưu metadata bằng SQLite
 │   ├── requirements.txt               # Thư viện Python
 │   ├── .env.example                   # Mẫu cấu hình môi trường
+│   ├── yolov8m-pose.pt                # Model pose ưu tiên độ chính xác (nếu có)
 │   ├── mosquitto_local.conf           # Cấu hình Mosquitto cho LAN thử nghiệm
 │   ├── mock_hardware.py               # Mô phỏng một phần giao tiếp MQTT
 │   ├── test_fall_detection.py
+│   ├── test_zone_config.py
 │   └── test_servo_control.py
 ├── frontend/
 │   ├── app/
@@ -120,7 +122,6 @@ Embedded system/
 │   ├── esp32_cam_stream.ino           # Firmware nạp vào ESP32-CAM
 │   └── esp32_cam_radar.ino            # Firmware nạp vào ESP32 DevKit
 ├── snapshots/                         # Ảnh sự kiện nếu được cấu hình lưu tại đây
-├── yolov8m-pose.pt                    # Trọng số YOLOv8 pose nếu có trong bản cài
 ├── README-en.md                       # Bản tiếng Anh
 └── README.md                          # Bản tiếng Việt
 ```
@@ -147,7 +148,7 @@ Embedded system/
 
 ### Sơ đồ chân firmware
 
-Trong `esp32_cam_radar.ino`, PAN mặc định là GPIO13, TILT GPIO27; radar UART dùng RX GPIO16 và TX GPIO17. Nếu dây TILT thực tế đang ở GPIO12 thì firmware và dây **chưa khớp**: chuyển dây về GPIO27 hoặc sửa `TILT_PIN` trong sketch rồi nạp lại. GPIO12 là chân strapping trên ESP32 cổ điển, nên cần kiểm tra ảnh hưởng khởi động trước khi chọn chân này.
+Trong `esp32_cam_radar.ino`, PAN mặc định là GPIO13, TILT GPIO27; radar LD2450 TX nối vào ESP32 RX GPIO32, còn LD2450 RX có thể nối vào ESP32 TX GPIO17. Nếu dây TILT thực tế đang ở GPIO12 thì firmware và dây **chưa khớp**: chuyển dây về GPIO27 hoặc sửa `TILT_PIN` trong sketch rồi nạp lại. GPIO12 là chân strapping trên ESP32 cổ điển, nên cần kiểm tra ảnh hưởng khởi động trước khi chọn chân này.
 
 ## 4. Firmware
 
@@ -172,6 +173,8 @@ Hai sketch có vai trò khác nhau. Không nạp chéo.
 5. Mở đúng `.ino`, chọn board như bảng phía trên và chọn đúng cổng COM.
 6. Cấu hình Wi-Fi/broker trong sketch nếu các giá trị còn là placeholder hoặc mạng đã đổi.
 7. Nạp từng bo riêng. Mở Serial Monitor ở **115200 baud** để xem log boot và IP.
+
+Nếu Arduino IDE đang mở một bản sao tạm như `sketch_oct8a.ino`, thay đổi trong `hardware/esp32_cam_radar.ino` sẽ không tự cập nhật bản sao đó. Mở đúng firmware trong dự án, điền lại cấu hình Wi-Fi/MQTT của bạn, nạp lại và đối chiếu `fw=` ở dòng `[BOOT]`.
 
 Radar UART 256000 baud là tốc độ riêng giữa LD2450 và ESP32; Serial Monitor vẫn để 115200.
 
@@ -205,7 +208,7 @@ Các giá trị quan trọng:
 SERVO_PROTOCOL=legacy_step
 MQTT_BROKER=YOUR-IP
 VIDEO_SOURCE=http://YOUR-IP:PORT/stream
-AI_FPS_LIMIT=30
+AI_FPS_LIMIT=15
 POSE_MODEL_PATH=yolov8m-pose.pt
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
@@ -323,13 +326,13 @@ npm run start
 
 ## 8. Mô hình AI và pipeline hình ảnh
 
-Backend dùng **YOLOv8m-pose** (`yolov8m-pose.pt`) để phát hiện người và keypoint pose. Hậu tố `m` là biến thể medium, được chọn làm điểm cân bằng giữa độ chi tiết và khối lượng suy luận. Tracker **BoT-SORT** duy trì ID đối tượng qua các frame bằng `model.track(..., persist=True, tracker="botsort.yaml")`.
+Backend mặc định dùng **YOLOv8m-pose** (`yolov8m-pose.pt`) để ưu tiên nhận diện người và keypoint ổn định hơn trong cảnh khuất/xa; model **YOLOv8n-pose INT8** (`yolov8n-pose_int8.onnx`) có thể chọn qua `POSE_MODEL_PATH` khi cần giảm tải CPU. Model m có thể làm FPS AI thấp hơn, nhưng luồng RAW camera vẫn chạy độc lập. INT8 có thể làm giảm độ chính xác ở một số cảnh; cần kiểm chứng với góc lắp và ánh sáng thực tế. Tracker **BoT-SORT** duy trì ID đối tượng qua các frame bằng `model.track(..., persist=True, tracker="botsort.yaml")`.
 
 Model pose pretrained cung cấp keypoint người, không phải model đã huấn luyện riêng cho té ngã. Backend ưu tiên runtime tăng tốc có sẵn (TensorRT/OpenVINO theo môi trường), rồi mới fallback PyTorch. Tốc độ thực tế tùy CPU/GPU, resolution, số người và phiên bản thư viện. Tham khảo [YOLOv8](https://docs.ultralytics.com/models/yolov8), [COCO Pose](https://docs.ultralytics.com/datasets/pose/coco) và [Tracking](https://docs.ultralytics.com/modes/track).
 
 Luồng ảnh: ESP32-CAM gửi JPEG multipart → backend đọc HTTP và giải mã bằng OpenCV → frame mới nhất được đưa vào pipeline AI → YOLO phát hiện/track/pose → backend vẽ overlay, xử lý sự kiện và phát MJPEG cho dashboard. Hàng đợi frame nhỏ ưu tiên độ mới; khi AI chậm, frame cũ có thể bị bỏ để giảm độ trễ.
 
-Camera firmware dùng JPEG, XCLK 20 MHz và mặc định VGA khi PSRAM khả dụng; nếu không có PSRAM sẽ fallback độ phân giải thấp hơn. ESP32-CAM có endpoint stream `:81/stream` và endpoint trạng thái/điều chỉnh `:82`. FPS camera (`RAW FPS`) khác FPS AI overlay; đặt giới hạn 30 không đảm bảo hệ thống đạt 30 FPS.
+Camera firmware dùng JPEG, XCLK 20 MHz và mặc định VGA khi PSRAM khả dụng; nếu không có PSRAM sẽ fallback độ phân giải thấp hơn. ESP32-CAM có endpoint stream `:81/stream` và endpoint trạng thái/điều chỉnh `:82`. FPS camera (`RAW FPS`) khác FPS AI overlay; `AI_FPS_LIMIT=15` chỉ là trần xử lý AI. Ở lần đo trên cấu hình hiện tại, RAW stream khoảng 10 FPS nên AI không thể hiển thị nhanh hơn nguồn camera. Dùng `/api/v1/video/status`, `[VIDEO-INGEST]` và `[VIDEO-AI]` để xác định nút thắt; model INT8 không yêu cầu nạp lại firmware.
 
 ## 9. Cách thuật toán tính té ngã và bám mục tiêu
 
@@ -413,12 +416,14 @@ Firmware `esp32_cam_radar.ino` đang dùng giao thức bước: `LEFT`, `RIGHT`,
 
 ## 11. Radar: nối, cấu hình và hiệu chỉnh
 
-1. Nối LD2450 TX vào ESP32 RX GPIO16 và LD2450 RX vào ESP32 TX GPIO17; nối chung GND và cấp đúng điện áp cho module.
+1. Nối LD2450 TX vào ESP32 RX GPIO32 và LD2450 RX vào ESP32 TX GPIO17 nếu cần gửi lệnh; nối chung GND và cấp đúng điện áp cho module.
 2. Mở Serial Monitor DevKit ở 115200 baud; firmware đọc UART2 ở 256000 baud.
-3. Tìm `[RADAR-DIAG]`: số frame phải tăng. Nếu `bytes` tăng nhưng `frames=0`, kiểm tra baud, RX/TX, GND và mode output của radar.
+3. Tìm `[RADAR-DIAG]`: `new_bytes` và `frames` phải tăng liên tục. `health=NO_UART_DATA` nghĩa là chưa có byte mới trên GPIO32; `health=INVALID_FRAME` nghĩa là có byte nhưng không đúng khung LD2450. Kiểm tra TX/RX, baud, GND, nguồn và chế độ xuất UART của radar.
 4. Quan sát tọa độ X/Y khi di chuyển mục tiêu; xác minh dấu tọa độ trùng hướng trái/phải trên bản đồ.
 5. Trong dashboard, cấu hình kích thước phòng, vị trí radar, góc xoay và vùng an toàn theo sơ đồ thực tế.
 6. Bật AUTO và thử mục tiêu ở vài vị trí, khoảng cách. Chỉ tinh chỉnh hệ số sau khi tọa độ, tâm servo, nguồn và hướng trục đã được xác nhận.
+
+Trên bản đồ, kéo vùng màu để đổi vị trí; chỉnh MIN/MAX ở các ô số để đổi kích thước. Nhấn **Lưu cấu hình** để ghi phòng và zone vào cơ sở dữ liệu; backend áp dụng lại cấu hình radar trong khoảng một giây. Zone phải nằm trong biên phòng và mỗi MIN phải nhỏ hơn MAX. Cảnh báo `DANGER_ZONE` phát khi mục tiêu đi vào vùng nguy hiểm; vùng an toàn được dùng cho cảnh báo di chuyển ban đêm khi mục tiêu ở ngoài vùng và tiếp tục di chuyển trên 5 phút trong khung 23:00–05:00.
 
 Chuyển tọa độ sensor sang tọa độ phòng dùng phép xoay và tịnh tiến:
 
@@ -453,7 +458,7 @@ Python dependencies được liệt kê tại `backend/requirements.txt`; fronte
 | Dashboard báo servo offline nhưng lệnh vẫn publish | Kiểm tra profile giao thức. `legacy_step` không cung cấp đầy đủ telemetry như firmware chẩn đoán; xem Serial Monitor và chuyển động thực. |
 | Nút joystick không làm servo quay | Xác nhận MANUAL, backend nhận POST, MQTT connected, lệnh tới đúng topic, firmware nhận lệnh, GPIO và nguồn servo. |
 | Servo giật/reset ESP32 | Đo 5 V tại servo khi có tải; kiểm tra dòng XL4015, GND chung, dây tín hiệu và va chạm cơ khí. |
-| Radar log có byte nhưng không có frame | Kiểm tra UART 256000, chéo RX/TX GPIO16/17, nguồn và cấu hình output LD2450. |
+| Radar log có byte nhưng không có frame | Kiểm tra UART 256000, LD2450 TX → ESP32 GPIO32, GND chung, nguồn và cấu hình output LD2450. |
 | Camera stream lag | So sánh RAW FPS/AI FPS, giảm số viewer, thử QVGA, kiểm tra PSRAM, Wi-Fi và thời gian inference. Giới hạn FPS cao không làm tăng năng lực xử lý của máy. |
 | Camera không kết nối backend | Mở `http://<IP-camera>:81/stream` trực tiếp trên cùng mạng, kiểm tra `VIDEO_SOURCE` và IP mới. |
 | Radar map lệch hướng | Kiểm tra đơn vị mm, dấu trục, gốc phòng và góc xoay. |

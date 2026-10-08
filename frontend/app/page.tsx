@@ -7,6 +7,11 @@ import { useTranslation } from "./context/LanguageContext";
 import { getBackendBaseUrl } from "./backendUrl";
 
 type VideoDiagnostics = {
+  ai_model?: string;
+  ai_overlay_fresh?: boolean;
+  ai_overlay_age_ms?: number | null;
+  ai_detection_count?: number;
+  ai_fall_states?: string[];
   raw_fps: number;
   ai_fps: number;
   ai_decode_fps: number;
@@ -32,6 +37,34 @@ type VideoDiagnostics = {
   ai_worker_alive: boolean;
 };
 
+type TrackingDetection = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  track_id: number | null;
+  confidence: number;
+  fall_state?: string;
+  fall_confirmed?: boolean;
+  keypoints?: { x: number; y: number; confidence: number }[];
+};
+
+type AiOverlaySnapshot = {
+  fresh: boolean;
+  timestamp: number | null;
+  width: number;
+  height: number;
+  message?: string;
+  radar?: { x: number; y: number; speed: number } | null;
+  detections: TrackingDetection[];
+};
+
+const POSE_CONNECTIONS = [
+  [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],
+  [5, 11], [6, 12], [5, 7], [6, 8], [7, 9], [8, 10],
+  [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6],
+] as const;
+
 export default function SurveillanceDashboard() {
   const { alerts, isConnected, acknowledgeAlert } = useAlerts();
   const { t } = useTranslation();
@@ -43,11 +76,15 @@ export default function SurveillanceDashboard() {
   const [streamError, setStreamError] = useState(false);
   const [videoOnline, setVideoOnline] = useState<boolean | null>(null);
   const [videoDiagnostics, setVideoDiagnostics] = useState<VideoDiagnostics | null>(null);
+  const [aiOverlay, setAiOverlay] = useState<AiOverlaySnapshot | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const overlayTimestampRef = useRef<number | null>(null);
   const streamUrl = backendBaseUrl
-    ? `${backendBaseUrl}/api/v1/video/stream`
+    // Keep the dashboard responsive by displaying the latest camera frames.
+    // AI inference continues independently in the backend for tracking/alerts.
+    ? `${backendBaseUrl}/api/v1/video/live`
     : "";
 
   useEffect(() => {
@@ -96,6 +133,62 @@ export default function SurveillanceDashboard() {
     void checkVideo();
     const timer = setInterval(checkVideo, 2000);
     return () => { active = false; clearInterval(timer); };
+  }, [backendBaseUrl]);
+
+  // Keep video pixels on the high-rate RAW MJPEG path. Fetch only the compact
+  // AI boxes separately, so inference cadence never throttles camera playback.
+  useEffect(() => {
+    if (!backendBaseUrl) {
+      overlayTimestampRef.current = null;
+      return;
+    }
+
+    let active = true;
+    let requestInFlight = false;
+    let activeController: AbortController | null = null;
+
+    const pollDetections = async () => {
+      if (!active || requestInFlight) return;
+      requestInFlight = true;
+      const controller = new AbortController();
+      activeController = controller;
+      const timeout = window.setTimeout(() => controller.abort(), 800);
+      try {
+        const response = await fetch(`${backendBaseUrl}/api/v1/video/detections`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        const snapshot = await response.json() as AiOverlaySnapshot & { status?: string };
+        if (!active) return;
+
+        if (response.ok && snapshot.status === "success" && snapshot.fresh && snapshot.timestamp) {
+          if (snapshot.timestamp !== overlayTimestampRef.current) {
+            overlayTimestampRef.current = snapshot.timestamp;
+            setAiOverlay(snapshot);
+          }
+        } else if (overlayTimestampRef.current !== null) {
+          overlayTimestampRef.current = null;
+          setAiOverlay(null);
+        }
+      } catch {
+        if (active && overlayTimestampRef.current !== null) {
+          overlayTimestampRef.current = null;
+          setAiOverlay(null);
+        }
+      } finally {
+        window.clearTimeout(timeout);
+        requestInFlight = false;
+        if (activeController === controller) activeController = null;
+      }
+    };
+
+    void pollDetections();
+    const timer = window.setInterval(() => void pollDetections(), 120);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      activeController?.abort();
+    };
   }, [backendBaseUrl]);
 
   // Some browsers/proxies can leave an MJPEG <img> open but frozen without an
@@ -174,11 +267,128 @@ export default function SurveillanceDashboard() {
               <img 
                 key={streamRetry}
                 src={streamUrl} 
-                alt="Camera feed with AI tracking"
+                alt="Live camera feed; AI tracking continues in the backend"
                 className="relative z-10 w-full h-full object-contain"
                 onLoad={() => setStreamError(false)}
                 onError={handleStreamError}
               />
+            )}
+
+            {aiOverlay?.fresh && aiOverlay.width > 0 && aiOverlay.height > 0 && (
+              <svg
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 z-[12] h-full w-full"
+                viewBox={`0 0 ${aiOverlay.width} ${aiOverlay.height}`}
+                preserveAspectRatio="xMidYMid meet"
+              >
+                {aiOverlay.detections.map((detection, index) => {
+                  // AI inference uses a mirrored image; map its coordinates
+                  // back onto the unmirrored RAW preview shown underneath.
+                  const x1 = Math.max(0, Math.min(aiOverlay.width, aiOverlay.width - detection.x2));
+                  const x2 = Math.max(0, Math.min(aiOverlay.width, aiOverlay.width - detection.x1));
+                  const y1 = Math.max(0, Math.min(aiOverlay.height, detection.y1));
+                  const y2 = Math.max(0, Math.min(aiOverlay.height, detection.y2));
+                  const boxWidth = Math.max(0, x2 - x1);
+                  const boxHeight = Math.max(0, y2 - y1);
+                  const confirmed = detection.fall_confirmed === true;
+                  const candidate = detection.fall_state === "CANDIDATE";
+                  const color = confirmed ? "#ef4444" : candidate ? "#f59e0b" : "#22c55e";
+                  const trackLabel = detection.track_id === null ? "Person" : `ID ${detection.track_id}`;
+                  const stateLabel = detection.fall_state && detection.fall_state !== "TRACKING"
+                    ? ` · ${detection.fall_state}`
+                    : "";
+                  const label = `${trackLabel}${stateLabel} · ${Math.round(detection.confidence * 100)}%`;
+                  const fontSize = Math.max(7, Math.min(14, aiOverlay.width * 0.02));
+                  const points = detection.keypoints ?? [];
+
+                  return (
+                    <g key={`${detection.track_id ?? "person"}-${index}`}>
+                      {POSE_CONNECTIONS.map(([from, to]) => {
+                        const a = points[from];
+                        const b = points[to];
+                        if (!a || !b || a.confidence < 0.25 || b.confidence < 0.25) return null;
+                        return (
+                          <line
+                            key={`pose-${from}-${to}`}
+                            x1={aiOverlay.width - a.x}
+                            y1={a.y}
+                            x2={aiOverlay.width - b.x}
+                            y2={b.y}
+                            stroke={color}
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        );
+                      })}
+                      {points.map((point, pointIndex) => point.confidence >= 0.25 ? (
+                        <circle
+                          key={`joint-${pointIndex}`}
+                          cx={aiOverlay.width - point.x}
+                          cy={point.y}
+                          r="2.5"
+                          fill={color}
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      ) : null)}
+                      <rect
+                        x={x1}
+                        y={y1}
+                        width={boxWidth}
+                        height={boxHeight}
+                        fill={color}
+                        fillOpacity="0.06"
+                        stroke={color}
+                        strokeWidth="2"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                      <text
+                        x={x1 + 4}
+                        y={Math.max(fontSize + 4, y1 - 6)}
+                        fill={color}
+                        fontSize={fontSize}
+                        fontWeight="700"
+                        paintOrder="stroke"
+                        stroke="#052e16"
+                        strokeWidth="3"
+                        strokeLinejoin="round"
+                      >
+                        {label}
+                      </text>
+                    </g>
+                  );
+                })}
+                {aiOverlay.message && (
+                  <text
+                    x={aiOverlay.width / 2}
+                    y={Math.max(20, aiOverlay.height * 0.06)}
+                    textAnchor="middle"
+                    fill="#facc15"
+                    fontSize={Math.max(8, Math.min(16, aiOverlay.width * 0.025))}
+                    fontWeight="700"
+                    paintOrder="stroke"
+                    stroke="#111827"
+                    strokeWidth="4"
+                  >
+                    {aiOverlay.message}
+                  </text>
+                )}
+                {aiOverlay.radar && (aiOverlay.radar.x !== 0 || aiOverlay.radar.y !== 0) && (
+                  <text
+                    x={aiOverlay.width - 12}
+                    y={Math.max(22, aiOverlay.height * 0.06)}
+                    textAnchor="end"
+                    fill="#facc15"
+                    fontSize={Math.max(7, Math.min(12, aiOverlay.width * 0.018))}
+                    fontWeight="600"
+                    paintOrder="stroke"
+                    stroke="#111827"
+                    strokeWidth="4"
+                  >
+                    {`RADAR X:${aiOverlay.radar.x.toFixed(1)}m Y:${aiOverlay.radar.y.toFixed(1)}m V:${aiOverlay.radar.speed.toFixed(2)}m/s`}
+                  </text>
+                )}
+              </svg>
             )}
 
             {(videoOnline === false || streamError) && (
@@ -197,12 +407,14 @@ export default function SurveillanceDashboard() {
 
             <div className="absolute bottom-4 left-4 z-20 bg-black/70 backdrop-blur-md px-2.5 py-1.5 rounded text-[10px] lg:text-[11px] font-mono text-white/90 border border-white/10 scale-90 lg:scale-100 origin-bottom-left max-w-[85%]">
               <button onClick={() => setShowDiagnostics((value) => !value)} className="text-left hover:text-white" title="Video diagnostics">
-                CAM_01 · RAW {videoDiagnostics?.raw_fps ?? "--"} FPS · AI overlay {videoDiagnostics?.ai_fps ?? "--"} FPS (target {videoDiagnostics?.ai_target_fps ?? "--"}) · {videoDiagnostics?.raw_kBps ?? "--"} KB/s · DIAG {showDiagnostics ? "−" : "+"}
+                CAM_01 · RAW {videoDiagnostics?.raw_fps ?? "--"} FPS · AI {videoDiagnostics?.ai_fps ?? "--"} FPS · TARGET {videoDiagnostics?.ai_detection_count ?? "--"} · {videoDiagnostics?.raw_kBps ?? "--"} KB/s · DIAG {showDiagnostics ? "−" : "+"}
               </button>
               {showDiagnostics && videoDiagnostics && (
                 <div className="mt-1 border-t border-white/20 pt-1 leading-4 whitespace-normal">
                   RAW received {videoDiagnostics.raw_fps} FPS · AI decoded {videoDiagnostics.ai_decode_fps} FPS<br />
                   AI output {videoDiagnostics.ai_fps} FPS · target {videoDiagnostics.ai_target_fps} / ceiling {videoDiagnostics.ai_limit_fps} FPS<br />
+                  Model {videoDiagnostics.ai_model ?? "unknown"} · overlay {videoDiagnostics.ai_overlay_fresh ? "fresh" : "stale"} ({videoDiagnostics.ai_overlay_age_ms ?? "--"} ms) · detections {videoDiagnostics.ai_detection_count ?? "--"}<br />
+                  Fall states {videoDiagnostics.ai_fall_states?.length ? videoDiagnostics.ai_fall_states.join(", ") : "none"}<br />
                   JPEG {videoDiagnostics.jpeg_kB} KB · JPEG decode {videoDiagnostics.decode_ms} ms · AI work {videoDiagnostics.ai_work_ms} ms/frame<br />
                   infer {videoDiagnostics.inference_ms} ms · encode {videoDiagnostics.encode_ms} ms · pipeline {videoDiagnostics.pipeline_ms} ms<br />
                   drops {videoDiagnostics.preview_dropped}/{videoDiagnostics.ai_input_dropped}/{videoDiagnostics.ai_output_dropped} · reconnect {videoDiagnostics.camera_reconnects}<br />

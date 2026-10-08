@@ -9,7 +9,7 @@ import { useTranslation } from "./context/LanguageContext";
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const { theme, setTheme } = useTheme();
+  const { resolvedTheme, setTheme } = useTheme();
   const { t, language, setLanguage } = useTranslation();
   const [isOpen, setIsOpen] = useState(false); // For mobile drawer
 
@@ -72,11 +72,13 @@ export default function Sidebar() {
                 {language.toUpperCase()}
               </button>
               <button
-                onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+                onClick={() => setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')}
                 className="p-1.5 rounded-md text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
                 title="Toggle theme"
+                aria-label="Toggle theme"
               >
-                {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+                <Moon className="w-4 h-4 dark:hidden" aria-hidden="true" />
+                <Sun className="hidden w-4 h-4 dark:block" aria-hidden="true" />
               </button>
             </div>
           )}
