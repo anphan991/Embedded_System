@@ -206,20 +206,24 @@ Các giá trị quan trọng:
 
 ```ini
 SERVO_PROTOCOL=legacy_step
-MQTT_BROKER=YOUR-IP
-VIDEO_SOURCE=http://YOUR-IP:PORT/stream
+MQTT_BROKER=192.168.1.10
+VIDEO_SOURCE=http://192.168.1.50:81/stream
 AI_FPS_LIMIT=15
 POSE_MODEL_PATH=yolov8m-pose.pt
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
-- `MQTT_BROKER`: IPv4 của máy đang chạy Mosquitto.
-- `VIDEO_SOURCE`: địa chỉ IP ESP32-CAM, không phải IP DevKit.
+- `MQTT_BROKER`: IPv4 của máy đang chạy Mosquitto (ví dụ `192.168.1.10`).
+- `VIDEO_SOURCE`: địa chỉ IP ESP32-CAM và cổng stream 81 (ví dụ `192.168.1.50`), không phải IP DevKit hay IP broker.
 - `SERVO_PROTOCOL`: phải khớp giao thức của firmware hiện hành. Sketch hiện tại nhận lệnh bước `LEFT`, `RIGHT`, `UP`, `DOWN`, `RESET`, do đó dùng `legacy_step`.
 - `AI_FPS_LIMIT`: trần xử lý AI, không phải cam kết FPS đầu ra.
 - `POSE_MODEL_PATH`: đường dẫn đến file model pose.
 - `TELEGRAM_BOT_TOKEN` và `TELEGRAM_CHAT_ID`: cấu hình tùy chọn để gửi cảnh báo té ngã qua Telegram; phải điền cả hai.
+
+Nếu IP máy chạy Mosquitto đổi, cập nhật `MQTT_BROKER` trong `backend/.env` **và** `mqtt_server` trong `hardware/esp32_cam_radar.ino` thành cùng IP. Khởi động lại backend, nạp lại sketch đã sửa vào ESP32 DevKit và kiểm tra dòng `[BOOT] ... mqtt=<IP>:1883` trên Serial Monitor. Sửa riêng `.env` sẽ không cập nhật địa chỉ broker đã biên dịch trong firmware.
+
+Nếu IP ESP32-CAM đổi, lấy địa chỉ mới từ dòng `[CAM-URL] VIDEO_SOURCE=...` trên Serial Monitor, rồi cập nhật **Cài đặt hệ thống → Địa chỉ IP Camera ESP32** trong dashboard; thao tác lưu sẽ cập nhật `VIDEO_SOURCE` trong `backend/.env` và đổi nguồn camera đang chạy. Cũng có thể sửa `VIDEO_SOURCE=http://<IP-camera-moi>:81/stream` trực tiếp trong `.env` rồi khởi động lại backend. Firmware camera dùng IP động nên không cần nạp lại chỉ vì IP thay đổi; chỉ nạp lại nếu đổi Wi-Fi hoặc sửa chính sketch camera.
 
 ### Tạo bot Telegram và lấy hai giá trị
 
@@ -250,7 +254,7 @@ TELEGRAM_CHAT_ID=your_chat_id_here
 
 Nếu token bị lộ, hãy thu hồi/tạo token mới qua BotFather và cập nhật `.env` ngay. Telegram Bot API dùng token trong URL của request; tránh dán URL có token vào lịch sử trình duyệt, ảnh chụp hoặc log chia sẻ. Đoạn PowerShell trên giữ token ngoài câu lệnh được lưu trong lịch sử và không in token ra màn hình.
 
-IP thường thay đổi khi đổi router/hotspot. Chạy `ipconfig` để lấy IP máy tính; lấy IP của ESP32 từ Serial Monitor hoặc router. Sau đó sửa `.env`, SSID/password/broker trong hai sketch nếu cần và khởi động lại tiến trình liên quan. Dashboard trên máy khác phải đặt Server URL về `http://<IP-máy-backend>:8000`, không dùng `localhost`.
+IP thường thay đổi khi đổi router/hotspot. Chạy `ipconfig` để lấy IP máy tính; lấy IP của ESP32 từ Serial Monitor hoặc router. Khi đổi Wi-Fi, cập nhật SSID/password trong sketch của từng bo cần đổi rồi nạp lại; xử lý IP broker và IP camera theo hướng dẫn trên. Dashboard trên máy khác phải đặt Server URL về `http://<IP-máy-backend>:8000`, không dùng `localhost`.
 
 ## 7. Chạy dịch vụ trên Windows
 
@@ -358,7 +362,11 @@ Góc gần 90° thể hiện thân tương đối thẳng đứng; gần 0° th�
 filtered = alpha * current + (1 - alpha) * previous_filtered
 ```
 
-Detector theo dõi từng ID, xác định trạng thái đứng trước đó, rồi kết hợp tư thế ngang, độ tụt tâm cơ thể chuẩn hóa theo chiều cao người, tốc độ tụt và độ ổn định sau sự kiện. Các ngưỡng trong `fall_detection.py` là heuristic theo ảnh, có thể báo nhầm khi người ngồi/nằm, bị che khuất, camera rung/nghiêng hoặc tracker đổi ID. Cần thử với video của không gian sử dụng; đây không phải hệ thống y tế/chứng nhận an toàn.
+Detector theo dõi từng ID, xác định trạng thái đứng trước đó, rồi kết hợp tư thế ngang, độ tụt tâm cơ thể chuẩn hóa theo chiều cao người, tốc độ tụt và độ ổn định sau sự kiện. `OBSERVED_HORIZONTAL` nghĩa là đã thấy người nằm ngang nhưng chưa có lịch sử đứng/chuyển động đủ để xác nhận ngã. Detector giữ giai đoạn nghi ngờ qua các frame liên tiếp, yêu cầu thay đổi tư thế thực trước khi xác nhận và chỉ chuyển sang hồi phục khi người đã đứng ổn định. Khi một người bị YOLO đổi ID trong thời gian ngắn, backend có thể chuyển lịch sử tư thế sang ID mới nếu khung người còn gần/chồng nhau và camera đứng yên.
+
+Khi radar có tọa độ **mới** trong vùng `SAFE` và không đồng thời thuộc vùng `DANGER`, backend gắn `SAFE ZONE` lên người và bỏ qua cảnh báo ngã cho tư thế nghỉ như nằm trên giường. Dữ liệu radar cũ quá 2 giây không giữ chặn này. Ở ngoài cả hai vùng, detector vẫn đánh giá ngã bằng tư thế và lịch sử chuyển động; chế độ camera `MANUAL` tự nó không tắt chức năng phát hiện. `DANGER_ZONE` là cảnh báo xâm nhập vùng nguy hiểm riêng, không đồng nghĩa với xác nhận ngã. Khi có từ hai người với pose đủ tin cậy, cảnh báo ngã tạm `MUTED` để tránh gán nhầm; một box không có keypoint thân đủ tin cậy không được tính là người thứ hai.
+
+Các ngưỡng trong `fall_detection.py` là heuristic theo ảnh, có thể báo nhầm khi người ngồi/nằm, bị che khuất, camera rung/nghiêng hoặc tracker đổi ID. Cần thử với video của không gian sử dụng; đây không phải hệ thống y tế/chứng nhận an toàn.
 
 ### 9.2 Tính góc servo từ radar
 
@@ -425,6 +433,8 @@ Firmware `esp32_cam_radar.ino` đang dùng giao thức bước: `LEFT`, `RIGHT`,
 
 Trên bản đồ, kéo vùng màu để đổi vị trí; chỉnh MIN/MAX ở các ô số để đổi kích thước. Nhấn **Lưu cấu hình** để ghi phòng và zone vào cơ sở dữ liệu; backend áp dụng lại cấu hình radar trong khoảng một giây. Zone phải nằm trong biên phòng và mỗi MIN phải nhỏ hơn MAX. Cảnh báo `DANGER_ZONE` phát khi mục tiêu đi vào vùng nguy hiểm; vùng an toàn được dùng cho cảnh báo di chuyển ban đêm khi mục tiêu ở ngoài vùng và tiếp tục di chuyển trên 5 phút trong khung 23:00–05:00.
 
+Chấm mục tiêu chỉ hiện khi `/api/v1/radar/status` báo dữ liệu radar còn mới (`online=true`, tuổi dữ liệu không quá 5 giây). Chấm đổi màu theo vị trí `SAFE`, `DANGER`, ngoài vùng hoặc ngoài biên phòng; khi radar ngừng cập nhật, bản đồ báo `STALE` và ẩn chấm cũ để tránh hiểu nhầm là vị trí hiện tại. Nếu broker vẫn có dữ liệu mà bản đồ không có chấm, kiểm tra thời gian gói tin, trạng thái MQTT và endpoint này.
+
 Chuyển tọa độ sensor sang tọa độ phòng dùng phép xoay và tịnh tiến:
 
 ```text
@@ -459,9 +469,12 @@ Python dependencies được liệt kê tại `backend/requirements.txt`; fronte
 | Nút joystick không làm servo quay | Xác nhận MANUAL, backend nhận POST, MQTT connected, lệnh tới đúng topic, firmware nhận lệnh, GPIO và nguồn servo. |
 | Servo giật/reset ESP32 | Đo 5 V tại servo khi có tải; kiểm tra dòng XL4015, GND chung, dây tín hiệu và va chạm cơ khí. |
 | Radar log có byte nhưng không có frame | Kiểm tra UART 256000, LD2450 TX → ESP32 GPIO32, GND chung, nguồn và cấu hình output LD2450. |
+| MQTT/radar/servo ngừng hoạt động sau khi IP máy tính đổi | Kiểm tra IP máy chạy Mosquitto bằng `ipconfig`; đặt cùng IP đó ở `MQTT_BROKER` trong `backend/.env` và `mqtt_server` trong `hardware/esp32_cam_radar.ino`. Khởi động lại backend, nạp lại firmware đã sửa vào ESP32 DevKit, kiểm tra `[BOOT] ... mqtt=...` và kết nối MQTT. |
+| Radar có tọa độ nhưng bản đồ không hiện chấm | Mở `/api/v1/radar/status`; nếu `online=false`/`STALE`, kiểm tra gói `embedded/radar/data` mới, broker của backend và DevKit, `frames_with_target`/`published` trong `[RADAR-DIAG]`. Chấm cũ được ẩn sau khi ngừng cập nhật. |
 | Camera stream lag | So sánh RAW FPS/AI FPS, giảm số viewer, thử QVGA, kiểm tra PSRAM, Wi-Fi và thời gian inference. Giới hạn FPS cao không làm tăng năng lực xử lý của máy. |
-| Camera không kết nối backend | Mở `http://<IP-camera>:81/stream` trực tiếp trên cùng mạng, kiểm tra `VIDEO_SOURCE` và IP mới. |
+| Camera không kết nối backend sau khi IP ESP32-CAM đổi | Xem `[CAM-URL]` trên Serial Monitor; mở `http://<IP-camera-moi>:81/stream` trên cùng mạng. Cập nhật IP tại **Cài đặt hệ thống** (tự lưu `VIDEO_SOURCE` vào `backend/.env`) hoặc sửa `VIDEO_SOURCE` trong `.env` rồi khởi động lại backend. Không cần nạp lại ESP32-CAM nếu chỉ đổi IP DHCP. |
 | Radar map lệch hướng | Kiểm tra đơn vị mm, dấu trục, gốc phòng và góc xoay. |
+| Nằm/ngã ngoài vùng SAFE nhưng không có cảnh báo ngã | Nhãn `OBSERVED_HORIZONTAL` nghĩa là thiếu lịch sử đứng trước khi nằm; để camera thấy toàn thân đứng ổn định rồi thử lại. Nếu hiện `SAFE ZONE`, đối chiếu chấm radar và `zone_state` tại `/api/v1/radar/status` với vùng SAFE đã lưu. Nếu hiện `MUTED`, kiểm tra số người/box và keypoint trong `/api/v1/video/detections`; camera đang quay cũng tạm ngừng đánh giá chuyển động. |
 
 Log hữu ích khi chẩn đoán gồm boot/reset reason, `[RADAR-DIAG]`, `[SERVO-DIAG]`, trạng thái MQTT, `/api/v1/video/status` và `/api/v1/servo/diag`. Không chia sẻ `.env` hoặc mật khẩu Wi-Fi/token.
 

@@ -194,6 +194,10 @@ TELEGRAM_CHAT_ID=your_chat_id_here
 
 `MQTT_BROKER` is the computer running Mosquitto. `VIDEO_SOURCE` is the ESP32-CAM address. Firmware Wi-Fi credentials are configured in the sketches. Keep `.env` private. The backend API is at `http://localhost:8000`; interactive API documentation is at `http://localhost:8000/docs`.
 
+If the Mosquitto host IP changes, set the same new address in `MQTT_BROKER` in `backend/.env` and `mqtt_server` in `hardware/esp32_cam_radar.ino`. Restart the backend, flash the edited sketch to the ESP32 DevKit, and confirm `[BOOT] ... mqtt=<IP>:1883` in its Serial Monitor. Editing `.env` alone cannot change the broker address compiled into the firmware.
+
+If the ESP32-CAM IP changes, read the new `[CAM-URL] VIDEO_SOURCE=...` line in its Serial Monitor. Enter the new IP under **System Settings → ESP32 Camera IP Address** in the dashboard; saving also updates `VIDEO_SOURCE` in `backend/.env` and switches the running camera source. Alternatively, edit `VIDEO_SOURCE=http://<NEW-CAMERA-IP>:81/stream` in `.env` and restart the backend. The camera gets its IP dynamically, so a DHCP address change alone does not require reflashing it; reflash only when changing its Wi-Fi settings or sketch.
+
 Telegram alerts are optional. Leave the placeholder values if you do not want Telegram notifications. To enable them, configure **both** `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as described below.
 
 ### Create a Telegram bot and obtain the two values
@@ -341,7 +345,11 @@ An upright torso tends toward 90 degrees; a horizontal torso tends toward 0 degr
 filtered = alpha * current + (1 - alpha) * previous_filtered
 ```
 
-This is a heuristic based on image observations, not a medical diagnosis. Occlusion, sitting/lying poses, camera angle, motion blur, lighting, and tracker ID changes can cause missed or false detections. Validate thresholds with representative local footage. Some multi-person cases intentionally suppress fall evaluation to reduce ambiguous alerts.
+`OBSERVED_HORIZONTAL` means the camera sees a horizontal person but lacks enough prior upright/motion history to confirm a fall. The detector carries a candidate across consecutive frames, requires an actual posture change, and enters recovery only after a stable upright posture. If YOLO changes the ID of the sole person, the backend can transfer recent pose history to a new, nearby/overlapping box while the camera is stationary.
+
+A **fresh** radar point in a configured `SAFE` zone, with no overlapping `DANGER` zone, labels the person `SAFE ZONE` and suppresses fall alerts for intentional rest such as lying in bed. A radar point older than two seconds cannot keep this suppression active. Outside both zones, camera pose and motion history still determine falls; `MANUAL` camera mode does not itself disable detection. `DANGER_ZONE` is a separate entry alert, not a confirmed fall. With at least two people whose torso poses are sufficiently reliable, fall alerts are temporarily `MUTED`; a stray box without a usable torso pose does not count as the second person.
+
+This is a heuristic based on image observations, not a medical diagnosis. Occlusion, sitting/lying poses, camera angle, motion blur, lighting, and tracker ID changes can cause missed or false detections. Validate thresholds with representative local footage.
 
 ### Target tracking and servo angles
 
@@ -379,6 +387,8 @@ Radar is preferred while fresh; vision can be used as a fallback according to th
 6. Test MANUAL servo movement first. Enable AUTO and check left/right, near/far, and vertical behavior before fine-tuning gains.
 
 On the map, drag a colored zone to reposition it and edit its numeric MIN/MAX fields to resize it. Press **Save Config** to persist the room and zones; radar processing reloads the saved values within about one second. Zones must stay within the room and each minimum must be lower than its maximum. A `DANGER_ZONE` event is emitted when a target enters a danger area. The safe zone is used for the existing night-wandering rule: a moving target must remain outside it for more than five minutes between 23:00 and 05:00.
+
+The target dot appears only while `/api/v1/radar/status` reports fresh radar data (`online=true`, age at most five seconds). Its color reflects `SAFE`, `DANGER`, outside-zone, or outside-room position. When updates stop, the map shows `STALE` and hides the old dot so it is not mistaken for a live position. If MQTT has messages but the dot is absent, inspect the packet timestamps, backend MQTT connection, and this endpoint.
 
 The room map applies a rotation and translation to local radar coordinates:
 
@@ -439,9 +449,12 @@ Python packages are listed in `backend/requirements.txt`; exact frontend depende
 | Joystick command does not move the servos | Check MANUAL mode, API response, broker address, MQTT topic/payload, board serial log, GPIO wiring, and the loaded firmware. |
 | Servo jitters or ESP32 resets | Measure 5 V at the servo under load; inspect XL4015 current/temperature, common ground, wiring, and mechanical binding. |
 | Radar bytes arrive but valid frames do not | Verify 256000-baud UART, LD2450 TX → ESP32 GPIO32, common ground, power, and LD2450 output mode. |
+| MQTT/radar/servos stop after the computer IP changes | Find the Mosquitto host IP with `ipconfig`; set it in both `MQTT_BROKER` in `backend/.env` and `mqtt_server` in `hardware/esp32_cam_radar.ino`. Restart the backend, reflash the edited ESP32 DevKit firmware, and check `[BOOT] ... mqtt=...` and MQTT connectivity. |
+| Radar coordinates arrive but the map has no target dot | Open `/api/v1/radar/status`; if `online=false`/`STALE`, check for fresh `embedded/radar/data` packets, the broker configured on both sides, and `frames_with_target`/`published` in `[RADAR-DIAG]`. Old dots are hidden after updates stop. |
 | Camera stream is slow | Compare raw and AI FPS, reduce viewer count, try QVGA, check PSRAM/Wi-Fi/inference time. Raising the FPS ceiling cannot make the host process faster. |
-| Camera does not connect to backend | Open `http://<CAMERA-IP>:81/stream` on the same LAN and update `VIDEO_SOURCE` if its IP changed. |
+| Camera does not connect after the ESP32-CAM IP changes | Read `[CAM-URL]` in its Serial Monitor and open `http://<NEW-CAMERA-IP>:81/stream` on the same LAN. Update the address in **System Settings** (which saves `VIDEO_SOURCE` to `backend/.env`), or edit `.env` and restart the backend. A DHCP IP change alone does not require reflashing the ESP32-CAM. |
 | Radar map is mirrored or offset | Check millimeter units, X/Y sign convention, map origin, and room rotation. |
+| A fall outside SAFE does not raise a fall alert | `OBSERVED_HORIZONTAL` means the detector missed the preceding upright state; keep the full standing person in view before retrying. For `SAFE ZONE`, compare the radar dot and `/api/v1/radar/status` `zone_state` with the saved SAFE zone. For `MUTED`, inspect people/boxes and keypoints at `/api/v1/video/detections`; camera motion also pauses motion evaluation. |
 
 Useful diagnostics include boot/reset reason, `[RADAR-DIAG]`, `[SERVO-DIAG]`, MQTT connection logs, `/api/v1/video/status`, and `/api/v1/servo/diag`. Never share `.env`, Wi-Fi credentials, or alert-service tokens publicly.
 
