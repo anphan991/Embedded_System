@@ -62,7 +62,7 @@ npm ci
 npm run dev
 ```
 
-Mở `http://localhost:3000`. Trước đó, hãy bật Mosquitto và nạp đúng firmware lên từng bo theo bảng ở phần [Firmware](#firmware-đúng-file-đúng-bo).
+Mở `http://localhost:3000`. Trước đó, hãy bật Mosquitto và nạp đúng firmware lên từng bo theo bảng ở phần [Firmware](#4-firmware).
 
 ---
 
@@ -73,7 +73,7 @@ flowchart LR
     CAM[ESP32-CAM + OV3660] -->|MJPEG qua HTTP :81| BACKEND[Python / FastAPI]
     BACKEND -->|Frame| AI[YOLOv8 Pose + BoT-SORT]
     AI -->|Overlay, trạng thái, sự kiện| BACKEND
-    BACKEND -->|MJPEG overlay / REST / WebSocket| WEB[Next.js dashboard]
+    BACKEND -->|RAW MJPEG + kết quả AI / REST / WebSocket| WEB[Next.js dashboard]
     RADAR[HLK-LD2450] -->|UART 256000| CTRL[ESP32 DevKit]
     BACKEND <-->|MQTT :1883| MQTT[Mosquitto]
     CTRL <-->|MQTT| MQTT
@@ -103,6 +103,7 @@ Embedded system/
 │   ├── yolov8m-pose.pt                # Model pose ưu tiên độ chính xác (nếu có)
 │   ├── mosquitto_local.conf           # Cấu hình Mosquitto cho LAN thử nghiệm
 │   ├── mock_hardware.py               # Mô phỏng một phần giao tiếp MQTT
+│   ├── snapshots/                      # Ảnh sự kiện tạo khi chạy từ backend
 │   ├── test_fall_detection.py
 │   ├── test_zone_config.py
 │   └── test_servo_control.py
@@ -121,7 +122,6 @@ Embedded system/
 ├── hardware/
 │   ├── esp32_cam_stream.ino           # Firmware nạp vào ESP32-CAM
 │   └── esp32_cam_radar.ino            # Firmware nạp vào ESP32 DevKit
-├── snapshots/                         # Ảnh sự kiện nếu được cấu hình lưu tại đây
 ├── README-en.md                       # Bản tiếng Anh
 └── README.md                          # Bản tiếng Việt
 ```
@@ -158,6 +158,10 @@ Hai sketch có vai trò khác nhau. Không nạp chéo.
 |---|---|---|---|
 | `hardware/esp32_cam_stream.ino` | ESP32-CAM | **AI Thinker ESP32-CAM** | Camera OV3660, Wi-Fi, MJPEG stream và endpoint trạng thái/cấu hình camera. |
 | `hardware/esp32_cam_radar.ino` | ESP32 DevKit thường | **ESP32 Dev Module** | LD2450 qua UART, MQTT, hai servo PAN/TILT và điều khiển MANUAL/AUTO. |
+
+Sketch DevKit phát PWM 50 Hz với xung 500–2400 µs, đặt tâm PAN/TILT ở 90°, giới hạn góc lệnh trong khoảng 10°–170°. Mỗi lệnh thủ công dịch PAN 12° hoặc TILT 7°; `RESET` đưa cả hai trục về 90°. Trạng thái `MOVING`/`STOPPED` được suy ra từ góc đích và góc đang nội suy trong phần mềm, không phải số đo vị trí trục thực. Nếu không nhận lệnh thủ công trong một giờ, firmware tự trở về AUTO.
+
+ESP32-CAM chỉ cho phép một kết nối trực tiếp tới `:81/stream`; kết nối thứ hai nhận HTTP 503. Khi backend đang đọc camera, hãy xem video qua dashboard hoặc `GET /api/v1/video/live` của backend. Muốn kiểm tra trực tiếp `:81/stream`, trước tiên tạm dừng backend.
 
 ### Cài Arduino IDE và thư viện
 
@@ -217,7 +221,7 @@ TELEGRAM_CHAT_ID=your_chat_id_here
 - `MQTT_BROKER`: IPv4 của máy đang chạy Mosquitto (ví dụ `192.168.1.10`).
 - `VIDEO_SOURCE`: địa chỉ IP ESP32-CAM và cổng stream 81 (ví dụ `192.168.1.50`), không phải IP DevKit hay IP broker.
 - `SERVO_PROTOCOL`: phải khớp giao thức của firmware hiện hành. Sketch hiện tại nhận lệnh bước `LEFT`, `RIGHT`, `UP`, `DOWN`, `RESET`, do đó dùng `legacy_step`.
-- `AI_FPS_LIMIT`: trần xử lý AI, không phải cam kết FPS đầu ra.
+- `AI_FPS_LIMIT`: trần xử lý AI. Cấu hình mẫu đặt 15 FPS; muốn kiểm tra mức AI cao hơn phải tăng giá trị này và khởi động lại backend.
 - `POSE_MODEL_PATH`: đường dẫn đến file model pose.
 - `TELEGRAM_BOT_TOKEN` và `TELEGRAM_CHAT_ID`: cấu hình tùy chọn để gửi cảnh báo té ngã qua Telegram; phải điền cả hai.
 
@@ -260,7 +264,7 @@ IP thường thay đổi khi đổi router/hotspot. Chạy `ipconfig` để lấ
 
 Mỗi khối nên chạy trong một cửa sổ Terminal/PowerShell riêng để dễ theo dõi log.
 
-### Terminal 1 — Mosquitto
+### Terminal 1 - Mosquitto
 
 Kiểm tra Windows Service trước để tránh chạy hai broker cùng cổng:
 
@@ -277,7 +281,7 @@ cd backend
 
 Nếu cài Mosquitto ở nơi khác, thay đường dẫn executable. Chỉ giữ một broker trên TCP 1883. Cấu hình mẫu cho phép kết nối LAN không xác thực; chỉ dùng trên mạng tin cậy, không mở cổng ra Internet.
 
-### Terminal 2 — Backend và AI
+### Terminal 2 - Backend và AI
 
 ```powershell
 cd backend
@@ -297,7 +301,7 @@ python main.py
 
 Backend mặc định phục vụ API tại `http://localhost:8000`; tài liệu API tại `http://localhost:8000/docs`.
 
-### Terminal 3 — Frontend
+### Terminal 3 - Frontend
 
 ```powershell
 cd frontend
@@ -334,9 +338,9 @@ Backend mặc định dùng **YOLOv8m-pose** (`yolov8m-pose.pt`) để ưu tiên
 
 Model pose pretrained cung cấp keypoint người, không phải model đã huấn luyện riêng cho té ngã. Backend ưu tiên runtime tăng tốc có sẵn (TensorRT/OpenVINO theo môi trường), rồi mới fallback PyTorch. Tốc độ thực tế tùy CPU/GPU, resolution, số người và phiên bản thư viện. Tham khảo [YOLOv8](https://docs.ultralytics.com/models/yolov8), [COCO Pose](https://docs.ultralytics.com/datasets/pose/coco) và [Tracking](https://docs.ultralytics.com/modes/track).
 
-Luồng ảnh: ESP32-CAM gửi JPEG multipart → backend đọc HTTP và giải mã bằng OpenCV → frame mới nhất được đưa vào pipeline AI → YOLO phát hiện/track/pose → backend vẽ overlay, xử lý sự kiện và phát MJPEG cho dashboard. Hàng đợi frame nhỏ ưu tiên độ mới; khi AI chậm, frame cũ có thể bị bỏ để giảm độ trễ.
+Luồng ảnh: ESP32-CAM gửi JPEG multipart → backend đọc HTTP và giải mã bằng OpenCV → frame mới nhất được đưa vào pipeline AI → YOLO phát hiện/track/pose và xử lý sự kiện. Dashboard lấy MJPEG trực tiếp từ backend qua `/api/v1/video/live`, đồng thời lấy bounding box và keypoint tại `/api/v1/video/detections` để hiển thị overlay. Endpoint `/api/v1/video/stream` vẫn cung cấp MJPEG đã vẽ overlay sẵn. Hàng đợi frame nhỏ ưu tiên độ mới; khi AI chậm, frame cũ có thể bị bỏ để giảm độ trễ.
 
-Camera firmware dùng JPEG, XCLK 20 MHz và mặc định VGA khi PSRAM khả dụng; nếu không có PSRAM sẽ fallback độ phân giải thấp hơn. ESP32-CAM có endpoint stream `:81/stream` và endpoint trạng thái/điều chỉnh `:82`. FPS camera (`RAW FPS`) khác FPS AI overlay; `AI_FPS_LIMIT=15` chỉ là trần xử lý AI. Ở lần đo trên cấu hình hiện tại, RAW stream khoảng 10 FPS nên AI không thể hiển thị nhanh hơn nguồn camera. Dùng `/api/v1/video/status`, `[VIDEO-INGEST]` và `[VIDEO-AI]` để xác định nút thắt; model INT8 không yêu cầu nạp lại firmware.
+Camera firmware dùng JPEG, XCLK 20 MHz và mặc định VGA khi PSRAM khả dụng; nếu không có PSRAM sẽ fallback độ phân giải thấp hơn. ESP32-CAM có endpoint stream `:81/stream` và endpoint trạng thái/điều chỉnh `:82`. FPS camera (`RAW FPS`) khác tốc độ xử lý AI. Theo quan sát của nhóm, RAW có thể đạt khoảng 30 FPS; AI thường dao động quanh 15–20 FPS và có thể chênh khoảng 5 FPS theo nguồn điện, mạng và năng lực xử lý. `AI_FPS_LIMIT=15` trong cấu hình mẫu giới hạn AI ở tối đa 15 FPS; cần tăng giá trị này nếu muốn đo mức cao hơn. Dùng `/api/v1/video/status`, `[VIDEO-INGEST]` và `[VIDEO-AI]` để xác định nút thắt; đổi model không cần nạp lại firmware.
 
 ## 9. Cách thuật toán tính té ngã và bám mục tiêu
 
@@ -364,7 +368,7 @@ filtered = alpha * current + (1 - alpha) * previous_filtered
 
 Detector theo dõi từng ID, xác định trạng thái đứng trước đó, rồi kết hợp tư thế ngang, độ tụt tâm cơ thể chuẩn hóa theo chiều cao người, tốc độ tụt và độ ổn định sau sự kiện. `OBSERVED_HORIZONTAL` nghĩa là đã thấy người nằm ngang nhưng chưa có lịch sử đứng/chuyển động đủ để xác nhận ngã. Detector giữ giai đoạn nghi ngờ qua các frame liên tiếp, yêu cầu thay đổi tư thế thực trước khi xác nhận và chỉ chuyển sang hồi phục khi người đã đứng ổn định. Khi một người bị YOLO đổi ID trong thời gian ngắn, backend có thể chuyển lịch sử tư thế sang ID mới nếu khung người còn gần/chồng nhau và camera đứng yên.
 
-Khi radar có tọa độ **mới** trong vùng `SAFE` và không đồng thời thuộc vùng `DANGER`, backend gắn `SAFE ZONE` lên người và bỏ qua cảnh báo ngã cho tư thế nghỉ như nằm trên giường. Dữ liệu radar cũ quá 2 giây không giữ chặn này. Ở ngoài cả hai vùng, detector vẫn đánh giá ngã bằng tư thế và lịch sử chuyển động; chế độ camera `MANUAL` tự nó không tắt chức năng phát hiện. `DANGER_ZONE` là cảnh báo xâm nhập vùng nguy hiểm riêng, không đồng nghĩa với xác nhận ngã. Khi có từ hai người với pose đủ tin cậy, cảnh báo ngã tạm `MUTED` để tránh gán nhầm; một box không có keypoint thân đủ tin cậy không được tính là người thứ hai.
+Khi radar có tọa độ **mới** trong vùng `SAFE` và không đồng thời thuộc vùng `DANGER`, backend áp dụng ngữ cảnh `SAFE ZONE` và bỏ qua cảnh báo ngã, kể cả khi người đang nằm. Dữ liệu radar cũ quá 2 giây không giữ chặn này. Radar và camera chưa ghép danh tính theo từng người, nên đây là ngữ cảnh chung của khung hình, không phải xác nhận người trong ảnh đang ở vùng SAFE. Ở ngoài cả hai vùng, detector vẫn đánh giá ngã bằng tư thế và lịch sử chuyển động; chế độ camera `MANUAL` tự nó không tắt chức năng phát hiện. `DANGER_ZONE` là cảnh báo xâm nhập vùng nguy hiểm riêng, không đồng nghĩa với xác nhận ngã. Khi có từ hai người với pose đủ tin cậy, cảnh báo ngã tạm `MUTED` để tránh gán nhầm; một box không có keypoint thân đủ tin cậy không được tính là người thứ hai.
 
 Các ngưỡng trong `fall_detection.py` là heuristic theo ảnh, có thể báo nhầm khi người ngồi/nằm, bị che khuất, camera rung/nghiêng hoặc tracker đổi ID. Cần thử với video của không gian sử dụng; đây không phải hệ thống y tế/chứng nhận an toàn.
 
@@ -402,7 +406,7 @@ Radar được ưu tiên khi mục tiêu radar còn mới; tracking hình ảnh 
 
 Mosquitto dùng cổng TCP 1883. Topic servo chính gồm `embedded/servo/mode`, `embedded/servo/manual`, `embedded/servo/tracking` và `embedded/servo/status`; radar dùng `embedded/radar/data`. Firmware DevKit và backend phải kết nối cùng một broker IP.
 
-Firmware `esp32_cam_radar.ino` đang dùng giao thức bước: `LEFT`, `RIGHT`, `UP`, `DOWN`, `RESET`. Mỗi lệnh thay đổi góc đích một bước; thao tác giữ nút trên giao diện có thể gửi lặp tùy implementation frontend. Profile backend tương ứng là `SERVO_PROTOCOL=legacy_step`. Không chọn `sequenced_hold` cho firmware này.
+Firmware `esp32_cam_radar.ino` đang dùng giao thức bước: `LEFT`, `RIGHT`, `UP`, `DOWN`, `RESET`. Mỗi lần nhấn nút điều khiển trên giao diện gửi một bước hữu hạn; giữ nút không tự lặp lệnh. Profile backend tương ứng là `SERVO_PROTOCOL=legacy_step`. Không chọn `sequenced_hold` cho firmware này.
 
 ### HTTP API / WebSocket
 
@@ -410,9 +414,11 @@ Firmware `esp32_cam_radar.ino` đang dùng giao thức bước: `LEFT`, `RIGHT`,
 |---|---|
 | `GET /api/v1/video/stream` | Luồng MJPEG có overlay AI. |
 | `GET /api/v1/video/live` | Luồng xem trực tiếp/raw. |
+| `GET /api/v1/video/detections` | Kết quả AI mới nhất để dashboard vẽ overlay. |
 | `GET /api/v1/video/status` | Chẩn đoán camera và AI. |
 | `GET, POST /api/v1/config/camera` | Đọc/cập nhật nguồn camera. |
 | `GET /api/v1/radar/history` | Dữ liệu radar gần nhất. |
+| `GET /api/v1/radar/status` | Tọa độ radar mới nhất và phân loại vùng. |
 | `GET, POST /api/v1/config/zones` | Đọc/lưu vùng. |
 | `GET, POST /api/v1/config/room` | Đọc/lưu kích thước/vị trí phòng. |
 | `GET /api/v1/servo/diag` | Tình trạng giao thức và telemetry servo. |
@@ -459,7 +465,17 @@ Y_room = radar_y - x*sin(theta) + y*cos(theta)
 
 Python dependencies được liệt kê tại `backend/requirements.txt`; frontend dependencies khóa trong `frontend/package-lock.json`.
 
-## 13. Xử lý sự cố thường gặp
+## 13. Kiểm thử phần mềm
+
+Từ thư mục `backend`, sau khi cài thư viện, chạy các ca kiểm thử hiện có:
+
+```powershell
+python -m unittest -v test_fall_detection.py test_zone_config.py test_servo_control.py
+```
+
+Ba tệp gồm 25 ca kiểm tra máy trạng thái té ngã, tính hợp lệ và ranh giới vùng, cùng hai profile điều khiển servo. Chúng kiểm tra logic phần mềm với dữ liệu giả lập, chưa thay thế việc đo độ chính xác, độ trễ hoặc độ ổn định trên phần cứng thực.
+
+## 14. Xử lý sự cố thường gặp
 
 | Triệu chứng | Bắt đầu kiểm tra từ |
 |---|---|
@@ -472,21 +488,23 @@ Python dependencies được liệt kê tại `backend/requirements.txt`; fronte
 | MQTT/radar/servo ngừng hoạt động sau khi IP máy tính đổi | Kiểm tra IP máy chạy Mosquitto bằng `ipconfig`; đặt cùng IP đó ở `MQTT_BROKER` trong `backend/.env` và `mqtt_server` trong `hardware/esp32_cam_radar.ino`. Khởi động lại backend, nạp lại firmware đã sửa vào ESP32 DevKit, kiểm tra `[BOOT] ... mqtt=...` và kết nối MQTT. |
 | Radar có tọa độ nhưng bản đồ không hiện chấm | Mở `/api/v1/radar/status`; nếu `online=false`/`STALE`, kiểm tra gói `embedded/radar/data` mới, broker của backend và DevKit, `frames_with_target`/`published` trong `[RADAR-DIAG]`. Chấm cũ được ẩn sau khi ngừng cập nhật. |
 | Camera stream lag | So sánh RAW FPS/AI FPS, giảm số viewer, thử QVGA, kiểm tra PSRAM, Wi-Fi và thời gian inference. Giới hạn FPS cao không làm tăng năng lực xử lý của máy. |
-| Camera không kết nối backend sau khi IP ESP32-CAM đổi | Xem `[CAM-URL]` trên Serial Monitor; mở `http://<IP-camera-moi>:81/stream` trên cùng mạng. Cập nhật IP tại **Cài đặt hệ thống** (tự lưu `VIDEO_SOURCE` vào `backend/.env`) hoặc sửa `VIDEO_SOURCE` trong `.env` rồi khởi động lại backend. Không cần nạp lại ESP32-CAM nếu chỉ đổi IP DHCP. |
+| Camera không kết nối backend sau khi IP ESP32-CAM đổi | Xem `[CAM-URL]` trên Serial Monitor và kiểm tra `http://<IP-camera-moi>:82/status` trên cùng mạng. Cập nhật IP tại **Cài đặt hệ thống** (tự lưu `VIDEO_SOURCE` vào `backend/.env`) hoặc sửa `VIDEO_SOURCE` trong `.env` rồi khởi động lại backend. Muốn thử trực tiếp `:81/stream`, tạm dừng backend trước vì camera chỉ nhận một người đọc. Không cần nạp lại ESP32-CAM nếu chỉ đổi IP DHCP. |
+| Điện thoại mở được giao diện nhưng dữ liệu hoặc chức năng không tải trong chế độ phát triển | Kiểm tra địa chỉ backend, TCP 8000 và Windows Firewall. Nếu log Next.js báo chặn origin, thêm IP/tên máy chủ đang dùng trong URL trình duyệt vào `allowedDevOrigins` tại `frontend/next.config.ts`, rồi khởi động lại `npm run dev`. |
 | Radar map lệch hướng | Kiểm tra đơn vị mm, dấu trục, gốc phòng và góc xoay. |
 | Nằm/ngã ngoài vùng SAFE nhưng không có cảnh báo ngã | Nhãn `OBSERVED_HORIZONTAL` nghĩa là thiếu lịch sử đứng trước khi nằm; để camera thấy toàn thân đứng ổn định rồi thử lại. Nếu hiện `SAFE ZONE`, đối chiếu chấm radar và `zone_state` tại `/api/v1/radar/status` với vùng SAFE đã lưu. Nếu hiện `MUTED`, kiểm tra số người/box và keypoint trong `/api/v1/video/detections`; camera đang quay cũng tạm ngừng đánh giá chuyển động. |
 
 Log hữu ích khi chẩn đoán gồm boot/reset reason, `[RADAR-DIAG]`, `[SERVO-DIAG]`, trạng thái MQTT, `/api/v1/video/status` và `/api/v1/servo/diag`. Không chia sẻ `.env` hoặc mật khẩu Wi-Fi/token.
 
-## 14. Dữ liệu và giới hạn vận hành
+## 15. Dữ liệu và giới hạn vận hành
 
-- Backend lưu metadata sự kiện trong SQLite; chạy từ thư mục `backend` để đường dẫn dữ liệu tương đối nhất quán.
+- Backend lưu metadata sự kiện trong SQLite; khi chạy từ thư mục `backend`, ảnh sự kiện được lưu tại `backend/snapshots/`.
 - Ảnh snapshot và log debug có thể tăng theo thời gian; cần theo dõi dung lượng lưu trữ.
+- Watchdog khởi động lại tiến trình camera hoặc AI nếu tiến trình đã dừng; nó không bảo đảm phát hiện mọi trường hợp tiến trình vẫn sống nhưng bị treo.
 - Trang logs trên frontend nhận trạng thái qua WebSocket; các thao tác trên giao diện không nhất thiết tương ứng với API lưu lịch sử bền vững.
 - Radar mmWave có thể phát hiện mục tiêu nhưng không thay thế camera hay xác nhận danh tính. Tracking theo ảnh cũng có thể mất ID hoặc sai keypoint.
 - Đây là dự án giám sát thử nghiệm; không dùng làm lớp bảo vệ duy nhất cho an toàn con người.
 
-## 15. Truy cập riêng từ xa bằng Tailscale
+## 16. Truy cập riêng từ xa bằng Tailscale
 
 Ứng dụng chạy trên máy chủ cục bộ, nhưng dashboard có thể mở trên điện thoại hoặc máy tính bảng ở ngoài nhà qua tailnet riêng. Backend và frontend vẫn chạy trên máy chủ gia đình; Tailscale tạo kết nối riêng giữa các thiết bị đã xác thực. Người chăm sóc không cần phơi cổng ứng dụng trực tiếp ra Internet.
 
@@ -512,13 +530,13 @@ Người chăm sóc từ xa chỉ cần dashboard; **không cần truy cập MQT
 
 Tailscale mã hóa kết nối giữa các thiết bị trong tailnet và hỗ trợ chính sách cấp quyền theo người/nhóm, thiết bị và cổng. IP Tailscale của node thường ổn định khi chuyển mạng; có thể dùng MagicDNS thay IP nếu đã bật. AI và dữ liệu được xử lý trên máy chủ cục bộ, nhưng truy cập từ xa vẫn phụ thuộc tài khoản tailnet, ACL/firewall và kết nối Internet.
 
-## 16. Giao diện mobile
+## 17. Giao diện mobile
 
-Dashboard có bố cục responsive cho màn hình nhỏ: menu điều hướng thành drawer, video nằm phía trên và vùng điều khiển ở bên dưới; trang phân tích xếp cấu hình và bản đồ radar theo chiều dọc. Người chăm sóc có thể truy cập bằng trình duyệt điện thoại/tablet khi thiết bị đã vào tailnet.
+Dashboard chính có bố cục responsive cho màn hình nhỏ: menu điều hướng thành drawer, video nằm phía trên và vùng điều khiển ở bên dưới. Người chăm sóc có thể mở trang giám sát bằng trình duyệt điện thoại/tablet khi thiết bị đã vào tailnet. Hiện trang **Phân tích** và **Cài đặt hệ thống** yêu cầu màn hình rộng ít nhất 1024 px; trên màn hình hẹp hơn ứng dụng hiển thị thông báo dùng máy tính. Hãy cấu hình phòng, vùng và IP camera trên máy tính trước khi chỉ dùng điện thoại để theo dõi.
 
 Khuyến nghị bắt đầu ở chế độ dọc, dùng nút điều khiển cảm ứng và xoay ngang nếu cần xem video lớn hơn. MJPEG có thể tiêu thụ nhiều pin/dữ liệu di động; trải nghiệm phụ thuộc mạng và năng lực máy chủ. Kiểm tra vùng chạm, trạng thái kết nối và điều khiển servo trước khi sử dụng thực tế.
 
-## 17. Quyền riêng tư và vận hành
+## 18. Quyền riêng tư và vận hành
 
 - Đặt máy chủ ở vị trí an toàn, khóa tài khoản Windows và giới hạn người đăng nhập.
 - Chỉ lưu snapshot/log khi cần; định kỳ kiểm tra và xóa dữ liệu không còn cần thiết.
@@ -528,15 +546,15 @@ Khuyến nghị bắt đầu ở chế độ dọc, dùng nút điều khiển c
 
 ## Tài liệu tham khảo
 
-- [Arduino ESP32 core — cài đặt](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)
+- [Arduino ESP32 core - cài đặt](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)
 - [ESP32 strapping pins](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/sd_pullup_requirements.html)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [Next.js](https://nextjs.org/docs)
 - [Ultralytics YOLOv8](https://docs.ultralytics.com/models/yolov8)
 - [Ultralytics tracking](https://docs.ultralytics.com/modes/track)
 - [Mosquitto](https://mosquitto.org/documentation/)
-- [Tailscale — access control grants](https://tailscale.com/docs/features/access-control/grants)
-- [Tailscale — IP và DNS của thiết bị](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
+- [Tailscale - access control grants](https://tailscale.com/docs/features/access-control/grants)
+- [Tailscale - IP và DNS của thiết bị](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
 - [Tailscale Serve và Funnel](https://tailscale.com/docs/features/tailscale-funnel)
-- [Telegram — tạo bot và BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
-- [Telegram Bot API — getUpdates](https://core.telegram.org/bots/api#getupdates)
+- [Telegram - tạo bot và BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
+- [Telegram Bot API - getUpdates](https://core.telegram.org/bots/api#getupdates)

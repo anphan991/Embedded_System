@@ -1,0 +1,72 @@
+
+=== KIỂM THỬ BACKEND ĐÃ THỰC HIỆN — 2026-10-11 ===
+Phạm vi: unit test thuần Python cho FallDetector và cấu hình vùng SQLite; không khởi chạy backend, MQTT broker, camera hoặc phần cứng.
+Python: C:\Users\PC\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe
+Thư mục chạy cách ly: C:\Users\PC\Desktop\Embedded system\bao_cao_bien_tap\_work\backend_test_run_20261011
+Nguồn được sao chép nguyên trạng: backend/fall_detection.py, backend/database.py, backend/test_fall_detection.py, backend/test_zone_config.py.
+Lệnh: python.exe -m unittest -v test_fall_detection test_zone_config
+Mã thoát thực tế: 0
+
+test_gradual_collapse_from_chair_is_confirmed (test_fall_detection.FallDetectorTests.test_gradual_collapse_from_chair_is_confirmed) ... ok
+test_slow_stationary_person_is_not_a_fall (test_fall_detection.FallDetectorTests.test_slow_stationary_person_is_not_a_fall) ... ok
+test_static_lying_person_is_not_a_fall (test_fall_detection.FallDetectorTests.test_static_lying_person_is_not_a_fall) ... ok
+test_two_ids_are_independent (test_fall_detection.FallDetectorTests.test_two_ids_are_independent) ... ok
+test_upright_to_horizontal_transition_confirms (test_fall_detection.FallDetectorTests.test_upright_to_horizontal_transition_confirms) ... ok
+test_invalid_bounds_do_not_replace_existing_zones (test_zone_config.ZoneConfigTests.test_invalid_bounds_do_not_replace_existing_zones) ... ok
+test_non_finite_coordinates_are_rejected (test_zone_config.ZoneConfigTests.test_non_finite_coordinates_are_rejected) ... ok
+test_update_replaces_zones_and_normalizes_type_and_name (test_zone_config.ZoneConfigTests.test_update_replaces_zones_and_normalizes_type_and_name) ... ok
+test_zone_contains_boundary_points_but_not_outside_points (test_zone_config.ZoneConfigTests.test_zone_contains_boundary_points_but_not_outside_points) ... ok
+test_zone_outside_room_is_rejected (test_zone_config.ZoneConfigTests.test_zone_outside_room_is_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.154s
+
+OK
+
+Diễn giải: 5/5 ca FallDetector và 5/5 ca cấu hình vùng đạt. Dữ liệu FallObservation là dữ liệu tổng hợp; kết quả không phải độ chính xác phát hiện té ngã trên video hay thử nghiệm với người. Kiểm thử vùng sử dụng cơ sở dữ liệu tạm, không đụng tới local_alerts.db của dự án. Mô-đun FallDetector có ghi fall_debug.log; tệp phát sinh được giữ trong thư mục chạy cách ly.
+
+Bộ test_servo_control.py: có 15 ca trong mã nguồn (8 ServoControlTests, 7 LegacyServoTests), chỉ phân tích, CHƯA CHẠY. Lý do: môi trường Python bundled không có cv2, fastapi, uvicorn, dotenv, requests và paho; import main còn có tác dụng phụ nạp dotenv, tạo thư mục snapshot và khởi tạo SQLite. Không báo 15 ca này là đã đạt. MQTT ở bộ test dùng Broker giả và gọi hàm backend trực tiếp, không kiểm chứng giao tiếp mạng hoặc chuyển động servo.
+
+mock_hardware.py: công cụ phát dữ liệu JSON radar qua kết nối MQTT thật mỗi 1 giây; hỗ trợ điểm ngẫu nhiên, điểm đứng yên, tọa độ gợi ý vùng nghỉ, tọa độ chuyển động và quỹ đạo chữ nhật. Trạng thái MOVING/STOPPED do người thao tác phát thủ công. Công cụ không sinh ảnh, keypoint, khung UART LD2450 hay phản hồi cơ khí servo. Chưa chạy công cụ giả lập trong lần kiểm tra này. Tên kịch bản SAFE/DANGER chỉ có ý nghĩa sau khi đổi tọa độ theo cấu hình phòng và kiểm tra vùng hiện hành.
+
+=== BỔ SUNG KẾT QUẢ KIỂM THỬ SERVO — 2026-10-11 ===
+Cập nhật: phần ghi CHƯA CHẠY đối với test_servo_control.py ở mục trước chỉ phản ánh lần kiểm tra bằng runtime bundled. Đã chạy bộ này bằng môi trường Python sẵn có của dự án và đạt kết quả bên dưới.
+Python: C:\Users\PC\Desktop\Embedded system\backend\venv\Scripts\python.exe (Python 3.14.5)
+Thư mục chạy cách ly: C:\Users\PC\Desktop\Embedded system\bao_cao_bien_tap\_work\backend_test_run_20261011
+Nguồn bổ sung được sao chép nguyên trạng: backend/main.py, backend/servo_protocol.py, backend/test_servo_control.py.
+Nạp dotenv được vô hiệu bằng PYTHON_DOTENV_DISABLED=1; đã kiểm tra thư viện dotenv của môi trường này hỗ trợ cờ trên. Không đọc .env. Không kích hoạt lifespan, worker, Uvicorn, broker hay phần cứng; MQTT trong các test được thay bằng Broker giả có sẵn trong test_servo_control.py. Không cài thư viện và không tạo stub phụ thuộc.
+Lệnh: python.exe -m unittest -v test_servo_control
+Mã thoát thực tế: 0
+Có cảnh báo khởi động về đường dẫn Python gốc của môi trường venv; quá trình vẫn chạy trên Python 3.14.5 và hoàn thành toàn bộ 15 test.
+
+test_legacy_requires_broker_and_manual_mode (test_servo_control.LegacyServoTests.test_legacy_requires_broker_and_manual_mode) ... ok
+test_mode_ack_only_confirms_broker (test_servo_control.LegacyServoTests.test_mode_ack_only_confirms_broker) ... ok
+test_no_fabricated_online_or_stale_retained_data (test_servo_control.LegacyServoTests.test_no_fabricated_online_or_stale_retained_data) ... ok
+test_raw_steps_work_without_telemetry (test_servo_control.LegacyServoTests.test_raw_steps_work_without_telemetry) ... ok
+test_step_bursts_and_duplicate_http_are_not_queued (test_servo_control.LegacyServoTests.test_step_bursts_and_duplicate_http_are_not_queued) ... ok
+test_tracking_coordinates_match_fixed_vga_firmware (test_servo_control.LegacyServoTests.test_tracking_coordinates_match_fixed_vga_firmware) ... ok
+test_unsupported_hold_stop_and_config_never_publish (test_servo_control.LegacyServoTests.test_unsupported_hold_stop_and_config_never_publish) ... ok
+test_all_four_hold_directions_are_published (test_servo_control.ServoControlTests.test_all_four_hold_directions_are_published) ... ok
+test_failed_enqueue_can_retry_same_sequence (test_servo_control.ServoControlTests.test_failed_enqueue_can_retry_same_sequence) ... ok
+test_memory_health_is_passed_to_dashboard (test_servo_control.ServoControlTests.test_memory_health_is_passed_to_dashboard) ... ok
+test_offline_still_allows_stop (test_servo_control.ServoControlTests.test_offline_still_allows_stop) ... ok
+test_partial_sequence_is_rejected (test_servo_control.ServoControlTests.test_partial_sequence_is_rejected) ... ok
+test_stale_telemetry_rejects_motion (test_servo_control.ServoControlTests.test_stale_telemetry_rejects_motion) ... ok
+test_stop_ack_wait_does_not_block_new_gesture (test_servo_control.ServoControlTests.test_stop_ack_wait_does_not_block_new_gesture) ... ok
+test_stop_prevents_older_hold_from_being_published (test_servo_control.ServoControlTests.test_stop_prevents_older_hold_from_being_published) ... ok
+
+----------------------------------------------------------------------
+Ran 15 tests in 0.006s
+
+OK
+
+Tổng hợp kết quả ĐÃ CHẠY: 25/25 ca đạt, gồm FallDetector 5/5, cấu hình vùng SQLite 5/5 và đường điều khiển servo 15/15. Hai lượt dùng môi trường Python khác nhau. Các số 0,154 s và 0,006 s là thời gian chạy unit test do unittest báo, không phải độ trễ suy luận, camera, servo hay cảnh báo của hệ thống.
+Phạm vi: kết quả xác nhận các assertion hiện có trên dữ liệu tổng hợp, cơ sở dữ liệu tạm và broker giả; không đo độ chính xác trên video, độ trễ mạng, sai số góc cơ khí hoặc khả năng vận hành dài hạn. 8 ca ServoControlTests kiểm tra nhánh sequenced_hold; 7 ca LegacyServoTests kiểm tra nhánh legacy_step, trong đó kiểm tra quy đổi tọa độ cũng có assertion cho payload sequenced_hold. Việc nhánh sequenced_hold đạt unit test không chứng minh firmware legacy_step hiện hành hỗ trợ HOLD, STOP hoặc telemetry.
+Đối chiếu SHA256 bản sao main.py : True
+Đối chiếu SHA256 bản sao fall_detection.py : True
+Đối chiếu SHA256 bản sao database.py : True
+Đối chiếu SHA256 bản sao servo_protocol.py : True
+Đối chiếu SHA256 bản sao test_fall_detection.py : True
+Đối chiếu SHA256 bản sao test_zone_config.py : True
+Đối chiếu SHA256 bản sao test_servo_control.py : True
+Bổ sung phiên bản runtime bundled dùng cho FallDetector và ZoneConfig: Python 3.12.14.

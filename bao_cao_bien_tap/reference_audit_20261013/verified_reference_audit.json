@@ -1,0 +1,363 @@
+{
+  "documentId": "1TSqhWf8g-AN6jkvRkLwYAojhGxZY42lbHffNSxuyalg",
+  "tabId": "t.f4e0xw306zdi",
+  "revisionId": "AHj4eMROmBsjE7lsbiwKw_NW4DbY2v1izkE2xFWv5Lm4SuaSLeF8lTpl-CrTyJ4G-Xk6HxAI3-US1s7gT9HNIuf8jk4XDhaDyweD0_yAQ0M",
+  "referenceCount": 39,
+  "firstCitationOrder": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39
+  ],
+  "bodyCitationCount": 71,
+  "sources": [
+    {
+      "key": "who",
+      "entry": "World Health Organization, “Falls,” Apr. 26, 2021. Accessed: Oct. 13, 2026. [Online]. Available: https://www.who.int/news-room/fact-sheets/detail/falls",
+      "url": "https://www.who.int/news-room/fact-sheets/detail/falls",
+      "sourceOrder": 0,
+      "first": 12570,
+      "n": 1
+    },
+    {
+      "key": "gso",
+      "entry": "General Statistics Office and United Nations Population Fund, Population Ageing and Older Persons in Viet Nam. Hanoi, Vietnam, Jul. 2021. [Online]. Available: https://vietnam.unfpa.org/sites/default/files/pub-pdf/ageing_report_from_census_2019_eng_final27082021.pdf",
+      "url": "https://vietnam.unfpa.org/sites/default/files/pub-pdf/ageing_report_from_census_2019_eng_final27082021.pdf",
+      "sourceOrder": 1,
+      "first": 12793,
+      "n": 2
+    },
+    {
+      "key": "tuyen",
+      "entry": "V. Q. Tuyen, B. N. Dung, N. H. Nghia, C. T. Dai, and V. D. Nguyen, “Vision Based Fall Detection for the Elderly People,” in Proc. 2020 International Conference on Applications of Artificial Intelligence in Transportation (AITC 2020), Ho Chi Minh City, Vietnam, 2020. [Online]. Available: https://dost.hochiminhcity.gov.vn/documents/1217/AITC2020_Proceedings.pdf",
+      "url": "https://dost.hochiminhcity.gov.vn/documents/1217/AITC2020_Proceedings.pdf",
+      "sourceOrder": 2,
+      "first": 14750,
+      "n": 3
+    },
+    {
+      "key": "ng",
+      "entry": "P. H. Ng, A. Mai, and H. Nguyen, “Building an AI-Powered IoT App for Fall Detection Using Yolov8 Approach,” in Intelligence of Things: Technologies and Applications, vol. 188, Lecture Notes on Data Engineering and Communications Technologies. Springer, 2023, pp. 65–74, doi: 10.1007/978-3-031-46749-3_7.",
+      "url": "https://doi.org/10.1007/978-3-031-46749-3_7",
+      "sourceOrder": 3,
+      "first": 15205,
+      "n": 4
+    },
+    {
+      "key": "do",
+      "entry": "T. N. Do and T. T. Le, “A new design of a fall detection system integrating landmark identification and deep learning techniques,” Vietnam Journal of Science, Technology and Engineering, vol. 68, no. 1, pp. 3–12, Mar. 2026, doi: 10.31276/VJSTE.2024.0138.",
+      "url": "https://doi.org/10.31276/VJSTE.2024.0138",
+      "sourceOrder": 4,
+      "first": 15464,
+      "n": 5
+    },
+    {
+      "key": "lu",
+      "entry": "N. Lu, Y. Wu, L. Feng, and J. Song, “Deep Learning for Fall Detection: Three-Dimensional CNN Combined With LSTM on Video Kinematic Data,” IEEE Journal of Biomedical and Health Informatics, vol. 23, no. 1, pp. 314–323, 2019, doi: 10.1109/JBHI.2018.2808281.",
+      "url": "https://doi.org/10.1109/JBHI.2018.2808281",
+      "sourceOrder": 5,
+      "first": 16482,
+      "n": 6
+    },
+    {
+      "key": "jin",
+      "entry": "F. Jin, A. Sengupta, and S. Cao, “mmFall: Fall Detection Using 4-D mmWave Radar and a Hybrid Variational RNN AutoEncoder,” IEEE Transactions on Automation Science and Engineering, vol. 19, no. 2, pp. 1245–1257, 2022, doi: 10.1109/TASE.2020.3042158.",
+      "url": "https://doi.org/10.1109/TASE.2020.3042158",
+      "sourceOrder": 6,
+      "first": 16888,
+      "n": 7
+    },
+    {
+      "key": "ld",
+      "entry": "Shenzhen Hi-Link Electronic Co., Ltd., “HLK-LD2450: Moving target detection and tracking module,” product documentation and user manual. Accessed: Oct. 13, 2026. [Online]. Available: https://www.hlktech.net/index.php?id=1182",
+      "url": "https://www.hlktech.net/index.php?id=1182",
+      "sourceOrder": 7,
+      "first": 20038,
+      "n": 8
+    },
+    {
+      "key": "esp",
+      "entry": "Espressif Systems, ESP32 Series Datasheet. Accessed: Oct. 13, 2026. [Online]. Available: https://documentation.espressif.com/esp32_datasheet_en.pdf",
+      "url": "https://documentation.espressif.com/esp32_datasheet_en.pdf",
+      "sourceOrder": 8,
+      "first": 20481,
+      "n": 9
+    },
+    {
+      "key": "ehub",
+      "entry": "R. Teja, “Getting Started with ESP32 | Introduction to ESP32,” Electronics Hub, Apr. 1, 2024. Accessed: Oct. 13, 2026. [Online]. Available: https://www.electronicshub.org/getting-started-with-esp32/",
+      "url": "https://www.electronicshub.org/getting-started-with-esp32/",
+      "sourceOrder": 9,
+      "first": 20852,
+      "n": 10
+    },
+    {
+      "key": "camera",
+      "entry": "Espressif Systems, “ESP32 Camera Driver,” source code and JPEG HTTP stream example. Accessed: Oct. 13, 2026. [Online]. Available: https://github.com/espressif/esp32-camera",
+      "url": "https://github.com/espressif/esp32-camera",
+      "sourceOrder": 10,
+      "first": 21095,
+      "n": 11
+    },
+    {
+      "key": "ti",
+      "entry": "C. Iovescu and S. Rao, The Fundamentals of Millimeter Wave Radar Sensors, Texas Instruments, Application Report SPYY005A, Jul. 2020. [Online]. Available: https://www.ti.com/lit/wp/spyy005a/spyy005a.pdf",
+      "url": "https://www.ti.com/lit/wp/spyy005a/spyy005a.pdf",
+      "sourceOrder": 11,
+      "first": 22795,
+      "n": 12
+    },
+    {
+      "key": "chirp",
+      "entry": "Wikipedia contributors, “Chirp,” Wikipedia, waveform illustration. Accessed: Oct. 13, 2026. [Online]. Available: https://en.wikipedia.org/wiki/Chirp",
+      "url": "https://en.wikipedia.org/wiki/Chirp",
+      "sourceOrder": 12,
+      "first": 23267,
+      "n": 13
+    },
+    {
+      "key": "nshop",
+      "entry": "Nshop, “Cảm biến hiện diện con người HLK-LD2450 24GHz,” hình minh họa sản phẩm và vùng quét. Accessed: Oct. 13, 2026. [Online]. Available: https://nshopvn.com/product/cam-bien-hien-dien-con-nguoi-hlk-ld2450-24ghz/",
+      "url": "https://nshopvn.com/product/cam-bien-hien-dien-con-nguoi-hlk-ld2450-24ghz/",
+      "sourceOrder": 13,
+      "first": 24332,
+      "n": 14
+    },
+    {
+      "key": "pololu",
+      "entry": "Pololu Corporation, “Servo control interface in detail.” Accessed: Oct. 13, 2026. [Online]. Available: https://www.pololu.com/blog/17/servo-control-interface-in-detail",
+      "url": "https://www.pololu.com/blog/17/servo-control-interface-in-detail",
+      "sourceOrder": 15,
+      "first": 24766,
+      "n": 15
+    },
+    {
+      "key": "servo",
+      "entry": "ESP32Servo contributors, “ESP32Servo: Arduino-compatible servo library for the ESP32,” source code and Sweep example. Accessed: Oct. 13, 2026. [Online]. Available: https://github.com/madhephaestus/ESP32Servo",
+      "url": "https://github.com/madhephaestus/ESP32Servo",
+      "sourceOrder": 14,
+      "first": 24839,
+      "n": 16
+    },
+    {
+      "key": "pishop",
+      "entry": "PiShop.us, “Pan-Tilt HAT – Full Kit,” Pimoroni PIM183, product illustration. Accessed: Oct. 13, 2026. [Online]. Available: https://www.pishop.us/product/pan-tilt-hat-full-kit/",
+      "url": "https://www.pishop.us/product/pan-tilt-hat-full-kit/",
+      "sourceOrder": 16,
+      "first": 25851,
+      "n": 17
+    },
+    {
+      "key": "nist",
+      "entry": "NIST/SEMATECH, “Single Exponential Smoothing,” e-Handbook of Statistical Methods, sec. 6.4.3.1. Accessed: Oct. 13, 2026. [Online]. Available: https://www.itl.nist.gov/div898/handbook/pmc/section4/pmc431.htm",
+      "url": "https://www.itl.nist.gov/div898/handbook/pmc/section4/pmc431.htm",
+      "sourceOrder": 17,
+      "first": 27395,
+      "n": 18
+    },
+    {
+      "key": "pose",
+      "entry": "Ultralytics, “Pose Estimation with Ultralytics YOLO.” Accessed: Oct. 13, 2026. [Online]. Available: https://docs.ultralytics.com/tasks/pose/",
+      "url": "https://docs.ultralytics.com/tasks/pose/",
+      "sourceOrder": 18,
+      "first": 28639,
+      "n": 19
+    },
+    {
+      "key": "yolov8",
+      "entry": "G. Jocher, A. Chaurasia, and J. Qiu, “Ultralytics YOLOv8,” software, 2023. Accessed: Oct. 13, 2026. [Online]. Available: https://docs.ultralytics.com/models/yolov8/",
+      "url": "https://docs.ultralytics.com/models/yolov8/",
+      "sourceOrder": 19,
+      "first": 28639,
+      "n": 20
+    },
+    {
+      "key": "redmon",
+      "entry": "J. Redmon, S. Divvala, R. Girshick, and A. Farhadi, “You Only Look Once: Unified, Real-Time Object Detection,” in Proc. IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2016, pp. 779–788, doi: 10.1109/CVPR.2016.91. [Online]. Available: https://openaccess.thecvf.com/content_cvpr_2016/html/Redmon_You_Only_Look_CVPR_2016_paper.html",
+      "url": "https://openaccess.thecvf.com/content_cvpr_2016/html/Redmon_You_Only_Look_CVPR_2016_paper.html",
+      "sourceOrder": 20,
+      "first": 28698,
+      "n": 21
+    },
+    {
+      "key": "viso",
+      "entry": "viso.ai, “OpenPose: Real-Time Multi-Person Keypoint Detection,” nguồn hình minh họa keypoint. Accessed: Oct. 13, 2026. [Online]. Available: https://viso.ai/deep-learning/openpose/",
+      "url": "https://viso.ai/deep-learning/openpose/",
+      "sourceOrder": 21,
+      "first": 29301,
+      "n": 22
+    },
+    {
+      "key": "project",
+      "entry": "Nhóm thực hiện, “Mã nguồn hệ thống servo Pan–Tilt điều hướng camera và nhận diện té ngã,” tài liệu nội bộ, 2026. Các tệp đối chiếu: README.md, hardware/, backend/, frontend/; phiên bản Git 8a160e2728179b96946c6bdc43c97caed904c080. Kho lưu trữ: https://github.com/anphan991/Embedded_System. Bản mã nguồn cục bộ được đối chiếu ngày 13/10/2026.",
+      "url": "https://github.com/anphan991/Embedded_System",
+      "sourceOrder": 22,
+      "first": 29424,
+      "n": 23
+    },
+    {
+      "key": "botsort",
+      "entry": "N. Aharon, R. Orfaig, and B.-Z. Bobrovsky, “BoT-SORT: Robust Associations Multi-Pedestrian Tracking,” arXiv:2206.14651, 2022, doi: 10.48550/arXiv.2206.14651. [Online]. Available: https://arxiv.org/abs/2206.14651",
+      "url": "https://arxiv.org/abs/2206.14651",
+      "sourceOrder": 23,
+      "first": 30724,
+      "n": 24
+    },
+    {
+      "key": "mqtt",
+      "entry": "A. Banks and R. Gupta, Eds., MQTT Version 3.1.1, OASIS Standard, Oct. 29, 2014. [Online]. Available: https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html",
+      "url": "https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html",
+      "sourceOrder": 24,
+      "first": 31762,
+      "n": 25
+    },
+    {
+      "key": "mosquitto",
+      "entry": "Eclipse Foundation, “mosquitto.conf — the configuration file for Mosquitto.” Accessed: Oct. 13, 2026. [Online]. Available: https://mosquitto.org/man/mosquitto-conf-5.html",
+      "url": "https://mosquitto.org/man/mosquitto-conf-5.html",
+      "sourceOrder": 25,
+      "first": 31861,
+      "n": 26
+    },
+    {
+      "key": "atpro",
+      "entry": "ATPro Corp, “Giao thức MQTT là gì? Ưu nhược điểm và cơ chế hoạt động,” nguồn hình minh họa MQTT. Accessed: Oct. 13, 2026. [Online]. Available: https://atpro.com.vn/giao-thuc-mqtt-la-gi-uu-nhuoc-diem-va-co-che-hoat-dong/",
+      "url": "https://atpro.com.vn/giao-thuc-mqtt-la-gi-uu-nhuoc-diem-va-co-che-hoat-dong/",
+      "sourceOrder": 26,
+      "first": 32558,
+      "n": 27
+    },
+    {
+      "key": "fastapi",
+      "entry": "FastAPI contributors, “FastAPI Documentation,” sections “Concurrency and async / await” and “WebSockets.” Accessed: Oct. 13, 2026. [Online]. Available: https://fastapi.tiangolo.com/",
+      "url": "https://fastapi.tiangolo.com/",
+      "sourceOrder": 27,
+      "first": 32716,
+      "n": 28
+    },
+    {
+      "key": "ws",
+      "entry": "I. Fette and A. Melnikov, The WebSocket Protocol, RFC 6455, Dec. 2011, doi: 10.17487/RFC6455. [Online]. Available: https://www.rfc-editor.org/rfc/rfc6455",
+      "url": "https://www.rfc-editor.org/rfc/rfc6455",
+      "sourceOrder": 28,
+      "first": 33246,
+      "n": 29
+    },
+    {
+      "key": "next",
+      "entry": "Vercel, “Next.js Documentation.” Accessed: Oct. 13, 2026. [Online]. Available: https://nextjs.org/docs",
+      "url": "https://nextjs.org/docs",
+      "sourceOrder": 29,
+      "first": 33507,
+      "n": 30
+    },
+    {
+      "key": "tailwind",
+      "entry": "Tailwind Labs, “Styling with Utility Classes,” Tailwind CSS Documentation. Accessed: Oct. 13, 2026. [Online]. Available: https://tailwindcss.com/docs/styling-with-utility-classes",
+      "url": "https://tailwindcss.com/docs/styling-with-utility-classes",
+      "sourceOrder": 31,
+      "first": 33507,
+      "n": 31
+    },
+    {
+      "key": "react",
+      "entry": "React contributors, “useContext,” React Documentation. Accessed: Oct. 13, 2026. [Online]. Available: https://react.dev/reference/react/useContext",
+      "url": "https://react.dev/reference/react/useContext",
+      "sourceOrder": 30,
+      "first": 33635,
+      "n": 32
+    },
+    {
+      "key": "multiproc",
+      "entry": "Python Software Foundation, “multiprocessing — Process-based parallelism,” Python 3.12 Documentation. Accessed: Oct. 13, 2026. [Online]. Available: https://docs.python.org/3.12/library/multiprocessing.html",
+      "url": "https://docs.python.org/3.12/library/multiprocessing.html",
+      "sourceOrder": 32,
+      "first": 34485,
+      "n": 33
+    },
+    {
+      "key": "telegram",
+      "entry": "Telegram, “Telegram Bot API,” method “sendPhoto.” Accessed: Oct. 13, 2026. [Online]. Available: https://core.telegram.org/bots/api#sendphoto",
+      "url": "https://core.telegram.org/bots/api#sendphoto",
+      "sourceOrder": 34,
+      "first": 49047,
+      "n": 34
+    },
+    {
+      "key": "sqlite",
+      "entry": "SQLite developers, “About SQLite.” Accessed: Oct. 13, 2026. [Online]. Available: https://sqlite.org/about.html",
+      "url": "https://sqlite.org/about.html",
+      "sourceOrder": 33,
+      "first": 49244,
+      "n": 35
+    },
+    {
+      "key": "pubsub",
+      "entry": "N. O’Leary, “PubSubClient — API Documentation,” ver. 2.8. Accessed: Oct. 13, 2026. [Online]. Available: https://pubsubclient.knolleary.net/api",
+      "url": "https://pubsubclient.knolleary.net/api",
+      "sourceOrder": 35,
+      "first": 51840,
+      "n": 36
+    },
+    {
+      "key": "tailscale",
+      "entry": "Tailscale Inc., “Tailscale quickstart.” Accessed: Oct. 13, 2026. [Online]. Available: https://tailscale.com/kb/1017/install/",
+      "url": "https://tailscale.com/kb/1017/install/",
+      "sourceOrder": 36,
+      "first": 72970,
+      "n": 37
+    },
+    {
+      "key": "accesscontrol",
+      "entry": "Tailscale Inc., “Access control” and “Grants,” Tailscale Documentation. Accessed: Oct. 13, 2026. [Online]. Available: https://tailscale.com/docs/features/access-control",
+      "url": "https://tailscale.com/docs/features/access-control",
+      "sourceOrder": 38,
+      "first": 73501,
+      "n": 38
+    },
+    {
+      "key": "testlog",
+      "entry": "Nhóm thực hiện, “Biên bản kiểm thử phần mềm hệ thống Pan–Tilt và phát hiện té ngã,” 11/10/2026, tài liệu nội bộ, tệp bao_cao_bien_tap/bien_ban_kiem_thu_2026-10-11.txt. Phạm vi: 5 ca phát hiện té ngã, 5 ca cấu hình vùng và 15 ca điều khiển servo.",
+      "url": null,
+      "sourceOrder": 37,
+      "first": 73860,
+      "n": 39
+    }
+  ],
+  "scope": "Only source citations, image attribution, reference section, author attribution for measured table, and project source URL."
+}

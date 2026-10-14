@@ -41,7 +41,7 @@ flowchart LR
     CAM[ESP32-CAM + OV3660] -->|HTTP MJPEG :81| BE[Python / FastAPI]
     BE -->|Decoded frames| AI[YOLOv8m-pose + BoT-SORT]
     AI -->|Overlay and events| BE
-    BE -->|MJPEG / REST / WebSocket| UI[Next.js dashboard]
+    BE -->|RAW MJPEG + AI detections / REST / WebSocket| UI[Next.js dashboard]
     RADAR[HLK-LD2450] -->|UART 256000| DEV[ESP32 DevKit]
     BE <-->|MQTT :1883| MQTT[Mosquitto]
     DEV <-->|MQTT| MQTT
@@ -64,6 +64,7 @@ Embedded system/
 │   ├── yolov8m-pose.pt            # Accuracy-priority pose model, if included
 │   ├── mosquitto_local.conf       # LAN broker example
 │   ├── mock_hardware.py            # MQTT hardware simulator
+│   ├── snapshots/                 # Event images created when run from backend
 │   ├── test_fall_detection.py
 │   ├── test_zone_config.py
 │   └── test_servo_control.py
@@ -82,7 +83,6 @@ Embedded system/
 ├── hardware/
 │   ├── esp32_cam_stream.ino       # Flash this sketch to the ESP32-CAM
 │   └── esp32_cam_radar.ino        # Flash this sketch to the ESP32 DevKit
-├── snapshots/                     # Runtime snapshots, if enabled
 ├── README-en.md                   # English project guide
 └── README.md                      # Vietnamese project guide / root readme
 ```
@@ -99,6 +99,10 @@ Local `.env` files, virtual environments, model exports, logs, databases, and sn
 | `hardware/esp32_cam_radar.ino` | **ESP32 Dev Module** | LD2450 UART, MQTT, two servo axes, MANUAL/AUTO logic. |
 
 The camera board shown in the project setup uses an ESP-32S module and an OV3660 flex. The camera firmware currently selects the AI Thinker ESP32 pin profile based on the board configuration that has previously worked. The carrier-board pinout and camera sensor are separate facts; check the serial boot log after flashing. Do not flash the servo/radar sketch to the camera board or vice versa.
+
+The DevKit sketch drives the servos at 50 Hz with 500–2400 µs pulses, starts and resets both axes at 90°, and clamps target angles to 10°–170°. Each manual command moves PAN by 12° or TILT by 7°. Its `MOVING`/`STOPPED` status is inferred from commanded and interpolated angles, not measured shaft position. After one hour without a manual command, the firmware returns to AUTO locally.
+
+The ESP32-CAM accepts one direct client on `:81/stream`; another client receives HTTP 503. While the backend owns that connection, view video through the dashboard or the backend's `GET /api/v1/video/live`. Stop the backend briefly before testing the camera stream directly.
 
 If Arduino IDE has a temporary copy open (such as `sketch_oct8a.ino`), editing `hardware/esp32_cam_radar.ino` will not update that copy. Open the project firmware, restore your local Wi-Fi/MQTT settings, flash it, and check the `fw=` value in the `[BOOT]` line.
 
@@ -148,7 +152,7 @@ Download from the official sites: [Python](https://www.python.org/downloads/wind
 
 Open PowerShell in the repository root. Use separate terminal windows for the broker, backend, and frontend so each process has its own visible logs.
 
-### Terminal 1 — MQTT broker
+### Terminal 1 - MQTT broker
 
 Check whether Mosquitto is already running as a Windows service:
 
@@ -165,7 +169,7 @@ cd backend
 
 If Mosquitto is installed elsewhere, update the executable path. Run only one broker on TCP port 1883. The sample config is intended for a trusted LAN and allows anonymous access; do not expose it to the public Internet.
 
-### Terminal 2 — Python backend
+### Terminal 2 - Python backend
 
 Create and activate the virtual environment, install packages, create the local configuration, then start FastAPI:
 
@@ -192,7 +196,7 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
-`MQTT_BROKER` is the computer running Mosquitto. `VIDEO_SOURCE` is the ESP32-CAM address. Firmware Wi-Fi credentials are configured in the sketches. Keep `.env` private. The backend API is at `http://localhost:8000`; interactive API documentation is at `http://localhost:8000/docs`.
+`MQTT_BROKER` is the computer running Mosquitto. `VIDEO_SOURCE` is the ESP32-CAM address. `AI_FPS_LIMIT=15` caps AI processing at 15 FPS in this sample configuration; increase it and restart the backend to evaluate higher rates. Firmware Wi-Fi credentials are configured in the sketches. Keep `.env` private. The backend API is at `http://localhost:8000`; interactive API documentation is at `http://localhost:8000/docs`.
 
 If the Mosquitto host IP changes, set the same new address in `MQTT_BROKER` in `backend/.env` and `mqtt_server` in `hardware/esp32_cam_radar.ino`. Restart the backend, flash the edited sketch to the ESP32 DevKit, and confirm `[BOOT] ... mqtt=<IP>:1883` in its Serial Monitor. Editing `.env` alone cannot change the broker address compiled into the firmware.
 
@@ -237,7 +241,7 @@ cd backend
 python main.py
 ```
 
-### Terminal 3 — Next.js dashboard
+### Terminal 3 - Next.js dashboard
 
 ```powershell
 cd frontend
@@ -305,7 +309,7 @@ Tailscale assigns a stable tailnet IP to each node and supports MagicDNS when en
 
 ## Mobile-friendly dashboard
 
-The UI includes responsive layouts for small screens. On mobile, navigation becomes a slide-in drawer, the video moves above the controls, and the analytics page stacks configuration and radar-map panels vertically. Caregivers can open the dashboard from a phone or tablet after joining the authorized tailnet.
+The main monitoring dashboard adapts to small screens: navigation becomes a slide-in drawer, and the video moves above the controls. Caregivers can open it from a phone or tablet after joining the authorized tailnet. The **Analytics** and **System Settings** pages currently require a viewport at least 1024 px wide; narrower screens show a desktop-required message. Configure the room, zones, and camera IP on a computer before relying on a phone for monitoring.
 
 Portrait orientation is a practical starting point; landscape can provide a larger video view. MJPEG can use substantial mobile data and battery, and responsiveness depends on the phone, Wi-Fi/mobile connection, host performance, and stream quality. Before relying on the system, check touch targets, connection status, and the manual control behavior on the intended devices.
 
@@ -319,9 +323,9 @@ At startup the backend selects an available acceleration path (TensorRT/OpenVINO
 
 ### Camera path and frame rate
 
-ESP32-CAM captures JPEG frames and serves multipart MJPEG on port 81. The backend reads the HTTP stream, decodes JPEG with OpenCV, passes recent frames to the AI worker, adds overlays/events, then serves an MJPEG stream to the dashboard. Small latest-frame queues prioritize freshness and may drop old frames when inference cannot keep up.
+ESP32-CAM captures JPEG frames and serves multipart MJPEG on port 81. The backend reads the HTTP stream, decodes JPEG with OpenCV, and passes recent frames to the AI worker for pose detection and event evaluation. The dashboard displays RAW MJPEG from `/api/v1/video/live` and fetches boxes and keypoints separately from `/api/v1/video/detections` for its overlay. `/api/v1/video/stream` remains available as a separate MJPEG endpoint with annotations already drawn. Small latest-frame queues prioritize freshness and may drop old frames when inference cannot keep up.
 
-The camera firmware uses JPEG and a 20 MHz XCLK. It selects VGA when PSRAM is available and falls back to a smaller mode when it is not. The camera exposes stream `:81/stream` and status/tuning endpoints on port 82. Camera input FPS (`RAW FPS`) and AI overlay FPS are separate. `AI_FPS_LIMIT=15` is only an AI ceiling; a recent measurement on this setup showed about 10 raw FPS, so AI output cannot exceed the camera input rate. Compare `/api/v1/video/status`, `[VIDEO-INGEST]`, and `[VIDEO-AI]` to find the bottleneck. Switching the backend model does not require reflashing the firmware.
+The camera firmware uses JPEG and a 20 MHz XCLK. It selects VGA when PSRAM is available and falls back to a smaller mode when it is not. The camera exposes stream `:81/stream` and status/tuning endpoints on port 82. Camera input FPS (`RAW FPS`) and AI processing FPS are separate. In the group's observations, RAW can reach about 30 FPS, while AI commonly runs around 15–20 FPS and may vary by roughly 5 FPS with power, network, and compute conditions. The sample `AI_FPS_LIMIT=15` caps AI at 15 FPS; raise it to measure higher AI throughput. Compare `/api/v1/video/status`, `[VIDEO-INGEST]`, and `[VIDEO-AI]` to find the bottleneck. Switching the backend model does not require reflashing the firmware.
 
 ### Fall-evaluation logic
 
@@ -347,7 +351,7 @@ filtered = alpha * current + (1 - alpha) * previous_filtered
 
 `OBSERVED_HORIZONTAL` means the camera sees a horizontal person but lacks enough prior upright/motion history to confirm a fall. The detector carries a candidate across consecutive frames, requires an actual posture change, and enters recovery only after a stable upright posture. If YOLO changes the ID of the sole person, the backend can transfer recent pose history to a new, nearby/overlapping box while the camera is stationary.
 
-A **fresh** radar point in a configured `SAFE` zone, with no overlapping `DANGER` zone, labels the person `SAFE ZONE` and suppresses fall alerts for intentional rest such as lying in bed. A radar point older than two seconds cannot keep this suppression active. Outside both zones, camera pose and motion history still determine falls; `MANUAL` camera mode does not itself disable detection. `DANGER_ZONE` is a separate entry alert, not a confirmed fall. With at least two people whose torso poses are sufficiently reliable, fall alerts are temporarily `MUTED`; a stray box without a usable torso pose does not count as the second person.
+A **fresh** radar point in a configured `SAFE` zone, with no overlapping `DANGER` zone, applies the `SAFE ZONE` context and suppresses fall alerts, including when someone is lying down. A radar point older than two seconds cannot keep this suppression active. The radar target is not associated with a specific camera track, so SAFE is a shared frame-level context rather than confirmation that the visible person is in that zone. Outside both zones, camera pose and motion history still determine falls; `MANUAL` camera mode does not itself disable detection. `DANGER_ZONE` is a separate entry alert, not a confirmed fall. With at least two people whose torso poses are sufficiently reliable, fall alerts are temporarily `MUTED`; a stray box without a usable torso pose does not count as the second person.
 
 This is a heuristic based on image observations, not a medical diagnosis. Occlusion, sitting/lying poses, camera angle, motion blur, lighting, and tracker ID changes can cause missed or false detections. Validate thresholds with representative local footage.
 
@@ -413,9 +417,11 @@ The current `esp32_cam_radar.ino` firmware uses the `legacy_step` protocol: `LEF
 |---|---|
 | `GET /api/v1/video/stream` | AI-overlay MJPEG stream. |
 | `GET /api/v1/video/live` | Live/raw preview stream. |
+| `GET /api/v1/video/detections` | Latest AI boxes and keypoints for the dashboard overlay. |
 | `GET /api/v1/video/status` | Camera and AI diagnostics. |
 | `GET, POST /api/v1/config/camera` | Read/update camera stream source. |
 | `GET /api/v1/radar/history` | Recent radar data. |
+| `GET /api/v1/radar/status` | Latest radar point and zone classification. |
 | `GET, POST /api/v1/config/zones` | Read/update zones. |
 | `GET, POST /api/v1/config/room` | Read/update room transform. |
 | `GET /api/v1/servo/diag` | Servo protocol/telemetry diagnostics. |
@@ -439,6 +445,16 @@ The current `esp32_cam_radar.ino` firmware uses the `legacy_step` protocol: `LEF
 
 Python packages are listed in `backend/requirements.txt`; exact frontend dependencies are in `frontend/package-lock.json`.
 
+## Software checks
+
+After installing the backend dependencies, run the existing checks from `backend`:
+
+```powershell
+python -m unittest -v test_fall_detection.py test_zone_config.py test_servo_control.py
+```
+
+These 25 tests cover temporal fall-state logic, zone validation and boundaries, and both servo control profiles. They use simulated inputs and do not replace physical measurements of detection accuracy, latency, or long-run stability.
+
 ## Troubleshooting
 
 | Symptom | First checks |
@@ -452,7 +468,8 @@ Python packages are listed in `backend/requirements.txt`; exact frontend depende
 | MQTT/radar/servos stop after the computer IP changes | Find the Mosquitto host IP with `ipconfig`; set it in both `MQTT_BROKER` in `backend/.env` and `mqtt_server` in `hardware/esp32_cam_radar.ino`. Restart the backend, reflash the edited ESP32 DevKit firmware, and check `[BOOT] ... mqtt=...` and MQTT connectivity. |
 | Radar coordinates arrive but the map has no target dot | Open `/api/v1/radar/status`; if `online=false`/`STALE`, check for fresh `embedded/radar/data` packets, the broker configured on both sides, and `frames_with_target`/`published` in `[RADAR-DIAG]`. Old dots are hidden after updates stop. |
 | Camera stream is slow | Compare raw and AI FPS, reduce viewer count, try QVGA, check PSRAM/Wi-Fi/inference time. Raising the FPS ceiling cannot make the host process faster. |
-| Camera does not connect after the ESP32-CAM IP changes | Read `[CAM-URL]` in its Serial Monitor and open `http://<NEW-CAMERA-IP>:81/stream` on the same LAN. Update the address in **System Settings** (which saves `VIDEO_SOURCE` to `backend/.env`), or edit `.env` and restart the backend. A DHCP IP change alone does not require reflashing the ESP32-CAM. |
+| Camera does not connect after the ESP32-CAM IP changes | Read `[CAM-URL]` in its Serial Monitor and check `http://<NEW-CAMERA-IP>:82/status` on the same LAN. Update the address in **System Settings** (which saves `VIDEO_SOURCE` to `backend/.env`), or edit `.env` and restart the backend. To test `:81/stream` directly, stop the backend first because the camera accepts only one reader. A DHCP IP change alone does not require reflashing the ESP32-CAM. |
+| Phone loads the page but data or controls fail during development | Check the backend address, TCP 8000, and Windows Firewall. If Next.js logs a blocked origin, add the host IP or hostname used in the browser URL to `allowedDevOrigins` in `frontend/next.config.ts`, then restart `npm run dev`. |
 | Radar map is mirrored or offset | Check millimeter units, X/Y sign convention, map origin, and room rotation. |
 | A fall outside SAFE does not raise a fall alert | `OBSERVED_HORIZONTAL` means the detector missed the preceding upright state; keep the full standing person in view before retrying. For `SAFE ZONE`, compare the radar dot and `/api/v1/radar/status` `zone_state` with the saved SAFE zone. For `MUTED`, inspect people/boxes and keypoints at `/api/v1/video/detections`; camera motion also pauses motion evaluation. |
 
@@ -460,8 +477,9 @@ Useful diagnostics include boot/reset reason, `[RADAR-DIAG]`, `[SERVO-DIAG]`, MQ
 
 ## Data and operational limits
 
-- The backend stores event metadata in SQLite. Run `main.py` from `backend` so relative paths remain predictable.
+- The backend stores event metadata in SQLite. When run from `backend`, event images are written to `backend/snapshots/`.
 - Snapshots and debug logs can accumulate; review retention and available disk space.
+- The watchdog restarts camera or AI worker processes after they exit. It does not guarantee detection of every hang in a still-running process.
 - The dashboard's event list is driven by WebSocket/client state; do not assume every UI acknowledgement is a durable server-side audit record.
 - Radar presence is not identity verification. Vision tracking can lose IDs or estimate incorrect keypoints.
 - This proof of concept can miss events or raise false alerts. Do not use it as the sole safety mechanism for a person.
@@ -483,4 +501,4 @@ The sample Mosquitto config is intended for a trusted LAN and allows anonymous c
 - [Tailscale IP addresses and DNS](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
 - [Tailscale Serve and Funnel](https://tailscale.com/docs/features/tailscale-funnel)
 - [Telegram bot creation and BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
-- [Telegram Bot API — getUpdates](https://core.telegram.org/bots/api#getupdates)
+- [Telegram Bot API - getUpdates](https://core.telegram.org/bots/api#getupdates)
