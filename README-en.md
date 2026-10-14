@@ -483,4 +483,4 @@ The sample Mosquitto config is intended for a trusted LAN and allows anonymous c
 - [Tailscale IP addresses and DNS](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
 - [Tailscale Serve and Funnel](https://tailscale.com/docs/features/tailscale-funnel)
 - [Telegram bot creation and BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
-- [Telegram Bot API — getUpdates](https://core.telegram.org/bots/api#getupdates)
+- [Telegram Bot API - getUpdates](https://core.telegram.org/bots/api#getupdates)

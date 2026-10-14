@@ -528,15 +528,15 @@ Khuyến nghị bắt đầu ở chế độ dọc, dùng nút điều khiển c
 
 ## Tài liệu tham khảo
 
-- [Arduino ESP32 core — cài đặt](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)
+- [Arduino ESP32 core - cài đặt](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)
 - [ESP32 strapping pins](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/sd_pullup_requirements.html)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [Next.js](https://nextjs.org/docs)
 - [Ultralytics YOLOv8](https://docs.ultralytics.com/models/yolov8)
 - [Ultralytics tracking](https://docs.ultralytics.com/modes/track)
 - [Mosquitto](https://mosquitto.org/documentation/)
-- [Tailscale — access control grants](https://tailscale.com/docs/features/access-control/grants)
-- [Tailscale — IP và DNS của thiết bị](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
+- [Tailscale - access control grants](https://tailscale.com/docs/features/access-control/grants)
+- [Tailscale - IP và DNS của thiết bị](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
 - [Tailscale Serve và Funnel](https://tailscale.com/docs/features/tailscale-funnel)
-- [Telegram — tạo bot và BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
-- [Telegram Bot API — getUpdates](https://core.telegram.org/bots/api#getupdates)
+- [Telegram - tạo bot và BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
+- [Telegram Bot API - getUpdates](https://core.telegram.org/bots/api#getupdates)
