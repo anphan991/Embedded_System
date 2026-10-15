@@ -3,9 +3,10 @@
 </div>
 
 <div align="center">
-  <p><strong>Hệ thống giám sát riêng tư cho người cao tuổi sống một mình</strong></p>
-  <p>Phân tích tư thế · Radar mmWave · Camera PAN/TILT · Truy cập từ xa qua Tailscale</p>
-  <p>
+  <p align="center"><strong>Private monitoring for older adults living alone</strong></p>
+  <p align="center">Pose analysis · mmWave radar · Pan/tilt camera · Private remote access</p>
+
+  <p align="center">
     <img src="https://img.shields.io/badge/Status-Prototype-blue?style=for-the-badge" alt="Project status: prototype" />
     <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.11 or newer" />
     <img src="https://img.shields.io/badge/Node.js-20.9%2B-339933?style=for-the-badge&logo=nodedotjs&logoColor=white" alt="Node.js 20.9 or newer" />
@@ -14,22 +15,159 @@
     <img src="https://img.shields.io/badge/Remote%20access-Tailscale-5A45FF?style=for-the-badge&logo=tailscale&logoColor=white" alt="Private remote access with Tailscale" />
     <img src="https://img.shields.io/badge/UI-Mobile%20responsive-0E7490?style=for-the-badge" alt="Mobile responsive UI" />
   </p>
-  <p><a href="README-en.md">English</a> • <a href="README.md">Tiếng Việt</a></p>
+
+  <p align="center"><a href="README.md">English</a> • <a href="README-vi.md">Tiếng Việt</a></p>
 </div>
 
 ---
 
-### Giám sát, phân tích tư thế và điều khiển camera hai trục
+FallGuard combines a camera, mmWave radar, pan/tilt servos, and pose-estimation software in a locally hosted monitoring system. The backend processes video and radar data, evaluates possible fall events, stores event metadata, and coordinates device control. A responsive web dashboard provides live viewing, configuration, and manual/automatic camera control.
 
-FallGuard kết nối camera, radar mmWave, servo và mô hình AI thành một luồng xử lý thống nhất. Backend tiếp nhận hình ảnh và dữ liệu radar, phân tích người trong khung hình, phát cảnh báo và gửi lệnh điều khiển. Dashboard hiển thị hình ảnh, trạng thái thiết bị và công cụ cấu hình.
+The system is designed as a **proof of concept** for monitoring an older adult who lives alone. It is not a certified medical or life-safety system.
 
----
+## At a glance
 
-## Bắt đầu nhanh
+| Component | Responsibility |
+|---|---|
+| ESP32-CAM + OV3660 | Captures images and serves an MJPEG stream over the local network. |
+| ESP32 DevKit | Reads the LD2450 radar, receives MQTT commands, and drives PAN/TILT PWM. |
+| Mosquitto | Relays radar data and control messages between the backend and the DevKit. |
+| Python backend | Runs FastAPI, camera/AI workers, MQTT, alerts, and SQLite persistence. |
+| Next.js frontend | Displays video, controls, radar/room configuration, and alerts. |
+| Tailscale (optional) | Gives explicitly authorized caregivers private remote access to the hosted dashboard. |
 
-Mở **PowerShell** tại thư mục dự án. Các khối lệnh bên dưới có thể sao chép trực tiếp.
+```mermaid
+flowchart LR
+    CAM[ESP32-CAM + OV3660] -->|HTTP MJPEG :81| BE[Python / FastAPI]
+    BE -->|Decoded frames| AI[YOLOv8m-pose + BoT-SORT]
+    AI -->|Overlay and events| BE
+    BE -->|MJPEG / REST / WebSocket| UI[Next.js dashboard]
+    RADAR[HLK-LD2450] -->|UART 256000| DEV[ESP32 DevKit]
+    BE <-->|MQTT :1883| MQTT[Mosquitto]
+    DEV <-->|MQTT| MQTT
+    DEV -->|PWM| SERVO[2 × MG996R]
+    CAREGIVER[Authorized phone/tablet] -->|Private tailnet| UI
+```
 
-### 1. Cài môi trường Python và thư viện backend
+## Repository layout
+
+```text
+Embedded system/
+├── backend/
+│   ├── main.py                    # FastAPI, MQTT, camera/AI workers, routes
+│   ├── fall_detection.py          # Fall-state evaluation logic
+│   ├── fall_detection_stable.py   # Alternative detector implementation
+│   ├── servo_protocol.py          # Servo protocol payload/capability helpers
+│   ├── database.py                # SQLite event metadata
+│   ├── requirements.txt           # Python dependencies
+│   ├── .env.example               # Environment template
+│   ├── yolov8m-pose.pt            # Accuracy-priority pose model, if included
+│   ├── mosquitto_local.conf       # LAN broker example
+│   ├── mock_hardware.py           # MQTT hardware simulator
+│   ├── test_fall_detection.py
+│   ├── test_zone_config.py
+│   └── test_servo_control.py
+├── frontend/
+│   ├── app/
+│   │   ├── page.tsx               # Main monitoring dashboard
+│   │   ├── CameraControlPanel.tsx # Camera mode and movement controls
+│   │   ├── ServoCalibrationPanel.tsx
+│   │   ├── RadarMap.tsx            # Radar map component
+│   │   ├── analytics/page.tsx     # Room, zone, and radar configuration
+│   │   ├── logs/page.tsx          # Dashboard event log
+│   │   ├── settings/page.tsx      # Application settings
+│   │   └── context/                # Shared UI state and localization
+│   ├── package.json
+│   └── package-lock.json
+├── hardware/
+│   ├── esp32_cam_stream.ino       # Flash this sketch to the ESP32-CAM
+│   └── esp32_cam_radar.ino        # Flash this sketch to the ESP32 DevKit
+├── snapshots/                     # Runtime snapshots, if enabled
+├── README.md                      # English project guide
+└── README-vi.md                   # Vietnamese project guide 
+```
+
+Local `.env` files, virtual environments, model exports, logs, databases, and snapshots are machine/runtime data. Do not commit credentials or private monitoring data. If model weights are absent from a clone, provide the approved model file and set `POSE_MODEL_PATH` accordingly.
+
+## Hardware and firmware
+
+### Firmware: which file goes to which board
+
+| Sketch | Target board in Arduino IDE | Function |
+|---|---|---|
+| `hardware/esp32_cam_stream.ino` | **AI Thinker ESP32-CAM** | OV3660 capture, Wi-Fi, MJPEG stream, and camera status/tuning endpoint. |
+| `hardware/esp32_cam_radar.ino` | **ESP32 Dev Module** | LD2450 UART, MQTT, two servo axes, MANUAL/AUTO logic. |
+
+The camera board shown in the project setup uses an ESP-32S module and an OV3660 flex. The camera firmware currently selects the AI Thinker ESP32 pin profile based on the board configuration that has previously worked. The carrier-board pinout and camera sensor are separate facts; check the serial boot log after flashing. Do not flash the servo/radar sketch to the camera board or vice versa.
+
+If Arduino IDE has a temporary copy open (such as `sketch_oct8a.ino`), editing `hardware/esp32_cam_radar.ino` will not update that copy. Open the project firmware, restore your local Wi-Fi/MQTT settings, flash it, and check the `fw=` value in the `[BOOT]` line.
+
+### Pin map and power
+
+| Signal | ESP32 DevKit pin |
+|---|---:|
+| Servo PAN | GPIO13 |
+| Servo TILT | GPIO27 |
+| LD2450 UART RX2 | GPIO32 |
+| LD2450 UART TX2 | GPIO17 |
+
+`esp32_cam_radar.ino` uses PAN GPIO13 and TILT GPIO27. If the physical TILT signal is connected to GPIO12, the wiring and sketch do not match: move the wire to GPIO27 or change `TILT_PIN` and reflash. GPIO12 is a boot-strapping pin on classic ESP32 boards, so verify its boot-level requirements before choosing it.
+
+- Power MG996R servos from a suitable 5 V rail, not an ESP32 GPIO or 3.3 V pin. Connect servo-supply ground to ESP32 ground so the PWM signal has a shared reference.
+- The reported 12 V/5 A adapter and XL4015 do not by themselves prove that 5 V stays stable at the servos under load. Measure at the servo rail while both axes start and move; check wiring, converter temperature, and voltage drop.
+- Set safe mechanical limits before enabling AUTO. Keep the camera mount clear of hard stops.
+- The LD2450 UART uses 256000 baud, 8N1. Serial Monitor remains at 115200 baud; these are separate links.
+
+### Arduino setup
+
+1. Install [Arduino IDE](https://www.arduino.cc/en/software).
+2. In **Preferences → Additional Boards Manager URLs**, add:
+
+   ```text
+   https://espressif.github.io/arduino-esp32/package_esp32_index.json
+   ```
+
+3. Install **esp32 by Espressif Systems** from Boards Manager.
+4. Install **PubSubClient** and **ESP32Servo** from Library Manager for the DevKit sketch.
+5. Open the correct `.ino`, select the board from the table above, choose the correct COM port, and configure Wi-Fi/broker values where needed.
+6. Flash one board at a time. Open its Serial Monitor at **115200 baud** to confirm boot and network status.
+
+## Software requirements
+
+| Tool | Recommended version | Used by |
+|---|---|---|
+| Python | 3.11 x64 | Backend and inference dependencies. |
+| Node.js | 20.9 or newer | Next.js 16 frontend and npm. |
+| Mosquitto | Current Windows release | MQTT broker. |
+| Arduino IDE 2 | Current release | ESP32 compile and upload. |
+| Git for Windows | Optional | Cloning and updating the repository. |
+
+Download from the official sites: [Python](https://www.python.org/downloads/windows/), [Node.js](https://nodejs.org/en/download), [Mosquitto](https://mosquitto.org/download/), [Arduino IDE](https://www.arduino.cc/en/software), and [Git](https://git-scm.com/download/win). Next.js 16 requires Node.js 20.9 or newer; see the [official installation requirements](https://nextjs.org/docs/app/getting-started/installation).
+
+## Quick start on Windows
+
+Open PowerShell in the repository root. Use separate terminal windows for the broker, backend, and frontend so each process has its own visible logs.
+
+### Terminal 1 — MQTT broker
+
+Check whether Mosquitto is already running as a Windows service:
+
+```powershell
+Get-Service mosquitto -ErrorAction SilentlyContinue
+```
+
+If the service is not running, start the project broker from the `backend` directory:
+
+```powershell
+cd backend
+& 'C:\Program Files\mosquitto\mosquitto.exe' -c '.\mosquitto_local.conf' -v
+```
+
+If Mosquitto is installed elsewhere, update the executable path. Run only one broker on TCP port 1883. The sample config is intended for a trusted LAN and allows anonymous access; do not expose it to the public Internet.
+
+### Terminal 2 — Python backend
+
+Create and activate the virtual environment, install packages, create the local configuration, then start FastAPI:
 
 ```powershell
 cd backend
@@ -37,172 +175,12 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-```
-
-### 2. Tạo cấu hình riêng cho máy này
-
-```powershell
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 notepad .env
-```
-
-Điền IP máy chạy MQTT broker và IP ESP32-CAM vào `.env` trước khi chạy.
-
-### 3. Khởi động backend
-
-```powershell
 python main.py
 ```
 
-### 4. Mở terminal mới để chạy dashboard
-
-```powershell
-cd frontend
-npm ci
-npm run dev
-```
-
-Mở `http://localhost:3000`. Trước đó, hãy bật Mosquitto và nạp đúng firmware lên từng bo theo bảng ở phần [Firmware](#firmware-đúng-file-đúng-bo).
-
----
-
-## 1. Sơ đồ hệ thống
-
-```mermaid
-flowchart LR
-    CAM[ESP32-CAM + OV3660] -->|MJPEG qua HTTP :81| BACKEND[Python / FastAPI]
-    BACKEND -->|Frame| AI[YOLOv8 Pose + BoT-SORT]
-    AI -->|Overlay, trạng thái, sự kiện| BACKEND
-    BACKEND -->|MJPEG overlay / REST / WebSocket| WEB[Next.js dashboard]
-    RADAR[HLK-LD2450] -->|UART 256000| CTRL[ESP32 DevKit]
-    BACKEND <-->|MQTT :1883| MQTT[Mosquitto]
-    CTRL <-->|MQTT| MQTT
-    CTRL -->|PWM| SERVO[MG996R PAN / TILT]
-```
-
-| Khối | Nhiệm vụ |
-|---|---|
-| ESP32-CAM | Lấy hình từ cảm biến OV3660 và phát MJPEG trong mạng nội bộ. |
-| ESP32 DevKit | Đọc LD2450, nhận lệnh MQTT và phát PWM điều khiển PAN/TILT. |
-| Mosquitto | Chuyển tiếp lệnh và dữ liệu radar giữa backend và ESP32 DevKit. |
-| Backend | Quản lý video/AI, API, MQTT, cảnh báo và metadata SQLite. |
-| Frontend | Dashboard, cấu hình phòng/vùng và điều khiển camera. |
-
-## 2. Cấu trúc thư mục
-
-```text
-Embedded system/
-├── backend/
-│   ├── main.py                        # FastAPI, MQTT, camera/AI workers, REST, WebSocket
-│   ├── fall_detection.py              # Logic đánh giá trạng thái té ngã
-│   ├── fall_detection_stable.py       # Biến thể thuật toán riêng
-│   ├── servo_protocol.py              # Payload và khả năng theo giao thức servo
-│   ├── database.py                    # Lưu metadata bằng SQLite
-│   ├── requirements.txt               # Thư viện Python
-│   ├── .env.example                   # Mẫu cấu hình môi trường
-│   ├── yolov8m-pose.pt                # Model pose ưu tiên độ chính xác (nếu có)
-│   ├── mosquitto_local.conf           # Cấu hình Mosquitto cho LAN thử nghiệm
-│   ├── mock_hardware.py               # Mô phỏng một phần giao tiếp MQTT
-│   ├── test_fall_detection.py
-│   ├── test_zone_config.py
-│   └── test_servo_control.py
-├── frontend/
-│   ├── app/
-│   │   ├── page.tsx                   # Dashboard chính
-│   │   ├── CameraControlPanel.tsx     # Chọn chế độ và điều khiển camera
-│   │   ├── ServoCalibrationPanel.tsx
-│   │   ├── RadarMap.tsx               # Bản đồ mục tiêu radar
-│   │   ├── analytics/page.tsx         # Phân tích, phòng và vùng
-│   │   ├── logs/page.tsx              # Nhật ký trên dashboard
-│   │   ├── settings/page.tsx          # Cài đặt ứng dụng
-│   │   └── context/                   # Ngôn ngữ, cảnh báo và giao diện
-│   ├── package.json
-│   └── package-lock.json
-├── hardware/
-│   ├── esp32_cam_stream.ino           # Firmware nạp vào ESP32-CAM
-│   └── esp32_cam_radar.ino            # Firmware nạp vào ESP32 DevKit
-├── snapshots/                         # Ảnh sự kiện nếu được cấu hình lưu tại đây
-├── README-en.md                       # Bản tiếng Anh
-└── README.md                          # Bản tiếng Việt
-```
-
->`backend/.env`, virtual environment, model đã chuyển đổi và cơ sở dữ liệu là dữ liệu theo máy hoặc phát sinh khi chạy. Không đưa secrets vào Git. Nếu file trọng số không có trong bản clone, cần cung cấp/tải model theo chính sách của dự án và đặt đúng `POSE_MODEL_PATH`.
-
-## 3. Phần cứng
-
-| Phần cứng | Mục đích / thông tin cần lưu ý |
-|---|---|
-| ESP32-CAM dùng module ESP-32S và camera flex OV3660 | Firmware chọn profile camera AI Thinker ESP32 theo cấu hình hiện tại; profile board và mã sensor là hai thông tin riêng. Kiểm tra log nhận sensor sau khi nạp. |
-| ESP32 DevKit | Đọc radar và điều khiển hai servo; Arduino IDE chọn **ESP32 Dev Module**. |
-| HLK-LD2450 | UART mặc định 256000 baud, 8N1; lắp cố định theo hướng đã đo đạc. |
-| 2 × MG996R | Servo PAN và TILT; cần rail nguồn 5 V đủ dòng khi tải. |
-| Adapter 12 V / 5 A + XL4015 | Bộ hạ áp. Đo đầu ra tại tải trước khi cắm thiết bị và kiểm tra sụt áp khi servo chuyển động. |
-| Máy tính Windows | Chạy Mosquitto, backend Python và frontend Next.js. |
-
-### Nguồn servo
-
-- Cấp servo bằng nguồn 5 V phù hợp; nối **GND nguồn servo với GND ESP32** để PWM có cùng mốc tín hiệu.
-- Không cấp dòng servo từ GPIO hoặc chân 3.3 V. Dây nguồn servo nên đủ tiết diện và ngắn; kiểm tra XL4015 không quá nhiệt.
-- Nếu ESP32 reset hoặc servo rung, đo rail 5 V ngay tại servo khi khởi động/quay. Adapter ghi 5 A không bảo đảm module hạ áp và dây dẫn đưa đủ dòng đến tải.
-- Đặt giới hạn cơ khí an toàn trước khi chạy AUTO; tránh để servo đẩy camera vào cữ cứng.
-
-### Sơ đồ chân firmware
-
-Trong `esp32_cam_radar.ino`, PAN mặc định là GPIO13, TILT GPIO27; radar LD2450 TX nối vào ESP32 RX GPIO32, còn LD2450 RX có thể nối vào ESP32 TX GPIO17. Nếu dây TILT thực tế đang ở GPIO12 thì firmware và dây **chưa khớp**: chuyển dây về GPIO27 hoặc sửa `TILT_PIN` trong sketch rồi nạp lại. GPIO12 là chân strapping trên ESP32 cổ điển, nên cần kiểm tra ảnh hưởng khởi động trước khi chọn chân này.
-
-## 4. Firmware
-
-Hai sketch có vai trò khác nhau. Không nạp chéo.
-
-| Tên file | Bo cần nạp | Board trong Arduino IDE | Chức năng |
-|---|---|---|---|
-| `hardware/esp32_cam_stream.ino` | ESP32-CAM | **AI Thinker ESP32-CAM** | Camera OV3660, Wi-Fi, MJPEG stream và endpoint trạng thái/cấu hình camera. |
-| `hardware/esp32_cam_radar.ino` | ESP32 DevKit thường | **ESP32 Dev Module** | LD2450 qua UART, MQTT, hai servo PAN/TILT và điều khiển MANUAL/AUTO. |
-
-### Cài Arduino IDE và thư viện
-
-1. Cài [Arduino IDE](https://www.arduino.cc/en/software).
-2. Trong **Preferences → Additional Boards Manager URLs**, thêm URL Espressif:
-
-   ```text
-   https://espressif.github.io/arduino-esp32/package_esp32_index.json
-   ```
-
-3. Trong **Boards Manager**, cài `esp32` của Espressif Systems.
-4. Trong **Library Manager**, cài `PubSubClient` và `ESP32Servo` cho sketch radar/servo.
-5. Mở đúng `.ino`, chọn board như bảng phía trên và chọn đúng cổng COM.
-6. Cấu hình Wi-Fi/broker trong sketch nếu các giá trị còn là placeholder hoặc mạng đã đổi.
-7. Nạp từng bo riêng. Mở Serial Monitor ở **115200 baud** để xem log boot và IP.
-
-Nếu Arduino IDE đang mở một bản sao tạm như `sketch_oct8a.ino`, thay đổi trong `hardware/esp32_cam_radar.ino` sẽ không tự cập nhật bản sao đó. Mở đúng firmware trong dự án, điền lại cấu hình Wi-Fi/MQTT của bạn, nạp lại và đối chiếu `fw=` ở dòng `[BOOT]`.
-
-Radar UART 256000 baud là tốc độ riêng giữa LD2450 và ESP32; Serial Monitor vẫn để 115200.
-
-## 5. Môi trường cần cài
-
-| Phần mềm | Phiên bản/gợi ý | Dùng cho |
-|---|---|---|
-| Python | 3.11 x64 khuyến nghị; requirements có thể cần hiệu chỉnh nếu dùng bản quá mới | Backend và AI. |
-| Node.js | Bản LTS | Frontend và npm. |
-| Mosquitto | Bản Windows hiện hành | MQTT broker. |
-| Arduino IDE 2 | Bản hiện hành | Compile và nạp hai firmware. |
-| Git for Windows | Tùy chọn | Clone/cập nhật repository. |
-
-Tải từ trang chính thức: [Python for Windows](https://www.python.org/downloads/windows/), [Node.js](https://nodejs.org/en/download), [Mosquitto](https://mosquitto.org/download/), [Arduino IDE](https://www.arduino.cc/en/software), [Git](https://git-scm.com/download/win).
-
-## 6. Cấu hình theo mạng hiện tại
-
-### Backend `.env`
-
-Tại `backend`, tạo file `.env` từ mẫu nếu đây là lần cài mới. Nếu `.env` đã tồn tại, giữ lại và chỉ cập nhật giá trị cần thiết:
-
-```powershell
-cd backend
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-notepad .env
-```
-
-Các giá trị quan trọng:
+Edit `.env` before the final command. At minimum, set the broker and camera addresses for this network:
 
 ```ini
 SERVO_PROTOCOL=legacy_step
@@ -214,27 +192,24 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
-- `MQTT_BROKER`: IPv4 của máy đang chạy Mosquitto (ví dụ `192.168.1.10`).
-- `VIDEO_SOURCE`: địa chỉ IP ESP32-CAM và cổng stream 81 (ví dụ `192.168.1.50`), không phải IP DevKit hay IP broker.
-- `SERVO_PROTOCOL`: phải khớp giao thức của firmware hiện hành. Sketch hiện tại nhận lệnh bước `LEFT`, `RIGHT`, `UP`, `DOWN`, `RESET`, do đó dùng `legacy_step`.
-- `AI_FPS_LIMIT`: trần xử lý AI, không phải cam kết FPS đầu ra.
-- `POSE_MODEL_PATH`: đường dẫn đến file model pose.
-- `TELEGRAM_BOT_TOKEN` và `TELEGRAM_CHAT_ID`: cấu hình tùy chọn để gửi cảnh báo té ngã qua Telegram; phải điền cả hai.
+`MQTT_BROKER` is the computer running Mosquitto. `VIDEO_SOURCE` is the ESP32-CAM address. Firmware Wi-Fi credentials are configured in the sketches. Keep `.env` private. The backend API is at `http://localhost:8000`; interactive API documentation is at `http://localhost:8000/docs`.
 
-Nếu IP máy chạy Mosquitto đổi, cập nhật `MQTT_BROKER` trong `backend/.env` **và** `mqtt_server` trong `hardware/esp32_cam_radar.ino` thành cùng IP. Khởi động lại backend, nạp lại sketch đã sửa vào ESP32 DevKit và kiểm tra dòng `[BOOT] ... mqtt=<IP>:1883` trên Serial Monitor. Sửa riêng `.env` sẽ không cập nhật địa chỉ broker đã biên dịch trong firmware.
+If the Mosquitto host IP changes, set the same new address in `MQTT_BROKER` in `backend/.env` and `mqtt_server` in `hardware/esp32_cam_radar.ino`. Restart the backend, flash the edited sketch to the ESP32 DevKit, and confirm `[BOOT] ... mqtt=<IP>:1883` in its Serial Monitor. Editing `.env` alone cannot change the broker address compiled into the firmware.
 
-Nếu IP ESP32-CAM đổi, lấy địa chỉ mới từ dòng `[CAM-URL] VIDEO_SOURCE=...` trên Serial Monitor, rồi cập nhật **Cài đặt hệ thống → Địa chỉ IP Camera ESP32** trong dashboard; thao tác lưu sẽ cập nhật `VIDEO_SOURCE` trong `backend/.env` và đổi nguồn camera đang chạy. Cũng có thể sửa `VIDEO_SOURCE=http://<IP-camera-moi>:81/stream` trực tiếp trong `.env` rồi khởi động lại backend. Firmware camera dùng IP động nên không cần nạp lại chỉ vì IP thay đổi; chỉ nạp lại nếu đổi Wi-Fi hoặc sửa chính sketch camera.
+If the ESP32-CAM IP changes, read the new `[CAM-URL] VIDEO_SOURCE=...` line in its Serial Monitor. Enter the new IP under **System Settings → ESP32 Camera IP Address** in the dashboard; saving also updates `VIDEO_SOURCE` in `backend/.env` and switches the running camera source. Alternatively, edit `VIDEO_SOURCE=http://<NEW-CAMERA-IP>:81/stream` in `.env` and restart the backend. The camera gets its IP dynamically, so a DHCP address change alone does not require reflashing it; reflash only when changing its Wi-Fi settings or sketch.
 
-### Tạo bot Telegram và lấy hai giá trị
+Telegram alerts are optional. Leave the placeholder values if you do not want Telegram notifications. To enable them, configure **both** `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as described below.
 
-1. Mở Telegram, tìm tài khoản chính thức **[@BotFather](https://t.me/BotFather)** và bắt đầu cuộc trò chuyện.
-2. Gửi `/newbot`, làm theo hướng dẫn để đặt tên hiển thị và username duy nhất. Username thường kết thúc bằng `bot`, ví dụ `FallGuardHomeBot`.
-3. BotFather sẽ gửi **API token**. Sao chép token này vào `TELEGRAM_BOT_TOKEN`. Hãy giữ kín như mật khẩu: người có token có thể điều khiển bot. Không gửi token vào chat, ảnh chụp màn hình, GitHub hoặc log hỗ trợ.
-4. Mở bot mới bằng đường dẫn `t.me/<username_bot>`, nhấn **Start** và gửi `/start`. Bot không thể tự mở cuộc trò chuyện với người dùng trước khi người đó bắt đầu chat.
-5. Dùng PowerShell để lấy `chat.id` của cuộc trò chuyện vừa bắt đầu:
+### Create a Telegram bot and obtain the two values
+
+1. Open Telegram and start a chat with the official **[@BotFather](https://t.me/BotFather)** account.
+2. Send `/newbot`. Follow the prompts to choose a display name and a unique username; the username normally ends in `bot` (for example, `FallGuardHomeBot`).
+3. BotFather returns an API token. Copy it into `TELEGRAM_BOT_TOKEN`. Treat it as a password: anyone with it can control the bot. Do not post it in chat, screenshots, GitHub, or support logs.
+4. Open the newly created bot using its `t.me/<bot_username>` link, press **Start**, and send `/start`. A bot cannot message a user until that user has started the conversation.
+5. In PowerShell, use the token to inspect the bot's pending updates and find the destination `chat.id`:
 
    ```powershell
-   $secureToken = Read-Host 'Dán token bot' -AsSecureString
+   $secureToken = Read-Host 'Paste the bot token' -AsSecureString
    $credential = [System.Net.NetworkCredential]::new('', $secureToken)
    $token = $credential.Password
    $updates = Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/getUpdates"
@@ -242,52 +217,19 @@ Nếu IP ESP32-CAM đổi, lấy địa chỉ mới từ dòng `[CAM-URL] VIDEO_
    Remove-Variable token, credential, secureToken
    ```
 
-   Trong kết quả, lấy giá trị `message.chat.id` của tin `/start` vừa gửi. Nếu `result` rỗng, gửi `/start` cho bot lần nữa rồi chạy lại. Nếu muốn gửi vào nhóm, thêm bot vào nhóm, gửi một tin nhắn trong nhóm và lấy `chat.id` của nhóm (thường là số âm).
-6. Điền cả hai giá trị vào `backend/.env`:
+   Find `message.chat.id` for the `/start` message you just sent. If `result` is empty, send `/start` to the bot again and rerun the command. For a group destination, add the bot to the group, send a message there, and use the group's `chat.id` (usually a negative number).
+6. Put the token and chat ID in `backend/.env`:
 
    ```ini
-   TELEGRAM_BOT_TOKEN=<token-tu-BotFather>
-   TELEGRAM_CHAT_ID=<chat-id-nhan-canh-bao>
+   TELEGRAM_BOT_TOKEN=<token-from-BotFather>
+   TELEGRAM_CHAT_ID=<destination-chat-id>
    ```
 
-7. Lưu `.env` rồi khởi động lại backend để nạp cấu hình mới. Telegram được gọi khi backend xác nhận sự kiện té ngã; xem log tìm `Telegram Alert Sent Successfully!` hoặc lỗi API. Backend hiện áp dụng thời gian chờ 60 giây giữa các lần gửi Telegram.
+7. Save `.env` and restart the backend so it reloads the variables. Telegram delivery is attempted when the backend confirms a fall event; check the backend log for `Telegram Alert Sent Successfully!` or an API error. The current backend applies a 60-second Telegram cooldown.
 
-Nếu token bị lộ, hãy thu hồi/tạo token mới qua BotFather và cập nhật `.env` ngay. Telegram Bot API dùng token trong URL của request; tránh dán URL có token vào lịch sử trình duyệt, ảnh chụp hoặc log chia sẻ. Đoạn PowerShell trên giữ token ngoài câu lệnh được lưu trong lịch sử và không in token ra màn hình.
+If the token is exposed, revoke/regenerate it through BotFather and update `.env` immediately. The token is embedded in Telegram Bot API request URLs by design; avoid copying those URLs into browser history, screenshots, or shared logs. The PowerShell example keeps the token out of the literal command history and does not print it.
 
-IP thường thay đổi khi đổi router/hotspot. Chạy `ipconfig` để lấy IP máy tính; lấy IP của ESP32 từ Serial Monitor hoặc router. Khi đổi Wi-Fi, cập nhật SSID/password trong sketch của từng bo cần đổi rồi nạp lại; xử lý IP broker và IP camera theo hướng dẫn trên. Dashboard trên máy khác phải đặt Server URL về `http://<IP-máy-backend>:8000`, không dùng `localhost`.
-
-## 7. Chạy dịch vụ trên Windows
-
-Mỗi khối nên chạy trong một cửa sổ Terminal/PowerShell riêng để dễ theo dõi log.
-
-### Terminal 1 — Mosquitto
-
-Kiểm tra Windows Service trước để tránh chạy hai broker cùng cổng:
-
-```powershell
-Get-Service mosquitto -ErrorAction SilentlyContinue
-```
-
-Nếu service chưa chạy, mở terminal tại thư mục `backend`:
-
-```powershell
-cd backend
-& 'C:\Program Files\mosquitto\mosquitto.exe' -c '.\mosquitto_local.conf' -v
-```
-
-Nếu cài Mosquitto ở nơi khác, thay đường dẫn executable. Chỉ giữ một broker trên TCP 1883. Cấu hình mẫu cho phép kết nối LAN không xác thực; chỉ dùng trên mạng tin cậy, không mở cổng ra Internet.
-
-### Terminal 2 — Backend và AI
-
-```powershell
-cd backend
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python main.py
-```
-
-Môi trường ảo chỉ cần tạo và cài thư viện lần đầu; các lần tiếp theo:
+On later runs, after dependencies and `.env` are set up:
 
 ```powershell
 cd backend
@@ -295,9 +237,7 @@ cd backend
 python main.py
 ```
 
-Backend mặc định phục vụ API tại `http://localhost:8000`; tài liệu API tại `http://localhost:8000/docs`.
-
-### Terminal 3 — Frontend
+### Terminal 3 — Next.js dashboard
 
 ```powershell
 cd frontend
@@ -305,14 +245,9 @@ npm ci
 npm run dev
 ```
 
-`npm ci` cài đúng dependency trong lockfile, thường chỉ cần ở lần cài đầu hoặc khi lockfile thay đổi. Những lần khởi chạy sau:
+Open `http://localhost:3000`. `npm ci` installs the exact dependency versions in `package-lock.json`; later runs only need `npm run dev`.
 
-```powershell
-cd frontend
-npm run dev
-```
-
-Dashboard mặc định ở `http://localhost:3000`. Tạo bản production cục bộ bằng:
+For a local production build:
 
 ```powershell
 cd frontend
@@ -320,57 +255,105 @@ npm run build
 npm run start
 ```
 
-### Thứ tự khởi động đề xuất
+### Recommended startup order
 
-1. Kiểm tra nguồn, radar và hai bo; mở Serial Monitor nếu cần xem IP.
-2. Khởi động Mosquitto.
-3. Khởi động backend và đợi log tải model/khởi chạy camera worker.
-4. Khởi động frontend, truy cập dashboard.
-5. Kiểm tra video, dữ liệu radar và MANUAL trước; chỉ bật AUTO sau khi mỗi phần hoạt động riêng.
+1. Power the devices and confirm their wiring. Use each board's serial log to find its IP.
+2. Start Mosquitto.
+3. Start the backend and wait for camera/model startup logs.
+4. Start the frontend and open the dashboard.
+5. Verify the video, radar, and MANUAL movement separately before enabling AUTO.
 
-## 8. Mô hình AI và pipeline hình ảnh
+## Private remote access with Tailscale
 
-Backend mặc định dùng **YOLOv8m-pose** (`yolov8m-pose.pt`) để ưu tiên nhận diện người và keypoint ổn định hơn trong cảnh khuất/xa; model **YOLOv8n-pose INT8** (`yolov8n-pose_int8.onnx`) có thể chọn qua `POSE_MODEL_PATH` khi cần giảm tải CPU. Model m có thể làm FPS AI thấp hơn, nhưng luồng RAW camera vẫn chạy độc lập. INT8 có thể làm giảm độ chính xác ở một số cảnh; cần kiểm chứng với góc lắp và ánh sáng thực tế. Tracker **BoT-SORT** duy trì ID đối tượng qua các frame bằng `model.track(..., persist=True, tracker="botsort.yaml")`.
+The system can remain hosted on a home computer while an authorized caregiver opens the dashboard remotely from a phone, tablet, or computer. The host continues to run the backend and frontend locally; Tailscale provides a private, authenticated network path between approved devices. This avoids forwarding the dashboard to the public Internet.
 
-Model pose pretrained cung cấp keypoint người, không phải model đã huấn luyện riêng cho té ngã. Backend ưu tiên runtime tăng tốc có sẵn (TensorRT/OpenVINO theo môi trường), rồi mới fallback PyTorch. Tốc độ thực tế tùy CPU/GPU, resolution, số người và phiên bản thư viện. Tham khảo [YOLOv8](https://docs.ultralytics.com/models/yolov8), [COCO Pose](https://docs.ultralytics.com/datasets/pose/coco) và [Tracking](https://docs.ultralytics.com/modes/track).
+### Setup
 
-Luồng ảnh: ESP32-CAM gửi JPEG multipart → backend đọc HTTP và giải mã bằng OpenCV → frame mới nhất được đưa vào pipeline AI → YOLO phát hiện/track/pose → backend vẽ overlay, xử lý sự kiện và phát MJPEG cho dashboard. Hàng đợi frame nhỏ ưu tiên độ mới; khi AI chậm, frame cũ có thể bị bỏ để giảm độ trễ.
+1. Install Tailscale on the Windows host running the application and on each caregiver device.
+2. Sign the devices into the intended tailnet. Invite only the people who should be able to view or control the system.
+3. In the Tailscale admin console, use Grants/ACLs to allow the selected users or group to reach the host on **TCP 3000** (dashboard) and **TCP 8000** (API/video). Restrict Windows Firewall inbound rules to the intended tailnet devices/interface.
+4. Start the broker, backend, and frontend as described above. The current Next.js script binds to `0.0.0.0`, and Uvicorn also binds to `0.0.0.0`, so they can accept connections on the host's network interfaces.
+5. Get the host's Tailscale IPv4 address:
 
-Camera firmware dùng JPEG, XCLK 20 MHz và mặc định VGA khi PSRAM khả dụng; nếu không có PSRAM sẽ fallback độ phân giải thấp hơn. ESP32-CAM có endpoint stream `:81/stream` và endpoint trạng thái/điều chỉnh `:82`. FPS camera (`RAW FPS`) khác FPS AI overlay; `AI_FPS_LIMIT=15` chỉ là trần xử lý AI. Ở lần đo trên cấu hình hiện tại, RAW stream khoảng 10 FPS nên AI không thể hiển thị nhanh hơn nguồn camera. Dùng `/api/v1/video/status`, `[VIDEO-INGEST]` và `[VIDEO-AI]` để xác định nút thắt; model INT8 không yêu cầu nạp lại firmware.
+   ```powershell
+   tailscale ip -4
+   ```
 
-## 9. Cách thuật toán tính té ngã và bám mục tiêu
+6. On a phone/tablet that is signed in and authorized, open:
 
-### 9.1 Đánh giá tư thế té ngã
+   ```text
+   http://<HOST-TAILSCALE-IP>:3000
+   ```
 
-`fall_detection.py` kết hợp hình học bounding box, keypoint vai/hông, dịch chuyển tâm người và thời gian duy trì tư thế. Từ bounding box:
+   For example, the address may look like `http://100.x.y.z:3000`.
+
+The frontend derives its default API hostname from the address in the browser, so opening the dashboard through the host's Tailscale IP also directs API/video requests to port 8000 on that host. If a Server URL was manually saved in the dashboard, set it to `http://<HOST-TAILSCALE-IP>:8000`.
+
+Remote caregivers do **not** need MQTT port 1883 or the camera's raw stream/status ports 81/82. Do not use Tailscale Funnel for this private monitoring dashboard. Tailscale Serve is a separate reverse-proxy option and should only be added after planning how it will route both the frontend and API.
+
+> **Access-control limitation:** the repository does not currently implement an application login or per-user roles. Anyone allowed through the tailnet to reach the dashboard/API can view the camera and issue controls. Grant access only to trusted people/devices and limit the permitted ports in the tailnet policy. Tailscale network access is not a substitute for application-level roles.
+
+Tailscale assigns a stable tailnet IP to each node and supports MagicDNS when enabled. Connections within the tailnet are encrypted; access still depends on the host being online, the user's tailnet identity and policy, Windows Firewall, and the Internet connection. See Tailscale's [Grants documentation](https://tailscale.com/docs/features/access-control/grants), [IP and DNS reference](https://tailscale.com/kb/1033/ip-and-dns-addresses/), and [Serve/Funnel overview](https://tailscale.com/docs/features/tailscale-funnel).
+
+### Privacy practices
+
+- Keep the host in a physically secure location and use a protected Windows account.
+- Tell the monitored person and caregivers what the camera captures and how long event data is kept.
+- Retain only the snapshots/logs needed for the intended use; review storage periodically.
+- Never commit `.env`, Wi-Fi passwords, bot tokens, private images, or local databases.
+- Do not port-forward the dashboard, API, broker, or camera to the public Internet.
+
+## Mobile-friendly dashboard
+
+The UI includes responsive layouts for small screens. On mobile, navigation becomes a slide-in drawer, the video moves above the controls, and the analytics page stacks configuration and radar-map panels vertically. Caregivers can open the dashboard from a phone or tablet after joining the authorized tailnet.
+
+Portrait orientation is a practical starting point; landscape can provide a larger video view. MJPEG can use substantial mobile data and battery, and responsiveness depends on the phone, Wi-Fi/mobile connection, host performance, and stream quality. Before relying on the system, check touch targets, connection status, and the manual control behavior on the intended devices.
+
+## AI model and video pipeline
+
+### Pose model
+
+The backend defaults to **YOLOv8m-pose** (`yolov8m-pose.pt`) to favor person and keypoint recognition in distant or partially occluded scenes. **YOLOv8n-pose INT8** (`yolov8n-pose_int8.onnx`) remains available through `POSE_MODEL_PATH` when CPU throughput is the priority; it may miss more difficult poses. The larger model can lower AI inference FPS, while the separate RAW camera stream remains unaffected. Validate both detection and fall-event behavior at the installed camera angle and lighting. The pose model is pretrained for people/keypoints, not specifically for falls. **BoT-SORT** maintains person IDs across frames using `persist=True`.
+
+At startup the backend selects an available acceleration path (TensorRT/OpenVINO where supported) and falls back to PyTorch when an optimized runtime is unavailable. First startup can take longer while weights or runtime artifacts are loaded/exported. Actual throughput depends on CPU/GPU, frame size, number of people, and software versions. References: [YOLOv8](https://docs.ultralytics.com/models/yolov8), [COCO Pose](https://docs.ultralytics.com/datasets/pose/coco), and [tracking mode](https://docs.ultralytics.com/modes/track).
+
+### Camera path and frame rate
+
+ESP32-CAM captures JPEG frames and serves multipart MJPEG on port 81. The backend reads the HTTP stream, decodes JPEG with OpenCV, passes recent frames to the AI worker, adds overlays/events, then serves an MJPEG stream to the dashboard. Small latest-frame queues prioritize freshness and may drop old frames when inference cannot keep up.
+
+The camera firmware uses JPEG and a 20 MHz XCLK. It selects VGA when PSRAM is available and falls back to a smaller mode when it is not. The camera exposes stream `:81/stream` and status/tuning endpoints on port 82. Camera input FPS (`RAW FPS`) and AI overlay FPS are separate. `AI_FPS_LIMIT=15` is only an AI ceiling; a recent measurement on this setup showed about 10 raw FPS, so AI output cannot exceed the camera input rate. Compare `/api/v1/video/status`, `[VIDEO-INGEST]`, and `[VIDEO-AI]` to find the bottleneck. Switching the backend model does not require reflashing the firmware.
+
+### Fall-evaluation logic
+
+`backend/fall_detection.py` evaluates pose geometry over time for each tracked person. For a box `(x1,y1,x2,y2)`:
 
 ```text
-box_width  = x2 - x1
-box_height = y2 - y1
-aspect_ratio = box_width / max(box_height, epsilon)
+width        = x2 - x1
+height       = y2 - y1
+aspect_ratio = width / max(height, epsilon)
 ```
 
-Gọi tâm vai là `(sx, sy)` và tâm hông `(hx, hy)`, góc thân được ước tính:
+Using the shoulder center `(sx, sy)` and hip center `(hx, hy)`, the torso angle is approximated by:
 
 ```text
 spine_angle = degrees(atan2(abs(hy - sy), abs(hx - sx)))
 ```
 
-Góc gần 90° thể hiện thân tương đối thẳng đứng; gần 0° thể hiện thân nằm ngang. Bộ lọc EMA giảm dao động giữa các frame:
+An upright torso tends toward 90 degrees; a horizontal torso tends toward 0 degrees. The detector combines torso orientation, horizontal box shape, body-center drop normalized by body height, change over time, prior upright state, and post-impact stability. An exponential moving average (EMA) reduces frame-to-frame noise:
 
 ```text
 filtered = alpha * current + (1 - alpha) * previous_filtered
 ```
 
-Detector theo dõi từng ID, xác định trạng thái đứng trước đó, rồi kết hợp tư thế ngang, độ tụt tâm cơ thể chuẩn hóa theo chiều cao người, tốc độ tụt và độ ổn định sau sự kiện. `OBSERVED_HORIZONTAL` nghĩa là đã thấy người nằm ngang nhưng chưa có lịch sử đứng/chuyển động đủ để xác nhận ngã. Detector giữ giai đoạn nghi ngờ qua các frame liên tiếp, yêu cầu thay đổi tư thế thực trước khi xác nhận và chỉ chuyển sang hồi phục khi người đã đứng ổn định. Khi một người bị YOLO đổi ID trong thời gian ngắn, backend có thể chuyển lịch sử tư thế sang ID mới nếu khung người còn gần/chồng nhau và camera đứng yên.
+`OBSERVED_HORIZONTAL` means the camera sees a horizontal person but lacks enough prior upright/motion history to confirm a fall. The detector carries a candidate across consecutive frames, requires an actual posture change, and enters recovery only after a stable upright posture. If YOLO changes the ID of the sole person, the backend can transfer recent pose history to a new, nearby/overlapping box while the camera is stationary.
 
-Khi radar có tọa độ **mới** trong vùng `SAFE` và không đồng thời thuộc vùng `DANGER`, backend gắn `SAFE ZONE` lên người và bỏ qua cảnh báo ngã cho tư thế nghỉ như nằm trên giường. Dữ liệu radar cũ quá 2 giây không giữ chặn này. Ở ngoài cả hai vùng, detector vẫn đánh giá ngã bằng tư thế và lịch sử chuyển động; chế độ camera `MANUAL` tự nó không tắt chức năng phát hiện. `DANGER_ZONE` là cảnh báo xâm nhập vùng nguy hiểm riêng, không đồng nghĩa với xác nhận ngã. Khi có từ hai người với pose đủ tin cậy, cảnh báo ngã tạm `MUTED` để tránh gán nhầm; một box không có keypoint thân đủ tin cậy không được tính là người thứ hai.
+A **fresh** radar point in a configured `SAFE` zone, with no overlapping `DANGER` zone, labels the person `SAFE ZONE` and suppresses fall alerts for intentional rest such as lying in bed. A radar point older than two seconds cannot keep this suppression active. Outside both zones, camera pose and motion history still determine falls; `MANUAL` camera mode does not itself disable detection. `DANGER_ZONE` is a separate entry alert, not a confirmed fall. With at least two people whose torso poses are sufficiently reliable, fall alerts are temporarily `MUTED`; a stray box without a usable torso pose does not count as the second person.
 
-Các ngưỡng trong `fall_detection.py` là heuristic theo ảnh, có thể báo nhầm khi người ngồi/nằm, bị che khuất, camera rung/nghiêng hoặc tracker đổi ID. Cần thử với video của không gian sử dụng; đây không phải hệ thống y tế/chứng nhận an toàn.
+This is a heuristic based on image observations, not a medical diagnosis. Occlusion, sitting/lying poses, camera angle, motion blur, lighting, and tracker ID changes can cause missed or false detections. Validate thresholds with representative local footage.
 
-### 9.2 Tính góc servo từ radar
+### Target tracking and servo angles
 
-LD2450 gửi vị trí mục tiêu theo mm. Với tọa độ `(x, y)`:
+The radar path uses LD2450 coordinates `(x,y)` in millimeters. Firmware estimates azimuth and servo angles as:
 
 ```text
 azimuth = atan2(x, y) * 180 / pi
@@ -381,162 +364,123 @@ elevation = atan2(camera_height - target_height, distance) * 180 / pi
 TILT = 90 - elevation
 ```
 
-Firmware lọc tọa độ radar bằng EMA, giới hạn góc trước khi đưa đến servo và làm mượt chuyển động. `camera_height`/`target_height` là tham số hình học phải hiệu chỉnh theo cách lắp; góc thực còn phụ thuộc tâm cơ khí và chiều lắp servo.
+Radar coordinates are smoothed with an EMA before the target angles are applied. Firmware clamps target angles and smooths PWM movement. Camera/target heights and servo center must reflect the physical installation; angle commands are not measured feedback because the servos do not report encoder position.
 
-### 9.3 Bám người bằng hình ảnh
-
-Backend lấy tâm bounding box, chuẩn hóa vị trí về mặt phẳng tham chiếu 640×480, so với tâm `(320,240)` và không phát lệnh trong vùng chết quanh tâm. Firmware legacy cập nhật gần dạng:
+The vision path uses a detected person's bounding-box center, normalizes it to a 640×480 reference plane, and compares it with image center `(320,240)`. A deadband avoids updates near the center. The legacy step firmware applies a proportional adjustment approximately as follows:
 
 ```text
-error_x = x_normalized - 320
-error_y = y_normalized - 240
+error_x = normalized_x - 320
+error_y = normalized_y - 240
 PAN  -= gain_pan  * error_x
 TILT += gain_tilt * error_y
 ```
 
-Radar được ưu tiên khi mục tiêu radar còn mới; tracking hình ảnh được dùng làm fallback theo logic hiện tại. Dấu của hiệu chỉnh phụ thuộc hướng gắn camera và servo. Nếu camera quay ngược mục tiêu, xác minh góc lắp và chiều trục trước khi đổi gain.
+Radar is preferred while fresh; vision can be used as a fallback according to the current backend/firmware logic. Axis signs depend on how the camera and servos are mounted. Confirm wiring and direction before changing gains.
 
-## 10. Giao thức và endpoint
+## Radar setup and room calibration
 
-### MQTT
+1. Connect LD2450 TX to ESP32 RX GPIO32 and radar RX to ESP32 TX GPIO17 if commands are needed; share ground and use the sensor's specified supply.
+2. Open the DevKit Serial Monitor at 115200 baud. The firmware's UART2 link to the radar runs at 256000 baud.
+3. Check `[RADAR-DIAG]`: `new_bytes` and valid frame counts should increase continuously. `health=NO_UART_DATA` means no new bytes on GPIO32; `health=INVALID_FRAME` means received bytes do not form LD2450 frames. Verify TX/RX, baud, ground, power, and radar output mode.
+4. Move a target through the radar field and confirm X/Y signs and distance.
+5. Configure room dimensions, radar position/rotation, and safety zones in the dashboard analytics page.
+6. Test MANUAL servo movement first. Enable AUTO and check left/right, near/far, and vertical behavior before fine-tuning gains.
 
-Mosquitto dùng cổng TCP 1883. Topic servo chính gồm `embedded/servo/mode`, `embedded/servo/manual`, `embedded/servo/tracking` và `embedded/servo/status`; radar dùng `embedded/radar/data`. Firmware DevKit và backend phải kết nối cùng một broker IP.
+On the map, drag a colored zone to reposition it and edit its numeric MIN/MAX fields to resize it. Press **Save Config** to persist the room and zones; radar processing reloads the saved values within about one second. Zones must stay within the room and each minimum must be lower than its maximum. A `DANGER_ZONE` event is emitted when a target enters a danger area. The safe zone is used for the existing night-wandering rule: a moving target must remain outside it for more than five minutes between 23:00 and 05:00.
 
-Firmware `esp32_cam_radar.ino` đang dùng giao thức bước: `LEFT`, `RIGHT`, `UP`, `DOWN`, `RESET`. Mỗi lệnh thay đổi góc đích một bước; thao tác giữ nút trên giao diện có thể gửi lặp tùy implementation frontend. Profile backend tương ứng là `SERVO_PROTOCOL=legacy_step`. Không chọn `sequenced_hold` cho firmware này.
+The target dot appears only while `/api/v1/radar/status` reports fresh radar data (`online=true`, age at most five seconds). Its color reflects `SAFE`, `DANGER`, outside-zone, or outside-room position. When updates stop, the map shows `STALE` and hides the old dot so it is not mistaken for a live position. If MQTT has messages but the dot is absent, inspect the packet timestamps, backend MQTT connection, and this endpoint.
 
-### HTTP API / WebSocket
-
-| Địa chỉ | Vai trò |
-|---|---|
-| `GET /api/v1/video/stream` | Luồng MJPEG có overlay AI. |
-| `GET /api/v1/video/live` | Luồng xem trực tiếp/raw. |
-| `GET /api/v1/video/status` | Chẩn đoán camera và AI. |
-| `GET, POST /api/v1/config/camera` | Đọc/cập nhật nguồn camera. |
-| `GET /api/v1/radar/history` | Dữ liệu radar gần nhất. |
-| `GET, POST /api/v1/config/zones` | Đọc/lưu vùng. |
-| `GET, POST /api/v1/config/room` | Đọc/lưu kích thước/vị trí phòng. |
-| `GET /api/v1/servo/diag` | Tình trạng giao thức và telemetry servo. |
-| `POST /api/v1/camera/move` | Gửi bước điều khiển thủ công. |
-| `GET, POST /api/v1/camera/mode` | Đọc hoặc chuyển MANUAL/AUTO. |
-| `WS /api/v1/ws/alerts` | Đẩy sự kiện cảnh báo tới dashboard. |
-
-`localhost:3000/api/v1` không phải API backend và có thể trả 404. Dùng địa chỉ backend `localhost:8000/docs` hoặc endpoint cụ thể. Với giao thức bước legacy, lệnh MQTT đã gửi thành công chưa chứng minh servo đã quay; đối chiếu log ESP32, nguồn và dây tín hiệu.
-
-## 11. Radar: nối, cấu hình và hiệu chỉnh
-
-1. Nối LD2450 TX vào ESP32 RX GPIO32 và LD2450 RX vào ESP32 TX GPIO17 nếu cần gửi lệnh; nối chung GND và cấp đúng điện áp cho module.
-2. Mở Serial Monitor DevKit ở 115200 baud; firmware đọc UART2 ở 256000 baud.
-3. Tìm `[RADAR-DIAG]`: `new_bytes` và `frames` phải tăng liên tục. `health=NO_UART_DATA` nghĩa là chưa có byte mới trên GPIO32; `health=INVALID_FRAME` nghĩa là có byte nhưng không đúng khung LD2450. Kiểm tra TX/RX, baud, GND, nguồn và chế độ xuất UART của radar.
-4. Quan sát tọa độ X/Y khi di chuyển mục tiêu; xác minh dấu tọa độ trùng hướng trái/phải trên bản đồ.
-5. Trong dashboard, cấu hình kích thước phòng, vị trí radar, góc xoay và vùng an toàn theo sơ đồ thực tế.
-6. Bật AUTO và thử mục tiêu ở vài vị trí, khoảng cách. Chỉ tinh chỉnh hệ số sau khi tọa độ, tâm servo, nguồn và hướng trục đã được xác nhận.
-
-Trên bản đồ, kéo vùng màu để đổi vị trí; chỉnh MIN/MAX ở các ô số để đổi kích thước. Nhấn **Lưu cấu hình** để ghi phòng và zone vào cơ sở dữ liệu; backend áp dụng lại cấu hình radar trong khoảng một giây. Zone phải nằm trong biên phòng và mỗi MIN phải nhỏ hơn MAX. Cảnh báo `DANGER_ZONE` phát khi mục tiêu đi vào vùng nguy hiểm; vùng an toàn được dùng cho cảnh báo di chuyển ban đêm khi mục tiêu ở ngoài vùng và tiếp tục di chuyển trên 5 phút trong khung 23:00–05:00.
-
-Chấm mục tiêu chỉ hiện khi `/api/v1/radar/status` báo dữ liệu radar còn mới (`online=true`, tuổi dữ liệu không quá 5 giây). Chấm đổi màu theo vị trí `SAFE`, `DANGER`, ngoài vùng hoặc ngoài biên phòng; khi radar ngừng cập nhật, bản đồ báo `STALE` và ẩn chấm cũ để tránh hiểu nhầm là vị trí hiện tại. Nếu broker vẫn có dữ liệu mà bản đồ không có chấm, kiểm tra thời gian gói tin, trạng thái MQTT và endpoint này.
-
-Chuyển tọa độ sensor sang tọa độ phòng dùng phép xoay và tịnh tiến:
+The room map applies a rotation and translation to local radar coordinates:
 
 ```text
 X_room = radar_x + x*cos(theta) + y*sin(theta)
 Y_room = radar_y - x*sin(theta) + y*cos(theta)
 ```
 
-Đảm bảo đơn vị và quy ước trục thống nhất; góc phòng trong ứng dụng và hướng lắp cảm biến phải phản ánh cùng một sơ đồ.
+Keep the map origin, axis directions, and sensor mounting angle consistent. Dashboard zone fields use millimeters; the backend stores radar/room coordinates in meters.
 
-## 12. Thư viện và framework
+## Communication and API
 
-| Phần | Công nghệ |
+### MQTT protocol
+
+Mosquitto uses TCP port 1883. Main topics include `embedded/servo/mode`, `embedded/servo/manual`, `embedded/servo/tracking`, `embedded/servo/status`, and `embedded/radar/data`. The DevKit and backend must use the same broker address.
+
+The current `esp32_cam_radar.ino` firmware uses the `legacy_step` protocol: `LEFT`, `RIGHT`, `UP`, `DOWN`, and `RESET`. Manual commands change the target by a finite step. Set `SERVO_PROTOCOL=legacy_step` in `backend/.env`; the backend code's fallback default is `sequenced_hold`, so do not omit this setting for this firmware. A successful HTTP/MQTT publish confirms message delivery to the broker, not physical servo motion.
+
+### Main backend endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/video/stream` | AI-overlay MJPEG stream. |
+| `GET /api/v1/video/live` | Live/raw preview stream. |
+| `GET /api/v1/video/status` | Camera and AI diagnostics. |
+| `GET, POST /api/v1/config/camera` | Read/update camera stream source. |
+| `GET /api/v1/radar/history` | Recent radar data. |
+| `GET, POST /api/v1/config/zones` | Read/update zones. |
+| `GET, POST /api/v1/config/room` | Read/update room transform. |
+| `GET /api/v1/servo/diag` | Servo protocol/telemetry diagnostics. |
+| `POST /api/v1/camera/move` | Send a manual direction command. |
+| `GET, POST /api/v1/camera/mode` | Read/change MANUAL or AUTO mode. |
+| `WS /api/v1/ws/alerts` | Push events to connected dashboards. |
+
+`http://localhost:3000/api/v1` is not the backend API and may return 404. Use `http://localhost:8000/docs` or a specific backend route.
+
+## Frameworks and libraries
+
+| Layer | Main technology |
 |---|---|
 | Frontend | Next.js 16, React 19, TypeScript, Tailwind CSS 4 |
-| Thành phần giao diện | `lucide-react`, `next-themes` |
-| Biểu đồ | Recharts |
+| UI and charts | lucide-react, next-themes, Recharts |
 | Backend | Python, FastAPI, Uvicorn |
-| Video/AI | OpenCV, Ultralytics, PyTorch, OpenVINO; TensorRT nếu môi trường hỗ trợ |
-| Giao tiếp | Paho MQTT, Mosquitto, HTTP, WebSocket |
-| Lưu trữ | SQLite, NumPy |
-| Firmware | Arduino ESP32 core, PubSubClient, ESP32Servo, camera driver của Espressif |
+| Video and AI | OpenCV, Ultralytics, PyTorch, OpenVINO; TensorRT where available |
+| Messaging/network | Paho MQTT, Mosquitto, HTTP, WebSocket |
+| Data | SQLite, NumPy |
+| Firmware | Arduino ESP32 core, PubSubClient, ESP32Servo, Espressif camera driver |
 
-Python dependencies được liệt kê tại `backend/requirements.txt`; frontend dependencies khóa trong `frontend/package-lock.json`.
+Python packages are listed in `backend/requirements.txt`; exact frontend dependencies are in `frontend/package-lock.json`.
 
-## 13. Xử lý sự cố thường gặp
+## Troubleshooting
 
-| Triệu chứng | Bắt đầu kiểm tra từ |
+| Symptom | First checks |
 |---|---|
-| Không mở được dashboard/API | Backend có chạy ở `:8000` không; mở `http://localhost:8000/docs`; kiểm tra Server URL và firewall. |
-| Lỗi bind cổng 8000 hoặc 1883 | Tìm tiến trình/server cũ; chỉ chạy một backend và một broker trên mỗi cổng. |
-| Dashboard báo servo offline nhưng lệnh vẫn publish | Kiểm tra profile giao thức. `legacy_step` không cung cấp đầy đủ telemetry như firmware chẩn đoán; xem Serial Monitor và chuyển động thực. |
-| Nút joystick không làm servo quay | Xác nhận MANUAL, backend nhận POST, MQTT connected, lệnh tới đúng topic, firmware nhận lệnh, GPIO và nguồn servo. |
-| Servo giật/reset ESP32 | Đo 5 V tại servo khi có tải; kiểm tra dòng XL4015, GND chung, dây tín hiệu và va chạm cơ khí. |
-| Radar log có byte nhưng không có frame | Kiểm tra UART 256000, LD2450 TX → ESP32 GPIO32, GND chung, nguồn và cấu hình output LD2450. |
-| MQTT/radar/servo ngừng hoạt động sau khi IP máy tính đổi | Kiểm tra IP máy chạy Mosquitto bằng `ipconfig`; đặt cùng IP đó ở `MQTT_BROKER` trong `backend/.env` và `mqtt_server` trong `hardware/esp32_cam_radar.ino`. Khởi động lại backend, nạp lại firmware đã sửa vào ESP32 DevKit, kiểm tra `[BOOT] ... mqtt=...` và kết nối MQTT. |
-| Radar có tọa độ nhưng bản đồ không hiện chấm | Mở `/api/v1/radar/status`; nếu `online=false`/`STALE`, kiểm tra gói `embedded/radar/data` mới, broker của backend và DevKit, `frames_with_target`/`published` trong `[RADAR-DIAG]`. Chấm cũ được ẩn sau khi ngừng cập nhật. |
-| Camera stream lag | So sánh RAW FPS/AI FPS, giảm số viewer, thử QVGA, kiểm tra PSRAM, Wi-Fi và thời gian inference. Giới hạn FPS cao không làm tăng năng lực xử lý của máy. |
-| Camera không kết nối backend sau khi IP ESP32-CAM đổi | Xem `[CAM-URL]` trên Serial Monitor; mở `http://<IP-camera-moi>:81/stream` trên cùng mạng. Cập nhật IP tại **Cài đặt hệ thống** (tự lưu `VIDEO_SOURCE` vào `backend/.env`) hoặc sửa `VIDEO_SOURCE` trong `.env` rồi khởi động lại backend. Không cần nạp lại ESP32-CAM nếu chỉ đổi IP DHCP. |
-| Radar map lệch hướng | Kiểm tra đơn vị mm, dấu trục, gốc phòng và góc xoay. |
-| Nằm/ngã ngoài vùng SAFE nhưng không có cảnh báo ngã | Nhãn `OBSERVED_HORIZONTAL` nghĩa là thiếu lịch sử đứng trước khi nằm; để camera thấy toàn thân đứng ổn định rồi thử lại. Nếu hiện `SAFE ZONE`, đối chiếu chấm radar và `zone_state` tại `/api/v1/radar/status` với vùng SAFE đã lưu. Nếu hiện `MUTED`, kiểm tra số người/box và keypoint trong `/api/v1/video/detections`; camera đang quay cũng tạm ngừng đánh giá chuyển động. |
+| Dashboard/API unavailable | Confirm backend is running on port 8000; open `/docs`; check the configured Server URL and firewall. |
+| Port 8000 or 1883 bind error | Another process is using the port. Stop the duplicate backend/broker and keep one instance per port. |
+| Servo appears offline, but MQTT is connected | Check protocol selection. The legacy firmware does not publish the same online/position telemetry as the diagnostic firmware; inspect the DevKit serial log and physical motion. |
+| Joystick command does not move the servos | Check MANUAL mode, API response, broker address, MQTT topic/payload, board serial log, GPIO wiring, and the loaded firmware. |
+| Servo jitters or ESP32 resets | Measure 5 V at the servo under load; inspect XL4015 current/temperature, common ground, wiring, and mechanical binding. |
+| Radar bytes arrive but valid frames do not | Verify 256000-baud UART, LD2450 TX → ESP32 GPIO32, common ground, power, and LD2450 output mode. |
+| MQTT/radar/servos stop after the computer IP changes | Find the Mosquitto host IP with `ipconfig`; set it in both `MQTT_BROKER` in `backend/.env` and `mqtt_server` in `hardware/esp32_cam_radar.ino`. Restart the backend, reflash the edited ESP32 DevKit firmware, and check `[BOOT] ... mqtt=...` and MQTT connectivity. |
+| Radar coordinates arrive but the map has no target dot | Open `/api/v1/radar/status`; if `online=false`/`STALE`, check for fresh `embedded/radar/data` packets, the broker configured on both sides, and `frames_with_target`/`published` in `[RADAR-DIAG]`. Old dots are hidden after updates stop. |
+| Camera stream is slow | Compare raw and AI FPS, reduce viewer count, try QVGA, check PSRAM/Wi-Fi/inference time. Raising the FPS ceiling cannot make the host process faster. |
+| Camera does not connect after the ESP32-CAM IP changes | Read `[CAM-URL]` in its Serial Monitor and open `http://<NEW-CAMERA-IP>:81/stream` on the same LAN. Update the address in **System Settings** (which saves `VIDEO_SOURCE` to `backend/.env`), or edit `.env` and restart the backend. A DHCP IP change alone does not require reflashing the ESP32-CAM. |
+| Radar map is mirrored or offset | Check millimeter units, X/Y sign convention, map origin, and room rotation. |
+| A fall outside SAFE does not raise a fall alert | `OBSERVED_HORIZONTAL` means the detector missed the preceding upright state; keep the full standing person in view before retrying. For `SAFE ZONE`, compare the radar dot and `/api/v1/radar/status` `zone_state` with the saved SAFE zone. For `MUTED`, inspect people/boxes and keypoints at `/api/v1/video/detections`; camera motion also pauses motion evaluation. |
 
-Log hữu ích khi chẩn đoán gồm boot/reset reason, `[RADAR-DIAG]`, `[SERVO-DIAG]`, trạng thái MQTT, `/api/v1/video/status` và `/api/v1/servo/diag`. Không chia sẻ `.env` hoặc mật khẩu Wi-Fi/token.
+Useful diagnostics include boot/reset reason, `[RADAR-DIAG]`, `[SERVO-DIAG]`, MQTT connection logs, `/api/v1/video/status`, and `/api/v1/servo/diag`. Never share `.env`, Wi-Fi credentials, or alert-service tokens publicly.
 
-## 14. Dữ liệu và giới hạn vận hành
+## Data and operational limits
 
-- Backend lưu metadata sự kiện trong SQLite; chạy từ thư mục `backend` để đường dẫn dữ liệu tương đối nhất quán.
-- Ảnh snapshot và log debug có thể tăng theo thời gian; cần theo dõi dung lượng lưu trữ.
-- Trang logs trên frontend nhận trạng thái qua WebSocket; các thao tác trên giao diện không nhất thiết tương ứng với API lưu lịch sử bền vững.
-- Radar mmWave có thể phát hiện mục tiêu nhưng không thay thế camera hay xác nhận danh tính. Tracking theo ảnh cũng có thể mất ID hoặc sai keypoint.
-- Đây là dự án giám sát thử nghiệm; không dùng làm lớp bảo vệ duy nhất cho an toàn con người.
+- The backend stores event metadata in SQLite. Run `main.py` from `backend` so relative paths remain predictable.
+- Snapshots and debug logs can accumulate; review retention and available disk space.
+- The dashboard's event list is driven by WebSocket/client state; do not assume every UI acknowledgement is a durable server-side audit record.
+- Radar presence is not identity verification. Vision tracking can lose IDs or estimate incorrect keypoints.
+- This proof of concept can miss events or raise false alerts. Do not use it as the sole safety mechanism for a person.
 
-## 15. Truy cập riêng từ xa bằng Tailscale
+## Security and privacy
 
-Ứng dụng chạy trên máy chủ cục bộ, nhưng dashboard có thể mở trên điện thoại hoặc máy tính bảng ở ngoài nhà qua tailnet riêng. Backend và frontend vẫn chạy trên máy chủ gia đình; Tailscale tạo kết nối riêng giữa các thiết bị đã xác thực. Người chăm sóc không cần phơi cổng ứng dụng trực tiếp ra Internet.
+The sample Mosquitto config is intended for a trusted LAN and allows anonymous connections. Do not expose MQTT, camera ports, API, or dashboard through public router port-forwarding. Use Tailscale access policies and Windows Firewall to limit remote access to named caregivers and TCP 3000/8000. The application itself currently has no login or per-user roles. Protect host accounts, explain camera use to the monitored person, and keep private video/database/configuration files out of source control.
 
-### Thiết lập
+## References
 
-1. Cài Tailscale trên máy tính chạy backend/frontend và trên điện thoại hoặc máy tính bảng của người chăm sóc.
-2. Đăng nhập các thiết bị vào tailnet phù hợp; chỉ mời tài khoản/người cần được cấp quyền.
-3. Trong Tailscale Admin Console, cấu hình Grants/ACL để chỉ người hoặc nhóm được chọn truy cập máy chủ và các cổng dashboard/API **TCP 3000 và TCP 8000**.
-4. Trên máy chủ, khởi chạy Mosquitto, backend và frontend như các phần trên. Frontend và backend lắng nghe trên network interface; quy tắc Windows Firewall cần giới hạn inbound tới các thiết bị/địa chỉ tailnet được phép.
-5. Lấy Tailscale IPv4 của máy chủ:
-
-   ```powershell
-   tailscale ip -4
-   ```
-
-6. Trên thiết bị đã được cấp quyền, mở `http://<TAILSCALE-IP-MAY-CHU>:3000`, ví dụ `http://100.x.y.z:3000`.
-
-Frontend tự dùng hostname đang mở làm địa chỉ backend mặc định, nên khi truy cập bằng Tailscale IP, request API/video sẽ đi tới cùng máy chủ ở cổng 8000. Nếu đã nhập Server URL thủ công trong dashboard, đổi URL đó về `http://<TAILSCALE-IP-MAY-CHU>:8000`.
-
-Người chăm sóc từ xa chỉ cần dashboard; **không cần truy cập MQTT TCP 1883 hoặc stream thô ESP32-CAM TCP 81/82**. Không bật Tailscale Funnel cho hệ thống này. Tailscale Serve chỉ nên thêm sau khi đã thiết kế reverse proxy cho cả giao diện và API.
-
-> **Quyền truy cập hiện được kiểm soát ở lớp mạng, chưa có phân quyền trong ứng dụng.** Repository hiện không có màn hình đăng nhập hay role riêng. Người được phép truy cập dashboard/API có thể xem video và gửi lệnh điều khiển. Chỉ cấp quyền cho thiết bị/tài khoản tin cậy, bật xác thực nhiều lớp cho tài khoản Tailscale và giới hạn cổng bằng Grants/ACL.
-
-Tailscale mã hóa kết nối giữa các thiết bị trong tailnet và hỗ trợ chính sách cấp quyền theo người/nhóm, thiết bị và cổng. IP Tailscale của node thường ổn định khi chuyển mạng; có thể dùng MagicDNS thay IP nếu đã bật. AI và dữ liệu được xử lý trên máy chủ cục bộ, nhưng truy cập từ xa vẫn phụ thuộc tài khoản tailnet, ACL/firewall và kết nối Internet.
-
-## 16. Giao diện mobile
-
-Dashboard có bố cục responsive cho màn hình nhỏ: menu điều hướng thành drawer, video nằm phía trên và vùng điều khiển ở bên dưới; trang phân tích xếp cấu hình và bản đồ radar theo chiều dọc. Người chăm sóc có thể truy cập bằng trình duyệt điện thoại/tablet khi thiết bị đã vào tailnet.
-
-Khuyến nghị bắt đầu ở chế độ dọc, dùng nút điều khiển cảm ứng và xoay ngang nếu cần xem video lớn hơn. MJPEG có thể tiêu thụ nhiều pin/dữ liệu di động; trải nghiệm phụ thuộc mạng và năng lực máy chủ. Kiểm tra vùng chạm, trạng thái kết nối và điều khiển servo trước khi sử dụng thực tế.
-
-## 17. Quyền riêng tư và vận hành
-
-- Đặt máy chủ ở vị trí an toàn, khóa tài khoản Windows và giới hạn người đăng nhập.
-- Chỉ lưu snapshot/log khi cần; định kỳ kiểm tra và xóa dữ liệu không còn cần thiết.
-- Thông báo cho người được giám sát và người chăm sóc về camera, phạm vi thu hình và thời gian lưu.
-- Không đưa `.env`, ảnh người dùng, database, mật khẩu Wi-Fi hoặc token cảnh báo lên GitHub.
-- Không port-forward dashboard, API, broker hoặc camera ra Internet công cộng.
-
-## Tài liệu tham khảo
-
-- [Arduino ESP32 core - cài đặt](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)
+- [Arduino ESP32 core installation](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)
 - [ESP32 strapping pins](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/sd_pullup_requirements.html)
 - [FastAPI](https://fastapi.tiangolo.com/)
-- [Next.js](https://nextjs.org/docs)
+- [Next.js installation requirements](https://nextjs.org/docs/app/getting-started/installation)
 - [Ultralytics YOLOv8](https://docs.ultralytics.com/models/yolov8)
 - [Ultralytics tracking](https://docs.ultralytics.com/modes/track)
 - [Mosquitto](https://mosquitto.org/documentation/)
-- [Tailscale - access control grants](https://tailscale.com/docs/features/access-control/grants)
-- [Tailscale - IP và DNS của thiết bị](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
-- [Tailscale Serve và Funnel](https://tailscale.com/docs/features/tailscale-funnel)
-- [Telegram - tạo bot và BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
+- [Tailscale Grants](https://tailscale.com/docs/features/access-control/grants)
+- [Tailscale IP addresses and DNS](https://tailscale.com/kb/1033/ip-and-dns-addresses/)
+- [Tailscale Serve and Funnel](https://tailscale.com/docs/features/tailscale-funnel)
+- [Telegram bot creation and BotFather](https://core.telegram.org/bots#how-do-i-create-a-bot)
 - [Telegram Bot API - getUpdates](https://core.telegram.org/bots/api#getupdates)
