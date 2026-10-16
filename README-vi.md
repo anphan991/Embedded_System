@@ -260,7 +260,7 @@ IP thường thay đổi khi đổi router/hotspot. Chạy `ipconfig` để lấ
 
 Mỗi khối nên chạy trong một cửa sổ Terminal/PowerShell riêng để dễ theo dõi log.
 
-### Terminal 1 — Mosquitto
+### Terminal 1 - Mosquitto
 
 Kiểm tra Windows Service trước để tránh chạy hai broker cùng cổng:
 
@@ -277,7 +277,7 @@ cd backend
 
 Nếu cài Mosquitto ở nơi khác, thay đường dẫn executable. Chỉ giữ một broker trên TCP 1883. Cấu hình mẫu cho phép kết nối LAN không xác thực; chỉ dùng trên mạng tin cậy, không mở cổng ra Internet.
 
-### Terminal 2 — Backend và AI
+### Terminal 2 - Backend và AI
 
 ```powershell
 cd backend
@@ -297,7 +297,7 @@ python main.py
 
 Backend mặc định phục vụ API tại `http://localhost:8000`; tài liệu API tại `http://localhost:8000/docs`.
 
-### Terminal 3 — Frontend
+### Terminal 3 - Frontend
 
 ```powershell
 cd frontend
