@@ -148,7 +148,7 @@ Download from the official sites: [Python](https://www.python.org/downloads/wind
 
 Open PowerShell in the repository root. Use separate terminal windows for the broker, backend, and frontend so each process has its own visible logs.
 
-### Terminal 1 — MQTT broker
+### Terminal 1 - MQTT broker
 
 Check whether Mosquitto is already running as a Windows service:
 
@@ -165,7 +165,7 @@ cd backend
 
 If Mosquitto is installed elsewhere, update the executable path. Run only one broker on TCP port 1883. The sample config is intended for a trusted LAN and allows anonymous access; do not expose it to the public Internet.
 
-### Terminal 2 — Python backend
+### Terminal 2 - Python backend
 
 Create and activate the virtual environment, install packages, create the local configuration, then start FastAPI:
 
@@ -237,7 +237,7 @@ cd backend
 python main.py
 ```
 
-### Terminal 3 — Next.js dashboard
+### Terminal 3 - Next.js dashboard
 
 ```powershell
 cd frontend
